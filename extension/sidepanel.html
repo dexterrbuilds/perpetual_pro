@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Perpetual Pro — Side Panel</title>
+    <link rel="stylesheet" href="shared/styles.css" />
+  </head>
+  <body class="sidepanel">
+    <header class="app-header">
+      <div class="brand">
+        <img src="icons/icon48.png" alt="" />
+        <div>
+          <h1>Perpetual Pro</h1>
+          <div class="sub">Side panel · full report</div>
+        </div>
+      </div>
+    </header>
+
+    <div class="status-bar">
+      <span id="statusDot" class="status-dot"></span>
+      <span id="statusText">Ready</span>
+    </div>
+
+    <div class="controls">
+      <div class="btn-row">
+        <button id="btnCapture" class="primary" type="button">Capture &amp; Analyze Chart</button>
+      </div>
+      <div class="btn-row">
+        <button id="btnVisible" type="button">Visible tab</button>
+        <button id="btnRefresh" type="button">Refresh</button>
+        <button id="btnClear" type="button">Clear</button>
+      </div>
+      <div class="field-row">
+        <label class="field">
+          Symbol
+          <input id="symbol" type="text" placeholder="BTC (optional)" />
+        </label>
+        <label class="field">
+          Timeframe
+          <input id="timeframe" type="text" placeholder="15m" />
+        </label>
+      </div>
+      <img id="thumb" class="thumb" alt="Capture preview" />
+    </div>
+
+    <div id="errorBanner" class="error-banner"></div>
+
+    <div id="loading" class="loading">
+      <div class="spinner"></div>
+      <div id="loadingText">Analyzing…</div>
+    </div>
+
+    <div id="results" class="results"></div>
+
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>

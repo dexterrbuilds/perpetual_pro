@@ -1,0 +1,492 @@
+"""Beautiful Rich terminal reports + Markdown/JSON export."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+
+from loguru import logger
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.markdown import Markdown
+from rich.rule import Rule
+
+from src.analysis.confluence import FullAnalysis
+from src.utils.config import AppConfig
+from src.utils.helpers import ensure_dir, format_price, slugify, utc_now_iso
+
+
+DISCLAIMER = (
+    "NOT FINANCIAL ADVICE. This tool is for educational and research purposes only. "
+    "Crypto perpetual futures are highly leveraged and risky. You can lose more than "
+    "your initial margin. Always do your own research and never risk capital you cannot "
+    "afford to lose."
+)
+
+
+class ReportGenerator:
+    def __init__(self, config: AppConfig, console: Optional[Console] = None) -> None:
+        self.config = config
+        self.console = console or Console(highlight=False)
+
+    def render(self, analysis: FullAnalysis, vision_notes: Optional[str] = None) -> None:
+        """Print full pro report to the terminal."""
+        c = self.console
+        c.print()
+        c.print(
+            Panel(
+                Text.from_markup(
+                    f"[bold cyan]PERPETUAL PRO[/]  ·  {analysis.symbol}  ·  "
+                    f"{analysis.exchange_id}  ·  {analysis.primary_tf}\n"
+                    f"[dim]{analysis.generated_at}[/]"
+                ),
+                border_style="cyan",
+                box=box.DOUBLE,
+            )
+        )
+
+        # Bias header
+        bias_color = {
+            "bullish": "green",
+            "bearish": "red",
+            "neutral": "yellow",
+        }.get(analysis.bias, "white")
+        header = Table.grid(padding=(0, 2))
+        header.add_column(style="bold")
+        header.add_column()
+        header.add_row("Overall Bias", f"[{bias_color}]{analysis.bias.upper()}[/]")
+        header.add_row("Confidence", f"[bold]{analysis.confidence:.1f}%[/]")
+        header.add_row("Setup", analysis.setup_name or "—")
+        header.add_row("Tags", ", ".join(analysis.strategy_tags) or "—")
+        header.add_row("Confluence", f"{analysis.confluence_total:+.3f}")
+        c.print(Panel(header, title="Bias & Setup", border_style=bias_color))
+
+        # Primary setup / trade plan
+        plan = analysis.trade_plan
+        price = analysis.meta.get("price")
+        if plan:
+            pt = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+            pt.add_column("Field")
+            pt.add_column("Value", style="bold")
+            pt.add_row("Direction", plan.direction.upper())
+            pt.add_row(
+                "Entry zone",
+                f"{format_price(plan.entry_low, price)} — {format_price(plan.entry_high, price)}",
+            )
+            pt.add_row("Stop Loss", format_price(plan.stop_loss, price))
+            for i, (tp, rr) in enumerate(zip(plan.take_profits, plan.risk_reward), 1):
+                pt.add_row(f"TP{i}", f"{format_price(tp, price)}  (R:R {rr:.2f})")
+            pt.add_row("Position size", f"{plan.position_size_units:.6g} units")
+            pt.add_row("Notional", f"${plan.position_size_notional:,.2f}")
+            pt.add_row("Risk $", f"${plan.risk_amount:,.2f} ({plan.risk_pct:.2f}%)")
+            pt.add_row("Leverage (cap)", f"{plan.leverage_suggested:.1f}x")
+            pt.add_row("Plan quality", plan.quality.upper())
+            pt.add_row("Invalidation", plan.invalidation)
+            c.print(Panel(pt, title="Primary Setup", border_style="magenta"))
+            if plan.notes:
+                for n in plan.notes:
+                    c.print(f"  [dim]• {n}[/]")
+
+        # Confluence breakdown
+        ft = Table(title="Confluence Score Breakdown", box=box.MINIMAL_DOUBLE_HEAD)
+        ft.add_column("Factor")
+        ft.add_column("Score", justify="right")
+        ft.add_column("Weight", justify="right")
+        ft.add_column("Weighted", justify="right")
+        ft.add_column("Detail")
+        for f in analysis.factors:
+            sc = f.score
+            color = "green" if sc > 0.1 else ("red" if sc < -0.1 else "yellow")
+            ft.add_row(
+                f.name,
+                f"[{color}]{sc:+.3f}[/]",
+                f"{f.weight:.2f}",
+                f"{f.weighted:+.3f}",
+                (f.detail or "")[:80],
+            )
+        c.print(ft)
+
+        # Patterns
+        if analysis.patterns and analysis.patterns.hits:
+            ptbl = Table(title="Key Patterns", box=box.SIMPLE)
+            ptbl.add_column("Pattern")
+            ptbl.add_column("Type")
+            ptbl.add_column("Bias")
+            ptbl.add_column("Conf %", justify="right")
+            ptbl.add_column("Note")
+            for h in analysis.patterns.top_hits:
+                bc = "green" if h.bias == "bullish" else ("red" if h.bias == "bearish" else "yellow")
+                ptbl.add_row(h.name, h.kind, f"[{bc}]{h.bias}[/]", f"{h.confidence:.0f}", h.note[:50])
+            c.print(ptbl)
+
+        # Market structure
+        if analysis.structure:
+            st = analysis.structure
+            body = (
+                f"[bold]{st.summary}[/]\n"
+                f"Wyckoff: {st.wyckoff_phase}\n"
+                f"{st.wyckoff_notes}\n"
+                f"{st.elliott_notes}"
+            )
+            if st.volume_profile_poc:
+                body += (
+                    f"\nVolume profile POC≈{format_price(st.volume_profile_poc, price)}"
+                    f"  VA=[{format_price(st.volume_profile_val or 0, price)} – "
+                    f"{format_price(st.volume_profile_vah or 0, price)}]"
+                )
+            c.print(Panel(body, title="Market Structure", border_style="blue"))
+
+        # Key levels
+        if analysis.key_levels:
+            lt = Table(title="Key Levels (nearest)", box=box.SIMPLE)
+            lt.add_column("Kind")
+            lt.add_column("Side")
+            lt.add_column("Mid")
+            lt.add_column("Dist %", justify="right")
+            lt.add_column("Note")
+            for lv in analysis.key_levels[:8]:
+                lt.add_row(
+                    str(lv.get("kind")),
+                    str(lv.get("side")),
+                    format_price(float(lv.get("mid", 0)), price),
+                    f"{float(lv.get('distance_pct', 0)):+.2f}%",
+                    str(lv.get("note", ""))[:40],
+                )
+            c.print(lt)
+
+        # Derivatives
+        if analysis.derivatives_notes:
+            c.print(
+                Panel(
+                    "\n".join(f"• {n}" for n in analysis.derivatives_notes),
+                    title="Derivatives",
+                    border_style="bright_cyan",
+                )
+            )
+
+        # Multi-TF
+        if analysis.multi_tf_notes:
+            c.print(
+                Panel(
+                    "\n".join(f"• {n}" for n in analysis.multi_tf_notes),
+                    title="Multi-Timeframe",
+                    border_style="bright_blue",
+                )
+            )
+
+        # News
+        if analysis.news:
+            news_lines = [analysis.news.summary or ""]
+            for item in analysis.news.top(5):
+                news_lines.append(
+                    f"  [{item.sentiment_score:+.2f}] {item.title[:100]}  ({item.source})"
+                )
+            c.print(Panel("\n".join(news_lines), title="News Impact", border_style="bright_yellow"))
+
+        # Scenarios
+        if analysis.scenarios:
+            sc = analysis.scenarios
+            stbl = Table(title="Scenarios", box=box.ROUNDED)
+            stbl.add_column("Scenario")
+            stbl.add_column("Prob %", justify="right")
+            stbl.add_column("Trigger")
+            stbl.add_column("Target")
+            stbl.add_column("Invalidation")
+            for row in (sc.bullish, sc.base, sc.bearish):
+                stbl.add_row(
+                    row["name"],
+                    f"{row['probability']:.1f}",
+                    str(row["trigger"])[:40],
+                    str(row["target"]),
+                    str(row["invalidation"])[:24],
+                )
+            c.print(stbl)
+
+        # Divergences
+        if analysis.indicators and analysis.indicators.divergences:
+            c.print(Rule("Divergences"))
+            for d in analysis.indicators.divergences:
+                col = "green" if d.kind == "bullish" else "red"
+                c.print(
+                    f"  [{col}]{d.kind.upper()}[/] {d.oscillator} "
+                    f"({d.confidence:.0f}%) — {d.note}"
+                )
+
+        # Vision
+        if vision_notes:
+            c.print(Panel(vision_notes, title="Screen / Vision", border_style="white"))
+
+        # Commentary
+        c.print(
+            Panel(
+                analysis.trader_commentary or "—",
+                title="Trader Commentary",
+                border_style="green",
+            )
+        )
+
+        if analysis.warnings:
+            c.print(Panel("\n".join(analysis.warnings), title="Warnings", border_style="red"))
+
+        if self.config.output.show_disclaimer:
+            c.print(Panel(DISCLAIMER, title="Disclaimer", border_style="dim", box=box.SQUARE))
+        c.print()
+
+    def to_dict(self, analysis: FullAnalysis, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        plan = analysis.trade_plan
+        data: Dict[str, Any] = {
+            "app": "perpetual_pro",
+            "generated_at": analysis.generated_at,
+            "symbol": analysis.symbol,
+            "exchange": analysis.exchange_id,
+            "primary_tf": analysis.primary_tf,
+            "bias": analysis.bias,
+            "direction": analysis.direction,
+            "confidence": analysis.confidence,
+            "setup_name": analysis.setup_name,
+            "strategy_tags": analysis.strategy_tags,
+            "confluence_total": analysis.confluence_total,
+            "factors": analysis.factor_breakdown(),
+            "trade_plan": None,
+            "patterns": [],
+            "structure": None,
+            "key_levels": analysis.key_levels,
+            "derivatives_notes": analysis.derivatives_notes,
+            "multi_tf_notes": analysis.multi_tf_notes,
+            "news": None,
+            "scenarios": None,
+            "trader_commentary": analysis.trader_commentary,
+            "warnings": analysis.warnings,
+            "meta": analysis.meta,
+            "disclaimer": DISCLAIMER,
+        }
+        if plan:
+            data["trade_plan"] = {
+                "direction": plan.direction,
+                "entry_low": plan.entry_low,
+                "entry_high": plan.entry_high,
+                "stop_loss": plan.stop_loss,
+                "take_profits": plan.take_profits,
+                "risk_reward": plan.risk_reward,
+                "position_size_units": plan.position_size_units,
+                "position_size_notional": plan.position_size_notional,
+                "risk_amount": plan.risk_amount,
+                "risk_pct": plan.risk_pct,
+                "leverage_suggested": plan.leverage_suggested,
+                "quality": plan.quality,
+                "notes": plan.notes,
+                "invalidation": plan.invalidation,
+            }
+        if analysis.patterns:
+            data["patterns"] = [
+                {
+                    "name": h.name,
+                    "kind": h.kind,
+                    "bias": h.bias,
+                    "confidence": h.confidence,
+                    "note": h.note,
+                }
+                for h in analysis.patterns.hits
+            ]
+        if analysis.structure:
+            s = analysis.structure
+            data["structure"] = {
+                "trend": s.trend,
+                "last_bos": s.last_bos,
+                "last_choch": s.last_choch,
+                "structure_score": s.structure_score,
+                "wyckoff_phase": s.wyckoff_phase,
+                "wyckoff_notes": s.wyckoff_notes,
+                "elliott_notes": s.elliott_notes,
+                "volume_profile_poc": s.volume_profile_poc,
+                "volume_profile_vah": s.volume_profile_vah,
+                "volume_profile_val": s.volume_profile_val,
+                "summary": s.summary,
+            }
+        if analysis.news:
+            data["news"] = {
+                "bias": analysis.news.bias,
+                "aggregate_sentiment": analysis.news.aggregate_sentiment,
+                "summary": analysis.news.summary,
+                "items": [
+                    {
+                        "title": i.title,
+                        "source": i.source,
+                        "url": i.url,
+                        "sentiment_score": i.sentiment_score,
+                    }
+                    for i in analysis.news.items
+                ],
+            }
+        if analysis.scenarios:
+            data["scenarios"] = {
+                "bullish": analysis.scenarios.bullish,
+                "base": analysis.scenarios.base,
+                "bearish": analysis.scenarios.bearish,
+            }
+        if analysis.indicators:
+            data["indicator_summary"] = analysis.indicators.summary
+            data["divergences"] = [
+                {
+                    "kind": d.kind,
+                    "oscillator": d.oscillator,
+                    "confidence": d.confidence,
+                    "note": d.note,
+                }
+                for d in analysis.indicators.divergences
+            ]
+        if analysis.snapshot:
+            snap = analysis.snapshot
+            data["snapshot"] = {
+                "last": snap.last,
+                "funding_rate": snap.funding_rate,
+                "open_interest": snap.open_interest,
+                "long_short_ratio": snap.long_short_ratio,
+                "percentage_24h": snap.percentage_24h,
+            }
+        if extra:
+            data["extra"] = extra
+        return data
+
+    def to_markdown(self, analysis: FullAnalysis, extra: Optional[Dict[str, Any]] = None) -> str:
+        price = analysis.meta.get("price")
+        plan = analysis.trade_plan
+        lines = [
+            f"# perpetual_pro Report — {analysis.symbol}",
+            "",
+            f"- **Generated:** {analysis.generated_at}",
+            f"- **Exchange:** {analysis.exchange_id}",
+            f"- **Timeframe:** {analysis.primary_tf}",
+            f"- **Bias:** {analysis.bias.upper()} ({analysis.confidence:.1f}% confidence)",
+            f"- **Setup:** {analysis.setup_name}",
+            f"- **Tags:** {', '.join(analysis.strategy_tags)}",
+            f"- **Confluence:** {analysis.confluence_total:+.3f}",
+            "",
+            "## Primary Setup",
+            "",
+        ]
+        if plan:
+            lines += [
+                f"| Field | Value |",
+                f"|---|---|",
+                f"| Direction | {plan.direction} |",
+                f"| Entry | {format_price(plan.entry_low, price)} — {format_price(plan.entry_high, price)} |",
+                f"| Stop Loss | {format_price(plan.stop_loss, price)} |",
+            ]
+            for i, (tp, rr) in enumerate(zip(plan.take_profits, plan.risk_reward), 1):
+                lines.append(f"| TP{i} | {format_price(tp, price)} (R:R {rr:.2f}) |")
+            lines += [
+                f"| Size | {plan.position_size_units:.6g} units (${plan.position_size_notional:,.2f}) |",
+                f"| Risk | ${plan.risk_amount:,.2f} ({plan.risk_pct:.2f}%) |",
+                f"| Quality | {plan.quality} |",
+                f"| Invalidation | {plan.invalidation} |",
+                "",
+            ]
+        else:
+            lines.append("_No trade plan_\n")
+
+        lines += ["## Confluence Breakdown", ""]
+        lines.append("| Factor | Score | Weight | Weighted | Detail |")
+        lines.append("|---|---:|---:|---:|---|")
+        for f in analysis.factors:
+            lines.append(
+                f"| {f.name} | {f.score:+.3f} | {f.weight:.2f} | {f.weighted:+.3f} | {f.detail[:60]} |"
+            )
+        lines.append("")
+
+        if analysis.patterns and analysis.patterns.hits:
+            lines += ["## Patterns", ""]
+            for h in analysis.patterns.top_hits:
+                lines.append(f"- **{h.name}** ({h.kind}, {h.bias}, {h.confidence:.0f}%): {h.note}")
+            lines.append("")
+
+        if analysis.structure:
+            s = analysis.structure
+            lines += [
+                "## Market Structure",
+                "",
+                s.summary,
+                "",
+                f"- Wyckoff: {s.wyckoff_phase} — {s.wyckoff_notes}",
+                f"- Elliott: {s.elliott_notes}",
+                "",
+            ]
+
+        if analysis.derivatives_notes:
+            lines += ["## Derivatives", ""]
+            for n in analysis.derivatives_notes:
+                lines.append(f"- {n}")
+            lines.append("")
+
+        if analysis.multi_tf_notes:
+            lines += ["## Multi-Timeframe", ""]
+            for n in analysis.multi_tf_notes:
+                lines.append(f"- {n}")
+            lines.append("")
+
+        if analysis.news:
+            lines += ["## News", "", analysis.news.summary or "", ""]
+            for i in analysis.news.top(8):
+                lines.append(f"- ({i.sentiment_score:+.2f}) [{i.source}] {i.title}")
+            lines.append("")
+
+        if analysis.scenarios:
+            lines += ["## Scenarios", ""]
+            for row in (
+                analysis.scenarios.bullish,
+                analysis.scenarios.base,
+                analysis.scenarios.bearish,
+            ):
+                lines.append(
+                    f"### {row['name']} ({row['probability']}%)\n"
+                    f"- Trigger: {row['trigger']}\n"
+                    f"- Target: {row['target']}\n"
+                    f"- Invalidation: {row['invalidation']}\n"
+                    f"- {row['narrative']}\n"
+                )
+
+        lines += [
+            "## Trader Commentary",
+            "",
+            analysis.trader_commentary or "",
+            "",
+            "## Disclaimer",
+            "",
+            DISCLAIMER,
+            "",
+        ]
+        if extra and extra.get("vision_notes"):
+            lines.insert(-4, "## Screen / Vision\n\n" + str(extra["vision_notes"]) + "\n")
+        return "\n".join(lines)
+
+    def save(
+        self,
+        analysis: FullAnalysis,
+        extra: Optional[Dict[str, Any]] = None,
+        output_dir: Optional[Union[str, Path]] = None,
+    ) -> Dict[str, Path]:
+        """Save Markdown and/or JSON report. Returns paths written."""
+        out = ensure_dir(output_dir or self.config.resolve_path(self.config.output.output_dir))
+        stamp = utc_now_iso().replace(":", "").replace("+00:00", "Z")
+        base = f"{slugify(analysis.symbol)}_{analysis.primary_tf}_{stamp}"
+        paths: Dict[str, Path] = {}
+
+        if self.config.output.save_json:
+            jp = out / f"{base}.json"
+            with open(jp, "w", encoding="utf-8") as f:
+                json.dump(self.to_dict(analysis, extra=extra), f, indent=2, default=str)
+            paths["json"] = jp
+            logger.info("Saved JSON report {}", jp)
+
+        if self.config.output.save_markdown:
+            mp = out / f"{base}.md"
+            with open(mp, "w", encoding="utf-8") as f:
+                f.write(self.to_markdown(analysis, extra=extra))
+            paths["markdown"] = mp
+            logger.info("Saved Markdown report {}", mp)
+
+        return paths

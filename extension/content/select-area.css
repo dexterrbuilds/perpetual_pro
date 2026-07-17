@@ -1,0 +1,52 @@
+/* Perpetual Pro — chart area selection overlay */
+
+#pp-select-root {
+  all: initial;
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 2147483646 !important;
+  cursor: crosshair !important;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif !important;
+}
+
+#pp-select-root * {
+  box-sizing: border-box !important;
+}
+
+.pp-select-mask {
+  position: absolute !important;
+  inset: 0 !important;
+  background: rgba(2, 6, 23, 0.45) !important;
+  pointer-events: none !important;
+}
+
+.pp-select-box {
+  position: absolute !important;
+  border: 2px solid #22d3ee !important;
+  background: rgba(34, 211, 238, 0.08) !important;
+  box-shadow: 0 0 0 9999px rgba(2, 6, 23, 0.55) !important;
+  pointer-events: none !important;
+}
+
+.pp-select-hint {
+  position: fixed !important;
+  top: 16px !important;
+  left: 50% !important;
+  transform: translateX(-50%) !important;
+  background: #0f172a !important;
+  color: #e2e8f0 !important;
+  border: 1px solid #334155 !important;
+  border-radius: 10px !important;
+  padding: 10px 16px !important;
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.02em !important;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45) !important;
+  z-index: 2147483647 !important;
+  pointer-events: none !important;
+}
+
+.pp-select-hint span {
+  color: #22d3ee !important;
+  font-weight: 700 !important;
+}

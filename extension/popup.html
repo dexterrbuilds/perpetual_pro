@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Perpetual Pro</title>
+    <link rel="stylesheet" href="shared/styles.css" />
+  </head>
+  <body class="popup">
+    <header class="app-header">
+      <div class="brand">
+        <img src="icons/icon48.png" alt="" />
+        <div>
+          <h1>Perpetual Pro</h1>
+          <div class="sub">Local FastAPI · localhost:8000</div>
+        </div>
+      </div>
+      <button id="btnSettings" class="ghost" title="Settings" type="button">⚙</button>
+    </header>
+
+    <div class="status-bar">
+      <span id="statusDot" class="status-dot"></span>
+      <span id="statusText">Checking backend…</span>
+    </div>
+
+    <div class="controls">
+      <div class="btn-row">
+        <button id="btnCapture" class="primary" type="button">Capture &amp; Analyze Chart</button>
+      </div>
+      <div class="btn-row">
+        <button id="btnVisible" type="button">Visible tab</button>
+        <button id="btnSidePanel" type="button">Side panel</button>
+      </div>
+
+      <div class="field-row" id="settingsPanel" style="display: none">
+        <label class="field full">
+          API base
+          <input id="apiBase" type="text" placeholder="http://localhost:8000" />
+        </label>
+        <label class="field">
+          Symbol (optional)
+          <input id="symbol" type="text" placeholder="BTC" />
+        </label>
+        <label class="field">
+          Timeframe
+          <input id="timeframe" type="text" placeholder="15m" />
+        </label>
+        <label class="field">
+          Exchange
+          <select id="exchange">
+            <option value="binanceusdm">Binance USDM</option>
+            <option value="bybit">Bybit</option>
+            <option value="okx">OKX</option>
+            <option value="bitget">Bitget</option>
+          </select>
+        </label>
+        <label class="field">
+          Higher TFs
+          <input id="higher" type="text" placeholder="1h,4h,1d" />
+        </label>
+        <label class="field">
+          Balance
+          <input id="balance" type="number" placeholder="10000" />
+        </label>
+        <label class="field">
+          Risk %
+          <input id="risk" type="number" step="0.1" placeholder="1.0" />
+        </label>
+        <label class="field full" style="flex-direction: row; align-items: center; gap: 8px">
+          <input id="noNews" type="checkbox" />
+          Skip news
+        </label>
+        <div class="btn-row" style="grid-column: 1 / -1">
+          <button id="btnSaveSettings" class="primary" type="button">Save settings</button>
+        </div>
+      </div>
+
+      <div class="hint">Shortcut: <strong>Ctrl+Shift+P</strong> · Right-click image/page for menu</div>
+      <img id="thumb" class="thumb" alt="Capture preview" />
+    </div>
+
+    <!-- Shown when OCR cannot detect a symbol -->
+    <section id="manualSymbolPanel" class="manual-symbol-panel" hidden>
+      <div class="manual-symbol-inner">
+        <div class="manual-symbol-icon" aria-hidden="true">◎</div>
+        <h2 class="manual-symbol-title">Symbol not detected</h2>
+        <p class="manual-symbol-desc" id="manualSymbolDesc">
+          OCR couldn’t read the ticker from the chart. Enter the symbol to continue analysis.
+        </p>
+        <label class="manual-symbol-label" for="manualSymbol">
+          Symbol
+          <span class="manual-symbol-examples">e.g. BTC · ETH · BTC/USDT:USDT</span>
+        </label>
+        <div class="manual-symbol-row">
+          <input
+            id="manualSymbol"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="BTC or BTC/USDT:USDT"
+            aria-label="Trading symbol"
+          />
+          <button id="btnManualAnalyze" class="primary" type="button">Analyze</button>
+        </div>
+        <div class="manual-symbol-chips" id="manualSymbolChips" role="group" aria-label="Quick symbols">
+          <button type="button" class="chip-btn" data-symbol="BTC">BTC</button>
+          <button type="button" class="chip-btn" data-symbol="ETH">ETH</button>
+          <button type="button" class="chip-btn" data-symbol="SOL">SOL</button>
+          <button type="button" class="chip-btn" data-symbol="XRP">XRP</button>
+          <button type="button" class="chip-btn" data-symbol="DOGE">DOGE</button>
+        </div>
+        <div class="manual-symbol-meta">
+          <label class="manual-tf-field">
+            Timeframe
+            <input id="manualTimeframe" type="text" placeholder="15m" />
+          </label>
+          <button id="btnManualDismiss" class="ghost" type="button">Dismiss</button>
+        </div>
+        <p class="manual-symbol-hint" id="manualSymbolHint"></p>
+      </div>
+    </section>
+
+    <div id="errorBanner" class="error-banner"></div>
+
+    <div id="loading" class="loading">
+      <div class="spinner"></div>
+      <div id="loadingText">Analyzing…</div>
+      <div class="hint" style="margin-top: 8px">OCR + backend confluence engine</div>
+    </div>
+
+    <div id="results" class="results"></div>
+
+    <div class="footer-actions">
+      <button id="btnRefresh" type="button">Refresh</button>
+      <button id="btnClear" type="button">Clear</button>
+    </div>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

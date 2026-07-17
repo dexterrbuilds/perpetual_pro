@@ -1,0 +1,121 @@
+# perpetual_pro configuration
+# Override with environment variables or CLI flags where supported.
+
+exchange:
+  # binanceusdm | bybit | okx | bitget
+  default: binanceusdm
+  # Optional API keys (prefer .env for secrets)
+  api_key: ""
+  api_secret: ""
+  password: ""  # OKX passphrase / Bitget password if needed
+  enable_rate_limit: true
+  timeout_ms: 30000
+  # Public endpoints work without keys for OHLCV/funding/OI on most venues
+  sandbox: false
+
+risk:
+  account_balance: 10000.0
+  risk_per_trade_pct: 1.0   # % of account risked per trade
+  max_leverage: 10
+  min_rr: 1.5               # minimum acceptable risk:reward
+  default_stop_atr_mult: 1.5
+  default_tp_atr_mults: [1.5, 2.5, 4.0]
+
+timeframes:
+  primary: "15m"
+  higher:
+    - "1h"
+    - "4h"
+    - "1d"
+  ohlcv_limit: 500
+
+analysis:
+  # Indicator lookbacks / sensitivity
+  rsi_period: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  atr_period: 14
+  ema_fast: 9
+  ema_mid: 21
+  ema_slow: 50
+  ema_trend: 200
+  # Confluence weights (should roughly sum ~1.0 for primary stack)
+  weights:
+    trend: 0.18
+    momentum: 0.14
+    structure: 0.16
+    patterns: 0.12
+    derivatives: 0.12
+    multi_tf: 0.14
+    volume: 0.08
+    news: 0.06
+  # Confidence clamps
+  min_confidence: 15
+  max_confidence: 92
+
+news:
+  enabled: true
+  # CryptoPanic public API (optional token improves rate limits)
+  cryptopanic_token: ""
+  max_articles: 12
+  lookback_hours: 24
+  # Simple keyword sentiment lexicon boost
+  bullish_keywords:
+    - approval
+    - etf
+    - inflow
+    - partnership
+    - adoption
+    - upgrade
+    - bullish
+    - rally
+    - listing
+    - institutional
+  bearish_keywords:
+    - hack
+    - exploit
+    - lawsuit
+    - ban
+    - sec
+    - crash
+    - liquidat
+    - delist
+    - fraud
+    - outage
+    - investigation
+
+ocr:
+  # tesseract | easyocr | dual (prefer dual)
+  engine: dual
+  tesseract_cmd: ""  # e.g. /usr/local/bin/tesseract or /opt/homebrew/bin/tesseract
+  languages:
+    - en
+  easyocr_gpu: false
+  min_confidence: 0.35
+
+screen:
+  # interactive | full | region (x,y,w,h via CLI)
+  default_mode: interactive
+  dark_theme: true
+  save_capture: true
+  annotate: true
+  output_dir: "./output"
+
+vision:
+  use_ollama: true
+  ollama_base_url: "http://127.0.0.1:11434"
+  ollama_model: "llava"
+  ollama_timeout_s: 45
+
+output:
+  save_markdown: true
+  save_json: true
+  output_dir: "./output"
+  show_disclaimer: true
+
+logging:
+  level: INFO
+  file: "./logs/perpetual_pro.log"
+  rotation: "10 MB"
+  retention: "14 days"
