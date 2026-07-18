@@ -17,6 +17,13 @@
   --shadow: 0 8px 28px rgba(0, 0, 0, 0.32);
   --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  /* Layout tokens — readable popup + roomy side panel */
+  --popup-width: 440px;
+  --popup-min-width: 420px;
+  --pad-x: 16px;
+  --pad-y: 14px;
+  --gap: 12px;
+  --content-max: 720px;
 }
 
 * {
@@ -31,21 +38,31 @@ body {
   color: var(--text);
   font-family: var(--font);
   font-size: 13px;
-  line-height: 1.45;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
 
+/* Chrome popup: fixed width so charts / tables / metrics stay readable */
+html.popup-root,
+html:has(body.popup) {
+  width: var(--popup-width);
+  min-width: var(--popup-min-width);
+}
+
 body.popup {
-  width: 380px;
-  min-height: 520px;
-  max-height: 620px;
+  width: var(--popup-width);
+  min-width: var(--popup-min-width);
+  max-width: 800px;
+  min-height: 540px;
+  max-height: 640px;
   overflow: hidden;
   display: flex;
   flex-direction: column;
 }
 
 body.sidepanel {
-  min-width: 320px;
+  min-width: 380px;
+  width: 100%;
   min-height: 100vh;
   display: flex;
   flex-direction: column;
@@ -60,8 +77,8 @@ a {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 12px 14px;
+  gap: 12px;
+  padding: var(--pad-y) var(--pad-x);
   border-bottom: 1px solid var(--border);
   background: linear-gradient(180deg, #0f172a 0%, #0b1220 100%);
   position: sticky;
@@ -118,12 +135,12 @@ a {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 14px;
+  padding: 9px var(--pad-x);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
   font-size: 12px;
   flex-shrink: 0;
-  min-height: 36px;
+  min-height: 38px;
 }
 
 .status-dot {
@@ -158,17 +175,17 @@ a {
 
 /* Controls */
 .controls {
-  padding: 12px 14px;
+  padding: var(--pad-y) var(--pad-x);
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--gap);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
 
 .btn-row {
   display: flex;
-  gap: 8px;
+  gap: 10px;
 }
 
 button,
@@ -220,11 +237,11 @@ button.ghost {
 .settings-panel {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 8px;
+  gap: 10px;
 }
 
 .settings-panel {
-  padding: 10px;
+  padding: 12px;
   border-radius: 12px;
   border: 1px solid var(--border);
   background: rgba(15, 23, 42, 0.8);
@@ -338,7 +355,7 @@ select:focus {
 /* Loading */
 .loading {
   display: none;
-  padding: 22px 14px;
+  padding: 24px var(--pad-x);
   text-align: center;
   flex-shrink: 0;
 }
@@ -371,10 +388,11 @@ select:focus {
 .error-banner,
 .success-banner {
   display: none;
-  margin: 10px 14px 0;
-  padding: 10px 12px;
+  margin: 10px var(--pad-x) 0;
+  padding: 11px 14px;
   border-radius: 10px;
   font-size: 12px;
+  line-height: 1.45;
   flex-shrink: 0;
 }
 .error-banner {
@@ -397,14 +415,14 @@ select:focus {
 .results {
   flex: 1;
   overflow: auto;
-  padding: 12px 14px 20px;
+  padding: 14px var(--pad-x) 24px;
   min-height: 0;
 }
 
 .empty-state {
   text-align: center;
   color: var(--muted);
-  padding: 36px 16px;
+  padding: 40px 20px;
 }
 .empty-icon {
   font-size: 28px;
@@ -427,8 +445,8 @@ select:focus {
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 12px;
-  margin-bottom: 10px;
+  padding: 14px 16px;
+  margin-bottom: 12px;
   box-shadow: var(--shadow);
 }
 
@@ -451,8 +469,8 @@ select:focus {
 
 .hero {
   border-radius: var(--radius);
-  padding: 14px;
-  margin-bottom: 10px;
+  padding: 16px;
+  margin-bottom: 12px;
   border: 1px solid var(--border);
   background: radial-gradient(120% 120% at 0% 0%, rgba(34, 211, 238, 0.12), transparent 50%),
     var(--bg-card);
@@ -474,9 +492,10 @@ select:focus {
 }
 
 .symbol {
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 800;
   letter-spacing: 0.01em;
+  word-break: break-word;
 }
 
 .sub {
@@ -508,9 +527,9 @@ select:focus {
 
 .hero-metrics {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
-  margin-top: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
 }
 
 .metric .label,
@@ -613,21 +632,27 @@ select:focus {
 .grid-2 {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px;
+  gap: 12px 14px;
 }
 
 .tp-row {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
-  margin-top: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
 }
 
 .tp {
   background: #0b1220;
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 8px;
+  padding: 10px;
+  min-width: 0;
+}
+
+.tp .value {
+  word-break: break-word;
+  font-size: 12px;
 }
 
 .bull {
@@ -695,17 +720,36 @@ select:focus {
 .table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 11px;
+  font-size: 12px;
+  table-layout: fixed;
 }
 .table th,
 .table td {
   text-align: left;
-  padding: 6px 4px;
+  padding: 8px 6px;
   border-bottom: 1px solid var(--border);
+  word-break: break-word;
+  vertical-align: top;
 }
 .table th {
   color: var(--muted);
   font-weight: 600;
+}
+.table th:nth-child(1),
+.table td:nth-child(1) {
+  width: 28%;
+}
+.table th:nth-child(2),
+.table td:nth-child(2) {
+  width: 22%;
+}
+.table th:nth-child(3),
+.table td:nth-child(3) {
+  width: 28%;
+}
+.table th:nth-child(4),
+.table td:nth-child(4) {
+  width: 22%;
 }
 
 .factors {
@@ -827,7 +871,7 @@ select:focus {
 .rr-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 12px;
+  gap: 14px;
 }
 
 .news-head {
@@ -874,8 +918,8 @@ select:focus {
 
 .footer-actions {
   display: flex;
-  gap: 8px;
-  padding: 10px 14px 14px;
+  gap: 10px;
+  padding: 12px var(--pad-x) 14px;
   border-top: 1px solid var(--border);
   background: var(--bg-elev);
   flex-shrink: 0;
@@ -887,7 +931,7 @@ select:focus {
 
 /* Manual symbol recovery */
 .manual-symbol-panel {
-  margin: 0 12px 10px;
+  margin: 0 var(--pad-x) 10px;
   border-radius: 14px;
   border: 1px solid rgba(251, 191, 36, 0.45);
   background:
@@ -1071,23 +1115,98 @@ select:focus {
   font-weight: 600;
 }
 
-/* Side panel breathing room */
+/* Side panel — wider, more open report layout */
+body.sidepanel {
+  --pad-x: 20px;
+  --pad-y: 16px;
+  font-size: 13.5px;
+}
+
+body.sidepanel .app-header,
+body.sidepanel .status-bar,
+body.sidepanel .controls {
+  padding-left: var(--pad-x);
+  padding-right: var(--pad-x);
+}
+
 body.sidepanel .results {
-  padding-bottom: 32px;
+  padding: 18px var(--pad-x) 40px;
+  max-width: var(--content-max);
+  width: 100%;
+  margin: 0 auto;
+}
+
+body.sidepanel .card {
+  padding: 16px 18px;
+  margin-bottom: 14px;
+}
+
+body.sidepanel .hero {
+  padding: 18px 20px;
 }
 
 body.sidepanel .hero-metrics {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
 }
 
-/* Narrow popup safety */
-@media (max-width: 360px) {
-  body.popup {
-    width: 100%;
+body.sidepanel .grid-2 {
+  gap: 14px 18px;
+}
+
+body.sidepanel .tp-row {
+  gap: 12px;
+}
+
+body.sidepanel .tp .value {
+  font-size: 13px;
+}
+
+body.sidepanel .symbol {
+  font-size: 18px;
+}
+
+body.sidepanel .commentary {
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+body.sidepanel .table {
+  font-size: 12.5px;
+}
+
+body.sidepanel .error-banner,
+body.sidepanel .success-banner,
+body.sidepanel .manual-symbol-panel {
+  margin-left: var(--pad-x);
+  margin-right: var(--pad-x);
+}
+
+/* Popup: keep multi-column metrics readable at 420px+ */
+body.popup .metric .value,
+body.popup .value {
+  font-size: 12.5px;
+}
+
+body.popup .sim-lead {
+  font-size: 12.5px;
+}
+
+/* Only collapse columns on truly narrow side-panel widths */
+@media (max-width: 400px) {
+  body.sidepanel .tp-row,
+  body.sidepanel .rr-grid {
+    grid-template-columns: 1fr;
   }
-  .tp-row,
-  .rr-grid,
-  .hero-metrics {
+
+  body.sidepanel .hero-metrics {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 340px) {
+  body.sidepanel .hero-metrics,
+  body.sidepanel .field-row {
     grid-template-columns: 1fr;
   }
 }
