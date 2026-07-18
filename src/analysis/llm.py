@@ -77,7 +77,8 @@ class NarrativeLLM:
 
     def _build_prompt(self, ctx: Dict[str, Any]) -> str:
         return (
-            "You are a senior crypto perpetual futures prop trader. "
+            "You are a senior crypto perpetual futures day trader / scalper. "
+            "Focus on short-term setups (5m–1h, 4h confirm), hold ≤12–24h, leverage 20x–100x. "
             "Given the analysis JSON, respond with ONLY valid JSON (no markdown) matching:\n"
             "{\n"
             '  "signal_narrative": "3-5 sentences explaining the trade signal",\n'
@@ -178,8 +179,8 @@ class NarrativeLLM:
         bias = ctx.get("bias", "neutral")
         conf = ctx.get("confidence", 0)
         setup = ctx.get("setup_name", "Setup")
-        lev = ctx.get("leverage_suggested", 1)
-        atr_pct = ctx.get("atr_pct", 0)
+        lev = float(ctx.get("leverage_suggested") or 20)
+        atr_pct = float(ctx.get("atr_pct") or 0)
         funding = ctx.get("funding_rate_pct")
         factors = ctx.get("top_factors") or []
         direction = ctx.get("direction", "flat")
@@ -193,6 +194,7 @@ class NarrativeLLM:
 
         risks = [
             "Crypto perps can gap; stops may slip in liquidation cascades.",
+            "High leverage (20x–100x band) amplifies liquidation risk — risk the plan, not max margin.",
             "Funding and crowded positioning can reverse quickly around event risk.",
         ]
         if atr_pct and atr_pct > 2.5:
@@ -202,14 +204,14 @@ class NarrativeLLM:
 
         narrative = (
             f"{setup}: bias is {bias} ({conf:.0f}% confidence) with directional lean {direction}. "
-            f"Structure, multi-timeframe trend, and derivatives context were combined into a "
-            f"weighted confluence score. Prefer planned risk of ~1% of simulated capital; "
-            f"do not chase if entry zone is missed."
+            f"Structure, multi-timeframe trend, and derivatives context form a weighted confluence. "
+            f"Aggressive perp style: suggested ~{lev:.0f}x (20x–100x band), hold typically ≤12–24h. "
+            f"Risk ~1% of simulated capital; do not chase if the entry zone is missed."
         )
         lev_reason = (
-            f"Suggested leverage ~{lev:.1f}x is scaled from ATR volatility ({atr_pct:.2f}% of price), "
-            f"signal confidence ({conf:.0f}%), and funding pressure. "
-            f"Lower confidence or higher vol → lower leverage; this is a simulation, not a mandate."
+            f"Suggested perp leverage ~{lev:.0f}x (band 20x–100x) from ATR {atr_pct:.2f}% of price, "
+            f"confidence {conf:.0f}%, and funding. Calmer tape + higher conf → more aggression; "
+            f"funding against you clips toward 20x. Simulation only — not a mandate."
         )
         scenarios = {
             "bullish": "Continuation if HTF demand holds and momentum expands with rising volume.",

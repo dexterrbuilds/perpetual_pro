@@ -211,7 +211,7 @@ class ConfluenceEngine:
         support, resistance = self._nearest_levels(struct, price)
         result.key_levels = self._collect_levels(struct, price)
 
-        # Trade plan — dynamic leverage + simulated capital
+        # Trade plan — aggressive perp leverage + multi-TP + hold window
         funding = mtf.snapshot.funding_rate if mtf.snapshot else None
         plan = self.risk.build_plan(
             direction=direction,
@@ -220,6 +220,9 @@ class ConfluenceEngine:
             structure_stops=(support, resistance),
             confidence=conf,
             funding_rate=funding,
+            primary_tf=mtf.primary_tf,
+            setup_name=result.setup_name,
+            strategy_tags=result.strategy_tags,
         )
         result.trade_plan = plan
         result.scenarios = self.risk.scenarios(
@@ -318,43 +321,65 @@ class ConfluenceEngine:
 
     # ------------------------------------------------------------------
     def _multi_tf_score(self, mtf: MultiTimeframeData) -> Tuple[float, List[str]]:
+        """
+        Day-trade MTF blend: prioritize 5m / 15m / 1h; 4h is confirmation only.
+        Mix trend + momentum on LTF for scalp alignment.
+        """
+        from src.utils.helpers import timeframe_to_minutes
+
         notes: List[str] = []
         scores: List[float] = []
         weights: List[float] = []
+
+        # Explicit day-trade weights by TF minutes
+        def _tf_weight(mins: int) -> float:
+            if mins <= 5:
+                return 1.45  # micro momentum
+            if mins <= 15:
+                return 1.55  # primary drive
+            if mins <= 60:
+                return 1.35  # session bias
+            if mins <= 240:
+                return 0.85  # confirmation only
+            return 0.40  # daily+ de-emphasized for scalps
 
         for tf, df in mtf.frames.items():
             if df is None or df.empty or len(df) < 30:
                 continue
             ind = compute_indicators(df, config=self.config)
-            s = float(ind.summary.get("trend_score", 0))
-            # Weight higher TFs more
-            from src.utils.helpers import timeframe_to_minutes
-
+            trend_s = float(ind.summary.get("trend_score", 0))
+            mom_s = float(ind.summary.get("momentum_score", 0))
             mins = timeframe_to_minutes(tf)
-            w = 1.0 + np.log1p(mins / 15.0)
+            # LTF: blend momentum heavier; HTF: trend/structure lean
+            if mins <= 60:
+                s = 0.45 * trend_s + 0.55 * mom_s
+            else:
+                s = 0.75 * trend_s + 0.25 * mom_s
+            w = _tf_weight(mins)
             scores.append(s)
             weights.append(w)
             rsi = ind.summary.get("rsi")
             rsi_s = f" RSI={rsi:.1f}" if rsi is not None else ""
-            notes.append(f"{tf}: trend={s:+.2f}{rsi_s}")
+            notes.append(f"{tf}: score={s:+.2f} (t={trend_s:+.2f}/m={mom_s:+.2f}){rsi_s}")
 
         if not scores:
             return 0.0, ["No multi-TF data"]
         total_w = sum(weights) or 1.0
         agg = sum(s * w for s, w in zip(scores, weights)) / total_w
 
-        # Alignment bonus/penalty
         signs = [np.sign(s) for s in scores if abs(s) > 0.1]
         if signs and all(x == signs[0] for x in signs):
-            notes.insert(0, "All timeframes aligned")
-            agg = clamp(agg * 1.1, -1, 1)
+            notes.insert(0, "Day-trade stack aligned (5m/15m/1h/4h)")
+            agg = clamp(agg * 1.12, -1, 1)
         elif signs:
-            notes.insert(0, "Timeframe conflict — reduce size")
-            agg *= 0.7
+            # Soft conflict: LTF can lead but cut aggression
+            notes.insert(0, "MTF conflict — scalp smaller / wait for 1h agree")
+            agg *= 0.75
 
         return float(clamp(agg, -1, 1)), notes
 
     def _derivatives_score(self, snap: Optional[MarketSnapshot]) -> Tuple[float, List[str]]:
+        """Funding-first for high-leverage perps; fade crowded positioning."""
         notes: List[str] = []
         if not snap:
             return 0.0, ["Derivatives snapshot unavailable"]
@@ -364,40 +389,47 @@ class ConfluenceEngine:
         if fr is not None:
             fr_pct = fr * 100
             notes.append(f"Funding {fr_pct:+.4f}%")
-            # Extreme positive funding → crowded long → mild bearish lean
-            if fr_pct > 0.05:
-                score -= 0.35
+            # Stronger fade signals for day-trade funding extremes
+            if fr_pct > 0.08:
+                score -= 0.45
+                notes.append("Very elevated long funding — mean-revert / short bias")
+            elif fr_pct > 0.035:
+                score -= 0.28
                 notes.append("Elevated long funding — squeeze risk")
-            elif fr_pct > 0.02:
-                score -= 0.15
-            elif fr_pct < -0.05:
-                score += 0.35
+            elif fr_pct > 0.015:
+                score -= 0.12
+            elif fr_pct < -0.08:
+                score += 0.45
+                notes.append("Very elevated short funding — squeeze / long bias")
+            elif fr_pct < -0.035:
+                score += 0.28
                 notes.append("Elevated short funding — short-squeeze risk")
-            elif fr_pct < -0.02:
-                score += 0.15
+            elif fr_pct < -0.015:
+                score += 0.12
         else:
             notes.append("Funding n/a")
 
         if snap.open_interest is not None:
             notes.append(f"OI {snap.open_interest:,.0f}")
-            # Without history we only note level; mild neutrality
         if snap.long_short_ratio is not None:
             lsr = snap.long_short_ratio
             notes.append(f"L/S ratio {lsr:.3f}")
-            if lsr > 1.8:
-                score -= 0.2
-                notes.append("Crowded longs (L/S high)")
-            elif lsr < 0.7:
-                score += 0.2
-                notes.append("Crowded shorts (L/S low)")
+            if lsr > 1.6:
+                score -= 0.22
+                notes.append("Crowded longs (L/S high) — fade bias")
+            elif lsr < 0.75:
+                score += 0.22
+                notes.append("Crowded shorts (L/S low) — squeeze bias")
 
         if snap.percentage_24h is not None:
             notes.append(f"24h {snap.percentage_24h:+.2f}%")
-            # Fade extreme extensions slightly
-            if snap.percentage_24h > 12:
-                score -= 0.1
-            elif snap.percentage_24h < -12:
-                score += 0.1
+            # Intraday extension fade (mean reversion fuel)
+            if snap.percentage_24h > 8:
+                score -= 0.15
+                notes.append("Extended up 24h — MR short fuel")
+            elif snap.percentage_24h < -8:
+                score += 0.15
+                notes.append("Extended down 24h — MR long fuel")
 
         return float(clamp(score, -1, 1)), notes
 
@@ -407,32 +439,34 @@ class ConfluenceEngine:
         ind: IndicatorSuite,
         struct: StructureReport,
     ) -> Tuple[str, str, float]:
-        # Soft thresholds
-        if total >= 0.12:
+        # Slightly tighter thresholds for faster day-trade decisions
+        if total >= 0.10:
             bias, direction = "bullish", "long"
-        elif total <= -0.12:
+        elif total <= -0.10:
             bias, direction = "bearish", "short"
         else:
             bias, direction = "neutral", "flat"
 
-        # Confidence from magnitude + ADX (trend clarity)
         adx = ind.summary.get("adx")
+        mom = abs(float(ind.summary.get("momentum_score", 0) or 0))
         clarity = 1.0
         if adx is not None:
             if adx < 15:
-                clarity = 0.75
-            elif adx > 25:
-                clarity = 1.1
+                clarity = 0.8  # range → mean reversion ok, slightly less conf
+            elif adx > 22:
+                clarity = 1.12  # trend day — momentum scalps favored
+        if mom > 0.4:
+            clarity *= 1.05
 
-        conf = min(92.0, abs(total) * 100 * 1.15 * clarity + 20)
+        conf = min(92.0, abs(total) * 100 * 1.2 * clarity + 18)
         if direction == "flat":
             conf = min(conf, 48)
 
-        # Structure conflict penalty
+        # Softer structure conflict on LTF (can scalp against HTF briefly)
         if struct.trend == "up" and direction == "short":
-            conf *= 0.85
+            conf *= 0.90
         if struct.trend == "down" and direction == "long":
-            conf *= 0.85
+            conf *= 0.90
 
         return bias, direction, float(conf)
 
@@ -445,49 +479,58 @@ class ConfluenceEngine:
         direction: str,
         conf: float,
     ) -> List[str]:
+        """Tags optimized for perp day-trading / scalping playbooks."""
+        from src.utils.helpers import timeframe_to_minutes
+
         tags: List[str] = []
         adx = ind.summary.get("adx") or 0
         rsi = ind.summary.get("rsi")
         trend = float(ind.summary.get("trend_score", 0))
+        mom = float(ind.summary.get("momentum_score", 0))
         bb_pos = float(ind.summary.get("bb_position", 0.5))
+        vol_ratio = float(ind.summary.get("vol_ratio") or 1.0)
+        mins = timeframe_to_minutes(mtf.primary_tf)
 
-        if adx >= 25 and abs(trend) > 0.25:
-            tags.append("trend_following")
-        if adx < 20 and 0.2 < bb_pos < 0.8:
+        # Style tags
+        if abs(mom) > 0.35 and adx >= 20:
+            tags.append("momentum_scalp")
+        if adx < 22 and (bb_pos <= 0.22 or bb_pos >= 0.78 or (rsi is not None and (rsi < 35 or rsi > 65))):
             tags.append("mean_reversion")
         if struct.last_bos:
             tags.append("breakout" if struct.last_bos == "bullish" else "breakdown")
-        if abs(float(ind.summary.get("momentum_score", 0))) > 0.35:
+            tags.append("breakout_retest")
+        if abs(mom) > 0.25:
             tags.append("momentum")
+        if vol_ratio >= 1.35:
+            tags.append("volume_surge")
         if any(p.bias in ("bullish", "bearish") and p.kind == "candlestick" for p in pat.hits[:3]):
-            if any(x in (p.name.lower() for p in pat.hits[:3]) for x in ("engulf", "star", "hammer", "shooting")):
+            names = " ".join(p.name.lower() for p in pat.hits[:3])
+            if any(x in names for x in ("engulf", "star", "hammer", "shooting", "marubozu")):
                 tags.append("reversal")
-        if "accumulation" in struct.wyckoff_phase or "distribution" in struct.wyckoff_phase:
-            tags.append("wyckoff")
-        if "impulse" in struct.elliott_notes.lower():
-            tags.append("elliott_impulse")
-        elif "corrective" in struct.elliott_notes.lower():
-            tags.append("elliott_corrective")
+                tags.append("candle_scalp")
 
-        from src.utils.helpers import timeframe_to_minutes
-
-        if timeframe_to_minutes(mtf.primary_tf) <= 15:
+        # Horizon — prefer day_trade / scalp over swing
+        if mins <= 5:
             tags.append("scalping")
-        if timeframe_to_minutes(mtf.primary_tf) >= 60:
-            tags.append("swing")
-        if timeframe_to_minutes(mtf.primary_tf) >= 240:
-            tags.append("position")
+        elif mins <= 30:
+            tags.append("scalping")
+            tags.append("day_trade")
+        elif mins <= 120:
+            tags.append("day_trade")
+        else:
+            tags.append("day_trade")
+            if conf >= 78 and abs(trend) > 0.4:
+                tags.append("swing")  # rare, strong only
 
         if direction == "flat":
             tags.append("wait")
         if conf >= 70:
             tags.append("high_conviction")
-
-        # Volume profile context
+        if struct.last_choch:
+            tags.append("choch")
         if struct.volume_profile_poc:
-            tags.append("volume_profile")
+            tags.append("micro_structure")
 
-        # Unique preserve order
         seen = set()
         out = []
         for t in tags:
@@ -497,22 +540,23 @@ class ConfluenceEngine:
         return out
 
     def _setup_name(self, tags: List[str], direction: str, struct: StructureReport) -> str:
+        """Short-term setup labels for aggressive perp cards."""
         if direction == "flat":
-            return "No Trade / Observe"
+            return "No Trade / Stand Aside"
         side = "Long" if direction == "long" else "Short"
+        if "momentum_scalp" in tags:
+            return f"{side} Momentum Scalp"
         if "breakout" in tags or "breakdown" in tags:
-            return f"{side} Break of Structure"
-        if "wyckoff" in tags and "accumulation" in struct.wyckoff_phase:
-            return f"{side} Wyckoff Accumulation Continuation"
-        if "wyckoff" in tags and "distribution" in struct.wyckoff_phase:
-            return f"{side} Wyckoff Distribution Continuation"
+            return f"{side} Breakout Retest"
         if "mean_reversion" in tags:
-            return f"{side} Mean Reversion to Value"
-        if "trend_following" in tags:
-            return f"{side} Trend Pullback"
-        if "reversal" in tags:
-            return f"{side} Reversal Setup"
-        return f"{side} Confluence Setup"
+            return f"{side} Mean Reversion Scalp"
+        if "candle_scalp" in tags or "reversal" in tags:
+            return f"{side} Reversal Scalp"
+        if "volume_surge" in tags and "momentum" in tags:
+            return f"{side} Volume Momentum Burst"
+        if "choch" in tags:
+            return f"{side} CHoCH Continuation"
+        return f"{side} Day-Trade Confluence"
 
     def _nearest_levels(
         self, struct: StructureReport, price: float
@@ -582,42 +626,39 @@ class ConfluenceEngine:
         return f"vol_ratio={s.get('vol_ratio')} CMF={s.get('cmf')} MFI={s.get('mfi')}"
 
     def _commentary(self, a: FullAnalysis) -> str:
-        """Senior trader style narrative."""
+        """Day-trader / scalper narrative for high-leverage perps."""
         parts: List[str] = []
         price = a.meta.get("price") if a.meta else None
         parts.append(
-            f"On {a.primary_tf}, {a.symbol} prints a {a.bias} lean "
-            f"({a.confidence:.0f}% confidence) via weighted confluence "
-            f"{a.confluence_total:+.3f}."
+            f"Day-trade read on {a.primary_tf} {a.symbol}: {a.bias} lean "
+            f"({a.confidence:.0f}% conf, confluence {a.confluence_total:+.3f}). "
+            f"Engine is weighted for momentum, volume, funding, and micro-structure."
         )
         if a.structure:
             parts.append(a.structure.summary + ".")
-            if a.structure.wyckoff_notes:
-                parts.append(a.structure.wyckoff_notes)
-            if a.structure.elliott_notes:
-                parts.append(a.structure.elliott_notes)
         if a.patterns and a.patterns.hits:
             top = a.patterns.hits[0]
             parts.append(
-                f"Pattern focus: {top.name} ({top.bias}, {top.confidence:.0f}% conf)."
+                f"Candle/pattern trigger: {top.name} ({top.bias}, {top.confidence:.0f}%)."
             )
         if a.derivatives_notes:
-            parts.append("Derivatives: " + "; ".join(a.derivatives_notes[:4]) + ".")
+            parts.append("Funding/OI: " + "; ".join(a.derivatives_notes[:3]) + ".")
         if a.multi_tf_notes:
-            parts.append("MTF: " + a.multi_tf_notes[0] + ".")
+            parts.append("Stack: " + a.multi_tf_notes[0] + ".")
         if a.news and a.news.bias != "neutral":
-            parts.append(f"News flow tilts {a.news.bias}.")
+            parts.append(f"News tilt {a.news.bias} — treat as secondary.")
         if a.trade_plan and a.trade_plan.direction != "flat":
             tp = a.trade_plan
+            hold = getattr(tp, "hold_detail", "") or "hold ≤12–24h"
             parts.append(
-                f"Playbook: {a.setup_name}. Entry {format_price(tp.entry_low, price)}–"
-                f"{format_price(tp.entry_high, price)}, SL {format_price(tp.stop_loss, price)}, "
-                f"R:R TP1 {tp.primary_rr:.2f} ({tp.quality}). "
-                f"Sim leverage ~{tp.leverage_suggested:.1f}x on ${tp.simulated_capital:,.0f}."
+                f"Playbook: {a.setup_name}. Tight entry "
+                f"{format_price(tp.entry_low, price)}–{format_price(tp.entry_high, price)}, "
+                f"SL {format_price(tp.stop_loss, price)}, TP1 R:R {tp.primary_rr:.2f} ({tp.quality}). "
+                f"Suggested lev ~{tp.leverage_suggested:.0f}x (20–100x). {hold}."
             )
         else:
-            parts.append("No clean asymmetric trade — stand aside or scalp only with tiny size.")
-        parts.append("Simulation / research only — not financial advice.")
+            parts.append("No clean scalp — stand aside; do not force high leverage.")
+        parts.append("Research / simulation only — not financial advice.")
         return " ".join(parts)
 
     def _key_reasons(
@@ -649,16 +690,19 @@ class ConfluenceEngine:
         funding: Optional[float],
     ) -> List[str]:
         risks = [
-            "Perpetual futures can gap; stops may slip during liquidations.",
-            "This is a simulated risk model — not live account advice.",
+            "High-leverage perps (20x–100x) liquidate fast — risk % of capital at the stop, not max margin.",
+            "Day-trade / scalp: flat within 12–24h if thesis fails; do not turn losers into swings.",
+            "Simulation only — not live account advice.",
         ]
         atr_pct = (atr / price * 100) if price else 0
-        if atr_pct > 2.5:
-            risks.append(f"High ATR ({atr_pct:.2f}% of price) — widen invalidation tolerance.")
-        if funding is not None and abs(funding) > 0.0005:
-            risks.append(f"Funding not neutral ({funding*100:+.4f}%) — squeeze risk.")
+        if atr_pct > 2.0:
+            risks.append(f"Elevated ATR ({atr_pct:.2f}% of price) — cut leverage toward 20x and trail after TP1.")
+        if funding is not None and abs(funding) > 0.0003:
+            risks.append(f"Funding not neutral ({funding*100:+.4f}%) — squeeze / funding bleed risk.")
         if a.confidence < 45:
-            risks.append("Confidence below 45% — prefer skip or micro size.")
+            risks.append("Confidence below 45% — skip or micro size only.")
         if a.trade_plan and a.trade_plan.quality == "poor":
-            risks.append("Plan quality poor (R:R / confluence) — do not force the trade.")
+            risks.append("Plan quality poor — do not force the trade.")
+        if a.trade_plan and (a.trade_plan.leverage_suggested or 0) >= 50:
+            risks.append("Suggested leverage ≥50x — bank partials at TP1 and never move stop against you.")
         return risks[:8]

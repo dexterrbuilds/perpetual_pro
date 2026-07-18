@@ -65,30 +65,23 @@ class ReportGenerator:
         header.add_row("Confluence", f"{analysis.confluence_total:+.3f}")
         c.print(Panel(header, title="Bias & Setup", border_style=bias_color))
 
-        # Primary setup / trade plan
+        # Pro trader setup card
         plan = analysis.trade_plan
         price = analysis.meta.get("price")
         if plan:
-            pt = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
-            pt.add_column("Field")
-            pt.add_column("Value", style="bold")
-            pt.add_row("Direction", plan.direction.upper())
-            pt.add_row(
-                "Entry zone",
-                f"{format_price(plan.entry_low, price)} — {format_price(plan.entry_high, price)}",
+            pro_lines = plan.to_pro_lines(analysis.symbol, price)
+            headline = pro_lines[0] if pro_lines else "SETUP"
+            body = "\n".join(pro_lines[1:]) if len(pro_lines) > 1 else "—"
+            c.print(
+                Panel(
+                    f"[bold white]{headline}[/]\n\n{body}",
+                    title="🚨 Primary Setup",
+                    border_style="magenta",
+                    box=box.HEAVY,
+                )
             )
-            pt.add_row("Stop Loss", format_price(plan.stop_loss, price))
-            for i, (tp, rr) in enumerate(zip(plan.take_profits, plan.risk_reward), 1):
-                pt.add_row(f"TP{i}", f"{format_price(tp, price)}  (R:R {rr:.2f})")
-            pt.add_row("Position size", f"{plan.position_size_units:.6g} units")
-            pt.add_row("Notional", f"${plan.position_size_notional:,.2f}")
-            pt.add_row("Risk $", f"${plan.risk_amount:,.2f} ({plan.risk_pct:.2f}%)")
-            pt.add_row("Leverage (cap)", f"{plan.leverage_suggested:.1f}x")
-            pt.add_row("Plan quality", plan.quality.upper())
-            pt.add_row("Invalidation", plan.invalidation)
-            c.print(Panel(pt, title="Primary Setup", border_style="magenta"))
             if plan.notes:
-                for n in plan.notes:
+                for n in plan.notes[:6]:
                     c.print(f"  [dim]• {n}[/]")
 
         # Confluence breakdown
@@ -280,7 +273,16 @@ class ReportGenerator:
             "disclaimer": DISCLAIMER,
         }
         if plan:
-            data["primary_setup"] = plan.to_primary_setup()
+            setup = plan.to_primary_setup()
+            setup["headline"] = plan.setup_headline(analysis.symbol)
+            setup["pro_lines"] = plan.to_pro_lines(
+                analysis.symbol, analysis.meta.get("price") if analysis.meta else None
+            )
+            data["primary_setup"] = setup
+            data["signal"]["headline"] = setup["headline"]
+            data["signal"]["hold_label"] = getattr(plan, "hold_label", "")
+            data["signal"]["hold_detail"] = getattr(plan, "hold_detail", "")
+            data["signal"]["leverage_suggested"] = plan.leverage_suggested
             data["position_simulation"] = plan.to_position_simulation()
             data["trade_plan"] = {
                 "direction": plan.direction,
@@ -289,6 +291,9 @@ class ReportGenerator:
                 "stop_loss": plan.stop_loss,
                 "take_profits": plan.take_profits,
                 "risk_reward": plan.risk_reward,
+                "alternative_entry_low": getattr(plan, "alternative_entry_low", None),
+                "alternative_entry_high": getattr(plan, "alternative_entry_high", None),
+                "alternative_entry_note": getattr(plan, "alternative_entry_note", ""),
                 "position_size_units": plan.position_size_units,
                 "position_size_notional": plan.position_size_notional,
                 "margin_required": getattr(plan, "margin_required", None),
@@ -302,6 +307,11 @@ class ReportGenerator:
                 "quality": plan.quality,
                 "notes": plan.notes,
                 "invalidation": plan.invalidation,
+                "hold_label": getattr(plan, "hold_label", ""),
+                "hold_detail": getattr(plan, "hold_detail", ""),
+                "hold_hours_max": getattr(plan, "hold_hours_max", 24.0),
+                "headline": setup["headline"],
+                "pro_lines": setup["pro_lines"],
                 "is_simulation": True,
             }
         if getattr(analysis, "llm", None):
@@ -400,24 +410,16 @@ class ReportGenerator:
             f"- **Tags:** {', '.join(analysis.strategy_tags)}",
             f"- **Confluence:** {analysis.confluence_total:+.3f}",
             "",
-            "## Primary Setup",
+            "## 🚨 Primary Setup",
             "",
         ]
         if plan:
+            for line in plan.to_pro_lines(analysis.symbol, price):
+                lines.append(f"**{line}**" if line.startswith("🚨") or line.startswith("⏸") else f"- {line}")
             lines += [
-                f"| Field | Value |",
-                f"|---|---|",
-                f"| Direction | {plan.direction} |",
-                f"| Entry | {format_price(plan.entry_low, price)} — {format_price(plan.entry_high, price)} |",
-                f"| Stop Loss | {format_price(plan.stop_loss, price)} |",
-            ]
-            for i, (tp, rr) in enumerate(zip(plan.take_profits, plan.risk_reward), 1):
-                lines.append(f"| TP{i} | {format_price(tp, price)} (R:R {rr:.2f}) |")
-            lines += [
-                f"| Size | {plan.position_size_units:.6g} units (${plan.position_size_notional:,.2f}) |",
-                f"| Risk | ${plan.risk_amount:,.2f} ({plan.risk_pct:.2f}%) |",
-                f"| Quality | {plan.quality} |",
-                f"| Invalidation | {plan.invalidation} |",
+                "",
+                f"- **Sim leverage:** {plan.leverage_suggested:.0f}x",
+                f"- **Quality:** {plan.quality}",
                 "",
             ]
         else:

@@ -628,7 +628,7 @@ async function getSettings() {
   return {
     defaultTimeframe: "",
     defaultExchange: "binanceusdm",
-    higher: "5m,1h,4h,1d",
+    higher: "5m,1h,4h",
     noNews: false,
     darkTheme: true,
     captureMode: "visible",

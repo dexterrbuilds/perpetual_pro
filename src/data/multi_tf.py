@@ -52,19 +52,19 @@ def fetch_multi_timeframe(
     """
     Fetch primary + higher timeframe OHLCV (and optional derivatives snapshot).
 
-    Higher TFs default from config or common prop stack (1h/4h/1d).
+    Higher TFs default to day-trade stack: 5m, 1h, 4h confirmation.
     """
     if higher_tfs is None:
         higher_tfs = (
             list(config.timeframes.higher)
             if config
-            else ["5m", "1h", "4h", "1d"]
+            else ["5m", "1h", "4h"]
         )
-    # Max signal quality default stack (includes lower TF context when useful)
+    # Day-trade bar depth (enough for micro-structure without HTF bloat)
     if config:
-        limit = max(limit or 0, int(config.timeframes.ohlcv_limit or 1000))
+        limit = max(limit or 0, int(config.timeframes.ohlcv_limit or 500))
     else:
-        limit = max(limit or 500, 1000)
+        limit = max(limit or 300, 500)
 
     # Deduplicate while preserving order; always include primary
     ordered: List[str] = []

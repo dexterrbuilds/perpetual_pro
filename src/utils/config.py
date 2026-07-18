@@ -34,22 +34,24 @@ class RiskConfig:
 
     simulated_capital: float = 1000.0
     risk_per_trade_pct: float = 1.0
-    # Soft ceiling for *suggested* dynamic leverage (not exchange max)
-    leverage_ceiling: float = 20.0
-    leverage_floor: float = 1.0
-    min_rr: float = 1.5
-    default_stop_atr_mult: float = 1.5
-    default_tp_atr_mults: List[float] = field(default_factory=lambda: [1.5, 2.5, 4.0])
+    # Aggressive perp leverage suggestions (not exchange max margin)
+    leverage_ceiling: float = 100.0
+    leverage_floor: float = 20.0
+    min_rr: float = 1.2
+    default_stop_atr_mult: float = 1.0
+    default_tp_atr_mults: List[float] = field(default_factory=lambda: [0.7, 1.3, 2.0, 3.0])
     # Legacy alias (read-only migration)
     account_balance: float = 1000.0
-    max_leverage: int = 20
+    max_leverage: int = 100
 
 
 @dataclass
 class TimeframesConfig:
+    """Day-trade stack: 5m / 15m / 1h with 4h confirmation."""
+
     primary: str = "15m"
-    higher: List[str] = field(default_factory=lambda: ["5m", "1h", "4h", "1d"])
-    ohlcv_limit: int = 1000
+    higher: List[str] = field(default_factory=lambda: ["5m", "1h", "4h"])
+    ohlcv_limit: int = 500
 
 
 @dataclass
@@ -64,13 +66,15 @@ class LLMConfig:
 
 @dataclass
 class AnalysisWeights:
-    trend: float = 0.18
-    momentum: float = 0.14
-    structure: float = 0.16
-    patterns: float = 0.12
-    derivatives: float = 0.12
-    multi_tf: float = 0.14
-    volume: float = 0.08
+    """Short-term perp weights — momentum, funding, volume, micro-structure first."""
+
+    momentum: float = 0.20
+    derivatives: float = 0.16
+    structure: float = 0.14
+    volume: float = 0.12
+    multi_tf: float = 0.12
+    patterns: float = 0.10
+    trend: float = 0.10
     news: float = 0.06
 
 
@@ -205,17 +209,17 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             simulated_capital=float(sim_cap),
             account_balance=float(sim_cap),
             risk_per_trade_pct=float(risk.get("risk_per_trade_pct", 1.0)),
-            leverage_ceiling=float(risk.get("leverage_ceiling", risk.get("max_leverage", 20))),
-            leverage_floor=float(risk.get("leverage_floor", 1.0)),
-            max_leverage=int(risk.get("max_leverage", risk.get("leverage_ceiling", 20))),
-            min_rr=float(risk.get("min_rr", 1.5)),
-            default_stop_atr_mult=float(risk.get("default_stop_atr_mult", 1.5)),
-            default_tp_atr_mults=list(risk.get("default_tp_atr_mults", [1.5, 2.5, 4.0])),
+            leverage_ceiling=float(risk.get("leverage_ceiling", risk.get("max_leverage", 100))),
+            leverage_floor=float(risk.get("leverage_floor", 20.0)),
+            max_leverage=int(risk.get("max_leverage", risk.get("leverage_ceiling", 100))),
+            min_rr=float(risk.get("min_rr", 1.2)),
+            default_stop_atr_mult=float(risk.get("default_stop_atr_mult", 1.0)),
+            default_tp_atr_mults=list(risk.get("default_tp_atr_mults", [0.7, 1.3, 2.0, 3.0])),
         ),
         timeframes=TimeframesConfig(
             primary=str(tf.get("primary", "15m")),
-            higher=list(tf.get("higher", ["5m", "1h", "4h", "1d"])),
-            ohlcv_limit=int(tf.get("ohlcv_limit", 1000)),
+            higher=list(tf.get("higher", ["5m", "1h", "4h"])),
+            ohlcv_limit=int(tf.get("ohlcv_limit", 500)),
         ),
         analysis=AnalysisConfig(
             rsi_period=int(an.get("rsi_period", 14)),
@@ -228,13 +232,13 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             ema_slow=int(an.get("ema_slow", 50)),
             ema_trend=int(an.get("ema_trend", 200)),
             weights=AnalysisWeights(
-                trend=float(weights.get("trend", 0.18)),
-                momentum=float(weights.get("momentum", 0.14)),
-                structure=float(weights.get("structure", 0.16)),
-                patterns=float(weights.get("patterns", 0.12)),
-                derivatives=float(weights.get("derivatives", 0.12)),
-                multi_tf=float(weights.get("multi_tf", 0.14)),
-                volume=float(weights.get("volume", 0.08)),
+                momentum=float(weights.get("momentum", 0.20)),
+                derivatives=float(weights.get("derivatives", 0.16)),
+                structure=float(weights.get("structure", 0.14)),
+                volume=float(weights.get("volume", 0.12)),
+                multi_tf=float(weights.get("multi_tf", 0.12)),
+                patterns=float(weights.get("patterns", 0.10)),
+                trend=float(weights.get("trend", 0.10)),
                 news=float(weights.get("news", 0.06)),
             ),
             min_confidence=float(an.get("min_confidence", 15)),

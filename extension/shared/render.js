@@ -1,6 +1,6 @@
 /**
  * Shared result rendering for popup + sidepanel.
- * Professional, scannable dark-theme report.
+ * Aggressive crypto-perp pro setup cards + full confluence report.
  */
 
 /** Educational illustration only — matches backend request capital. */
@@ -34,34 +34,44 @@ export function fmtMoney(n) {
 }
 
 /**
- * Suggested hold window from timeframe + setup tags.
+ * Day-trade biased hold window. Max 12–24h for most signals;
+ * longer only for strong swing (backend usually already computed).
  */
-export function suggestHoldTime(tf, setupName, tags = [], direction = "") {
+export function suggestHoldTime(tf, setupName, tags = [], direction = "", plan = {}) {
+  if (plan.hold_detail || plan.hold_label) {
+    return {
+      label: plan.hold_label || "Day trade",
+      detail: plan.hold_detail || "Suggested hold: 4–24 hours",
+    };
+  }
   const t = String(tf || "").toLowerCase().trim();
   const blob = `${setupName || ""} ${(tags || []).join(" ")} ${direction || ""}`.toLowerCase();
+  const strongSwing =
+    blob.includes("swing") &&
+    (t === "4h" || t === "1d" || t === "12h" || blob.includes("trend"));
 
   if (blob.includes("scalp") || ["1m", "3m", "5m"].includes(t)) {
-    return { label: "Scalp", detail: "Suggested hold: 15–90 minutes" };
+    return { label: "Scalp", detail: "Suggested hold: 15–90 minutes (max 2h)" };
   }
   if (["15m", "30m"].includes(t)) {
-    return { label: "Intraday", detail: "Suggested hold: 1–8 hours" };
+    return { label: "Intraday", detail: "Suggested hold: 1–8 hours (max 12h)" };
   }
   if (["1h", "2h"].includes(t)) {
-    return { label: "Day trade", detail: "Suggested hold: 4–24 hours" };
+    return { label: "Day trade", detail: "Suggested hold: 4–12 hours (max 24h)" };
   }
   if (["4h", "6h", "8h", "12h"].includes(t)) {
-    if (blob.includes("swing") || blob.includes("breakout")) {
-      return { label: "Swing", detail: "Suggested hold: 2–7 days" };
+    if (strongSwing) {
+      return { label: "Swing", detail: "Suggested hold: 1–3 days (strong swing only)" };
     }
-    return { label: "Swing", detail: "Suggested hold: 1–5 days" };
+    return { label: "Day / short swing", detail: "Suggested hold: 8–24 hours" };
   }
-  if (["1d", "3d", "1w", "1W"].includes(t) || t === "d" || t === "w") {
-    return { label: "Position", detail: "Suggested hold: 2–14 days" };
+  if (["1d", "3d", "1w"].includes(t)) {
+    if (strongSwing) {
+      return { label: "Swing", detail: "Suggested hold: 2–5 days (strong HTF swing)" };
+    }
+    return { label: "Day / short swing", detail: "Suggested hold: 12–24 hours — reassess daily" };
   }
-  if (blob.includes("swing")) {
-    return { label: "Swing", detail: "Suggested hold: 2–7 days" };
-  }
-  return { label: "Intraday", detail: "Suggested hold: 4–24 hours" };
+  return { label: "Day trade", detail: "Suggested hold: 4–24 hours" };
 }
 
 /**
@@ -100,6 +110,7 @@ export function renderResults(container, result) {
   const conf = result.confidence != null ? Number(result.confidence).toFixed(1) : "—";
   const price = result.meta?.price ?? result.snapshot?.last;
   const plan = result.trade_plan || {};
+  const primary = result.primary_setup || {};
   const factors = Array.isArray(result.factors) ? result.factors : [];
   const patterns = Array.isArray(result.patterns) ? result.patterns.slice(0, 6) : [];
   const levels = Array.isArray(result.key_levels) ? result.key_levels.slice(0, 6) : [];
@@ -111,13 +122,26 @@ export function renderResults(container, result) {
     result.primary_tf,
     result.setup_name,
     tags,
-    plan.direction || result.direction
+    plan.direction || result.direction,
+    plan
   );
   const reasons = Array.isArray(result.key_reasons) ? result.key_reasons.slice(0, 5) : [];
   const risks = Array.isArray(result.key_risks) ? result.key_risks.slice(0, 5) : [];
+  const headline =
+    plan.headline ||
+    primary.headline ||
+    result.signal?.headline ||
+    buildHeadline(result.symbol, plan.direction || result.direction);
+  const lev =
+    plan.leverage_suggested != null
+      ? Math.round(Number(plan.leverage_suggested))
+      : primary.leverage_suggested != null
+        ? Math.round(Number(primary.leverage_suggested))
+        : "—";
 
   container.innerHTML = `
     <section class="hero ${bc}">
+      <div class="setup-headline">${escapeHtml(headline)}</div>
       <div class="hero-top">
         <div>
           <div class="symbol">${escapeHtml(prettySymbol(result.symbol))}</div>
@@ -136,33 +160,38 @@ export function renderResults(container, result) {
           <span class="value">${result.confluence_total != null ? Number(result.confluence_total).toFixed(3) : "—"}</span>
         </div>
         <div class="metric">
-          <span class="label">Price</span>
-          <span class="value">${fmtPrice(price)}</span>
+          <span class="label">Leverage</span>
+          <span class="value lev-hot">${escapeHtml(String(lev))}x</span>
         </div>
       </div>
       <div class="setup-name">${escapeHtml(result.setup_name || "—")}</div>
-      <div class="hold-badge" title="Educational hold window from timeframe & setup type">
+      <div class="hold-badge" title="Hold window — day-trade biased">
         <span class="hold-label">${escapeHtml(hold.label)}</span>
         <span class="hold-detail">${escapeHtml(hold.detail)}</span>
       </div>
       <div class="tags">${tags.map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join("")}</div>
     </section>
 
-    <section class="card card-accent">
-      <h3>Primary Setup</h3>
-      ${renderPlan(plan, price)}
+    <section class="card card-accent pro-setup-card">
+      <h3>🚨 Trade Setup</h3>
+      ${renderProSetup(plan, primary, price, headline, hold, lev)}
     </section>
 
     <section class="card sim-card">
       <h3>Simulation Example</h3>
-      ${renderSimulation(plan, result)}
+      ${renderSimulation(plan, result, lev)}
+    </section>
+
+    <section class="card">
+      <h3>⚠ Risk Advice</h3>
+      ${renderRiskAdvice(plan, risks, lev)}
     </section>
 
     ${
-      reasons.length || risks.length
+      reasons.length
         ? `<section class="card">
             <h3>Why This Signal</h3>
-            ${renderReasonsRisks(reasons, risks)}
+            ${renderReasonsRisks(reasons, [])}
           </section>`
         : ""
     }
@@ -242,9 +271,17 @@ export function renderResults(container, result) {
     }
 
     <section class="disclaimer">
-      ${escapeHtml(result.disclaimer || "NOT FINANCIAL ADVICE. Educational / research only. Perpetuals are high risk.")}
+      ${escapeHtml(result.disclaimer || "NOT FINANCIAL ADVICE. Educational / research only. High leverage perps can liquidate quickly.")}
     </section>
   `;
+}
+
+function buildHeadline(symbol, direction) {
+  const base = prettySymbol(symbol).split("/")[0] || "PAIR";
+  const d = String(direction || "").toLowerCase();
+  if (d === "long") return `🚨 ${base} LONG SETUP`;
+  if (d === "short") return `🚨 ${base} SHORT SETUP`;
+  return `⏸ ${base} NO TRADE — STAND ASIDE`;
 }
 
 function prettySymbol(sym) {
@@ -254,70 +291,93 @@ function prettySymbol(sym) {
   return s;
 }
 
-function renderPlan(plan, price) {
+/**
+ * Bold pro trader setup block.
+ */
+function renderProSetup(plan, primary, price, headline, hold, lev) {
   if (!plan || !plan.direction || plan.direction === "flat") {
     return `<div class="muted">No directional trade plan — stand aside or wait for clearer structure.</div>`;
   }
-  const tps = Array.isArray(plan.take_profits) ? plan.take_profits : [];
-  const rrs = Array.isArray(plan.risk_reward) ? plan.risk_reward : [];
-  const lev = plan.leverage_suggested != null ? Number(plan.leverage_suggested).toFixed(1) : "—";
+
+  const tps = Array.isArray(plan.take_profits)
+    ? plan.take_profits
+    : [primary.tp1, primary.tp2, primary.tp3, primary.tp4].filter((x) => x != null);
+  const rrs = Array.isArray(plan.risk_reward)
+    ? plan.risk_reward
+    : [primary.rr_tp1, primary.rr_tp2, primary.rr_tp3, primary.rr_tp4];
+  const dir = String(plan.direction).toUpperCase();
+  const dirCls = biasClass(plan.direction);
+  const dirEmoji = dir === "LONG" ? "🟢" : dir === "SHORT" ? "🔴" : "⚪";
+
+  const altLow = plan.alternative_entry_low ?? primary.alternative_entry?.low;
+  const altHigh = plan.alternative_entry_high ?? primary.alternative_entry?.high;
+  const altNote = plan.alternative_entry_note || primary.alternative_entry?.note || "";
+
+  const tpEmojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"];
+
   return `
-    <div class="grid-2">
-      <div>
-        <span class="label">Direction</span>
-        <div class="value ${biasClass(plan.direction)}">${escapeHtml(String(plan.direction).toUpperCase())}</div>
-      </div>
-      <div>
-        <span class="label">Suggested lev.</span>
-        <div class="value">${lev}x</div>
-      </div>
-      <div>
-        <span class="label">Entry zone</span>
-        <div class="value">${fmtPrice(plan.entry_low, price)} – ${fmtPrice(plan.entry_high, price)}</div>
-      </div>
-      <div>
-        <span class="label">Stop loss</span>
-        <div class="value bear">${fmtPrice(plan.stop_loss, price)}</div>
-      </div>
-      <div>
-        <span class="label">Quality</span>
-        <div class="value">${escapeHtml((plan.quality || "—").toUpperCase())}</div>
-      </div>
-      <div>
-        <span class="label">R:R (TP1)</span>
-        <div class="value">${rrs[0] != null ? Number(rrs[0]).toFixed(2) : "—"}</div>
+    <div class="pro-setup">
+      <div class="pro-headline">${escapeHtml(headline)}</div>
+      <div class="pro-rows">
+        <div class="pro-row">
+          <span class="pro-k">${dirEmoji} Direction</span>
+          <span class="pro-v ${dirCls}"><strong>${escapeHtml(dir)}</strong></span>
+        </div>
+        <div class="pro-row">
+          <span class="pro-k">🎯 Entry Zone</span>
+          <span class="pro-v"><strong>${fmtPrice(plan.entry_low, price)} – ${fmtPrice(plan.entry_high, price)}</strong></span>
+        </div>
+        ${
+          altLow != null && altHigh != null
+            ? `<div class="pro-row">
+                <span class="pro-k">🔄 Alternative Entry</span>
+                <span class="pro-v"><strong>${fmtPrice(altLow, price)} – ${fmtPrice(altHigh, price)}</strong>
+                ${altNote ? `<span class="muted"> · ${escapeHtml(altNote)}</span>` : ""}</span>
+              </div>`
+            : ""
+        }
+        <div class="pro-row">
+          <span class="pro-k">🛑 Stop-Loss</span>
+          <span class="pro-v bear"><strong>${fmtPrice(plan.stop_loss, price)}</strong></span>
+        </div>
+        ${tps
+          .slice(0, 4)
+          .map(
+            (tp, i) =>
+              `<div class="pro-row">
+                <span class="pro-k">${tpEmojis[i] || "•"} TP${i + 1}</span>
+                <span class="pro-v bull"><strong>${fmtPrice(tp, price)}</strong>
+                <span class="muted"> · R:R ${rrs[i] != null ? Number(rrs[i]).toFixed(2) : "—"}</span></span>
+              </div>`
+          )
+          .join("")}
+        <div class="pro-row">
+          <span class="pro-k">⚡ Leverage</span>
+          <span class="pro-v lev-hot"><strong>${escapeHtml(String(lev))}x</strong></span>
+        </div>
+        <div class="pro-row">
+          <span class="pro-k">⏱ Hold</span>
+          <span class="pro-v"><strong>${escapeHtml(hold.detail)}</strong></span>
+        </div>
+        <div class="pro-row">
+          <span class="pro-k">❌ Invalidation</span>
+          <span class="pro-v">${escapeHtml(plan.invalidation || "—")}</span>
+        </div>
+        <div class="pro-row">
+          <span class="pro-k">⭐ Quality</span>
+          <span class="pro-v"><strong>${escapeHtml((plan.quality || "—").toUpperCase())}</strong></span>
+        </div>
       </div>
     </div>
-    <div class="tp-row">
-      ${tps
-        .map(
-          (tp, i) =>
-            `<div class="tp">
-              <span class="label">TP${i + 1}</span>
-              <div class="value bull">${fmtPrice(tp, price)}</div>
-              <div class="muted">R:R ${rrs[i] != null ? Number(rrs[i]).toFixed(2) : "—"}</div>
-            </div>`
-        )
-        .join("")}
-    </div>
-    ${
-      plan.invalidation
-        ? `<div class="muted inv"><b>Invalidation:</b> ${escapeHtml(plan.invalidation)}</div>`
-        : ""
-    }
   `;
 }
 
-/**
- * Educational simulation block — not a wallet.
- */
-function renderSimulation(plan, result) {
+function renderSimulation(plan, result, lev) {
   if (!plan || !plan.direction || plan.direction === "flat") {
     return `<div class="muted">No simulation — flat / neutral bias.</div>`;
   }
 
-  const lev =
-    plan.leverage_suggested != null ? Number(plan.leverage_suggested).toFixed(1) : "—";
+  const levStr = lev != null && lev !== "—" ? String(lev) : "—";
   const profits = simulationProfits(plan);
   const atrPct = plan.atr_pct ?? result?.meta?.atr_pct;
   const conf = result?.confidence;
@@ -325,7 +385,7 @@ function renderSimulation(plan, result) {
   const lines =
     profits.length > 0
       ? profits
-          .slice(0, 3)
+          .slice(0, 4)
           .map((p, i) => {
             const cls = p >= 0 ? "bull" : "bear";
             return `<li class="${cls}">At TP${i + 1} → <strong>${fmtMoney(p)}</strong> profit</li>`;
@@ -336,7 +396,7 @@ function renderSimulation(plan, result) {
   const metaBits = [];
   if (atrPct != null) metaBits.push(`ATR ${Number(atrPct).toFixed(2)}%`);
   if (conf != null) metaBits.push(`conf ${Number(conf).toFixed(0)}%`);
-  metaBits.push("funding-aware lev");
+  metaBits.push("20x–100x band");
 
   return `
     <div class="sim-header">
@@ -344,21 +404,41 @@ function renderSimulation(plan, result) {
     </div>
     <p class="sim-lead">
       If you trade this signal with <strong>$${SIM_EXAMPLE_USD}</strong> at the suggested
-      <strong>${escapeHtml(String(lev))}x</strong> leverage:
+      <strong>${escapeHtml(levStr)}x</strong> leverage:
     </p>
     <ul class="sim-list">
       ${lines}
     </ul>
     <p class="sim-meta muted">
       Leverage is model-suggested from ${escapeHtml(metaBits.join(" · "))} — not exchange max margin.
-      Not a real balance or order.
+      Not a real balance or order. High leverage can liquidate fast.
     </p>
   `;
 }
 
+function renderRiskAdvice(plan, keyRisks, lev) {
+  const notes = Array.isArray(plan?.notes) ? plan.notes.filter((n) => /risk|leverage|Low confidence|High leverage|R:R/i.test(n)) : [];
+  const items = [
+    ...(keyRisks || []),
+    ...notes.slice(0, 3),
+    lev != null && Number(lev) >= 50
+      ? `Suggested ${lev}x is aggressive — trail after TP1 and never move stop against you.`
+      : null,
+    "Risk a small % of capital at the stop; do not max margin on the full notional.",
+  ].filter(Boolean);
+
+  if (!items.length) {
+    return `<div class="muted">Respect the stop. Day-trade style holds — flat if thesis breaks.</div>`;
+  }
+  return `<ul class="list tight risk-list">${items
+    .slice(0, 6)
+    .map((r) => `<li>${escapeHtml(r)}</li>`)
+    .join("")}</ul>`;
+}
+
 function renderReasonsRisks(reasons, risks) {
   return `
-    <div class="rr-grid">
+    <div class="rr-grid${risks.length ? "" : " rr-single"}">
       <div>
         <div class="label">Key reasons</div>
         ${
@@ -367,14 +447,14 @@ function renderReasonsRisks(reasons, risks) {
             : `<div class="muted">—</div>`
         }
       </div>
-      <div>
-        <div class="label">Key risks</div>
-        ${
-          risks.length
-            ? `<ul class="list tight risk-list">${risks.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>`
-            : `<div class="muted">—</div>`
-        }
-      </div>
+      ${
+        risks.length
+          ? `<div>
+              <div class="label">Key risks</div>
+              <ul class="list tight risk-list">${risks.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>
+            </div>`
+          : ""
+      }
     </div>
   `;
 }
