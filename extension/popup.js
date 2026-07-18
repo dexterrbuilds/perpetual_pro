@@ -12,10 +12,13 @@ const els = {
   statusDot: $("statusDot"),
   statusText: $("statusText"),
   errorBanner: $("errorBanner"),
+  successBanner: $("successBanner"),
   loading: $("loading"),
   loadingText: $("loadingText"),
+  loadingSteps: $("loadingSteps"),
   results: $("results"),
   thumb: $("thumb"),
+  thumbWrap: $("thumbWrap"),
   settingsPanel: $("settingsPanel"),
   btnSettings: $("btnSettings"),
   btnCapture: $("btnCapture"),
@@ -28,10 +31,7 @@ const els = {
   timeframe: $("timeframe"),
   exchange: $("exchange"),
   higher: $("higher"),
-  balance: $("balance"),
-  risk: $("risk"),
   noNews: $("noNews"),
-  // Manual symbol recovery UI
   manualPanel: $("manualSymbolPanel"),
   manualSymbol: $("manualSymbol"),
   manualTimeframe: $("manualTimeframe"),
@@ -42,53 +42,50 @@ const els = {
   manualChips: $("manualSymbolChips"),
 };
 
-/** @type {null | {
- *   dataUrl: string,
- *   timeframe: string,
- *   exchange: string,
- *   clientOcr: object | null,
- *   reason: string
- * }} */
+/** Capture context for the current image only (never reused across captures). */
 let pendingCapture = null;
+/** Last shown capture data URL (for Refresh). */
+let lastCaptureDataUrl = null;
 let busy = false;
+/** Symbol the user typed as an intentional override for the next capture only. */
+let captureOverrideSymbol = "";
 
 init();
 
 async function init() {
   await loadSettingsIntoForm();
   await refreshBackendStatus();
-  await loadLastResult();
+  await loadLastResult({ restoreThumb: true });
   await maybeProcessPending();
 
   els.btnSettings.addEventListener("click", () => {
-    const open = els.settingsPanel.style.display !== "none";
-    els.settingsPanel.style.display = open ? "none" : "grid";
+    const open = !els.settingsPanel.hidden;
+    els.settingsPanel.hidden = open;
+    els.btnSettings.classList.toggle("active", !open);
   });
 
-  els.btnSaveSettings.addEventListener("click", saveSettingsFromForm);
-  // Primary: auto full-tab capture
+  els.btnSaveSettings.addEventListener("click", async () => {
+    await saveSettingsFromForm();
+    flashSuccess("Settings saved");
+    setStatusUI("idle", "Settings saved · ready");
+  });
+
   els.btnCapture.addEventListener("click", () => startCapture("visible"));
-  // Optional manual region
   els.btnSelectArea?.addEventListener("click", () => startCapture("select-area"));
   els.btnSidePanel.addEventListener("click", openSidePanel);
-  els.btnRefresh.addEventListener("click", async () => {
-    await refreshBackendStatus();
-    await loadLastResult();
-  });
-  els.btnClear.addEventListener("click", async () => {
-    await chrome.runtime.sendMessage({ type: "CLEAR_RESULT" });
-    els.results.innerHTML = "";
-    renderResults(els.results, null);
-    hideError();
-    hideManualSymbolPanel();
-    pendingCapture = null;
+
+  els.btnRefresh.addEventListener("click", onRefresh);
+  els.btnClear.addEventListener("click", onClear);
+
+  // Track intentional symbol override (typed by user, not auto-filled)
+  els.symbol.addEventListener("input", () => {
+    captureOverrideSymbol = els.symbol.value.trim();
   });
 
-  // Manual symbol panel
   els.btnManualAnalyze.addEventListener("click", () => runManualAnalyze());
   els.btnManualDismiss.addEventListener("click", () => {
     hideManualSymbolPanel();
-    setStatusUI("idle", "Ready — enter a symbol anytime, or capture again");
+    setStatusUI("idle", "Ready — enter a symbol or capture again");
   });
   els.manualSymbol.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
@@ -112,45 +109,117 @@ async function init() {
       pendingCapture = null;
       setStatusUI("done", "Analysis complete");
       renderResults(els.results, msg.result);
+      const img = msg.result?._meta?.imageDataUrl || lastCaptureDataUrl;
+      if (img) showThumb(img);
+      flashSuccess("Analysis complete");
     }
     if (msg?.type === "PENDING_IMAGE") {
       maybeProcessPending();
     }
+    if (msg?.type === "CLEARED") {
+      applyLocalClear();
+    }
   });
+}
+
+async function onRefresh() {
+  hideError();
+  setBusy(true, "Refreshing…");
+  els.loadingSteps.textContent = "Backend · last report · capture";
+  try {
+    await refreshBackendStatus();
+    await loadLastResult({ restoreThumb: true });
+    // Re-show capture if we still have it in memory or storage
+    if (lastCaptureDataUrl) {
+      showThumb(lastCaptureDataUrl);
+    } else if (pendingCapture?.dataUrl) {
+      showThumb(pendingCapture.dataUrl);
+    }
+    if (!busy) setStatusUI("idle", "Refreshed");
+    flashSuccess("Refreshed");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function onClear() {
+  hideError();
+  hideSuccess();
+  hideManualSymbolPanel();
+  pendingCapture = null;
+  lastCaptureDataUrl = null;
+  captureOverrideSymbol = "";
+
+  // Clear form fields (do not keep old symbol/TF)
+  els.symbol.value = "";
+  els.timeframe.value = "";
+  els.manualSymbol.value = "";
+  els.manualTimeframe.value = "";
+  hideThumb();
+  els.results.innerHTML = "";
+  renderResults(els.results, null);
+
+  await chrome.runtime.sendMessage({ type: "CLEAR_RESULT" });
+  // Persist empty defaults so next capture never inherits stale symbol
+  await chrome.runtime.sendMessage({
+    type: "SAVE_SETTINGS",
+    settings: {
+      defaultSymbol: "",
+      defaultTimeframe: els.timeframe.value.trim(),
+      defaultExchange: els.exchange.value,
+      higher: els.higher.value.trim(),
+      noNews: els.noNews.checked,
+      darkTheme: true,
+    },
+  });
+
+  setStatusUI("idle", "Cleared · ready");
+  flashSuccess("All clear");
+}
+
+function applyLocalClear() {
+  pendingCapture = null;
+  lastCaptureDataUrl = null;
+  captureOverrideSymbol = "";
+  els.symbol.value = "";
+  els.timeframe.value = "";
+  hideThumb();
+  hideManualSymbolPanel();
+  hideError();
+  renderResults(els.results, null);
 }
 
 async function loadSettingsIntoForm() {
   const res = await chrome.runtime.sendMessage({ type: "GET_SETTINGS" });
   const s = res?.settings || {};
-  els.symbol.value = s.defaultSymbol || "";
+  // Do NOT load a saved defaultSymbol into the form — prevents stale pair reuse.
+  // User can still type an override for the next capture.
+  els.symbol.value = "";
+  captureOverrideSymbol = "";
   els.timeframe.value = s.defaultTimeframe || "";
   els.exchange.value = s.defaultExchange || "binanceusdm";
-  els.higher.value = s.higher || "1h,4h,1d";
-  els.balance.value = s.balance ?? "";
-  els.risk.value = s.risk ?? "";
+  els.higher.value = s.higher || "5m,1h,4h,1d";
   els.noNews.checked = !!s.noNews;
 }
 
 async function saveSettingsFromForm() {
   const settings = {
-    defaultSymbol: els.symbol.value.trim(),
+    // Never persist symbol as a sticky default — override is session-only
+    defaultSymbol: "",
     defaultTimeframe: els.timeframe.value.trim(),
     defaultExchange: els.exchange.value,
     higher: els.higher.value.trim(),
-    balance: els.balance.value,
-    risk: els.risk.value,
     noNews: els.noNews.checked,
     darkTheme: true,
   };
+  captureOverrideSymbol = els.symbol.value.trim();
   await chrome.runtime.sendMessage({ type: "SAVE_SETTINGS", settings });
-  setStatusUI("idle", "Settings saved");
-  await refreshBackendStatus();
 }
 
 async function refreshBackendStatus() {
   const res = await chrome.runtime.sendMessage({ type: "CHECK_BACKEND" });
   if (res?.ok) {
-    setStatusUI("idle", "API online · ready");
+    setStatusUI("idle", "Online · ready");
     els.statusDot.className = "status-dot ok";
     hideError();
   } else {
@@ -163,27 +232,54 @@ async function refreshBackendStatus() {
   }
 }
 
-async function loadLastResult() {
+async function loadLastResult({ restoreThumb = false } = {}) {
   const res = await chrome.runtime.sendMessage({ type: "GET_LAST_RESULT" });
-  if (res?.result) renderResults(els.results, res.result);
-  else renderResults(els.results, null);
+  if (res?.result) {
+    renderResults(els.results, res.result);
+    if (restoreThumb) {
+      const img = res.result._meta?.imageDataUrl;
+      if (img) {
+        lastCaptureDataUrl = img;
+        showThumb(img);
+      }
+    }
+  } else {
+    renderResults(els.results, null);
+  }
 }
 
 async function startCapture(mode) {
   hideError();
+  hideSuccess();
   hideManualSymbolPanel();
+  // Drop previous analysis UI so we never show / send a stale pair
+  pendingCapture = null;
+  els.results.innerHTML = "";
+  renderResults(els.results, null);
+
+  // Intentional override for THIS capture only (typed in settings)
+  const override = (captureOverrideSymbol || els.symbol.value).trim();
+
   setBusy(
     true,
     mode === "select-area" ? "Select chart area on the page…" : "Capturing full tab…"
   );
+  els.loadingSteps.textContent =
+    mode === "select-area" ? "Drag on the chart region" : "Full visible tab";
+
   await saveSettingsFromForm();
+
   const res = await chrome.runtime.sendMessage({
     type: "START_CAPTURE",
     mode: mode || "visible",
-    symbol: els.symbol.value.trim(),
+    // Only send symbol if user typed an override for this capture
+    symbol: override,
     timeframe: els.timeframe.value.trim(),
     exchange: els.exchange.value,
+    // Force fresh resolution — background must not inject old defaults
+    freshCapture: true,
   });
+
   if (!res?.ok) {
     setBusy(false);
     showError(res?.error || "Capture failed");
@@ -202,14 +298,15 @@ async function maybeProcessPending() {
   const pending = claim?.pending;
   if (!claim?.ok || !pending?.dataUrl) return;
 
-  setBusy(true, "OCR + vision + URL fusion…");
-  els.thumb.src = pending.dataUrl;
-  els.thumb.classList.add("show");
+  setBusy(true, "Reading chart…");
+  els.loadingSteps.textContent = "OCR · vision · URL fusion";
+  showThumb(pending.dataUrl);
+  lastCaptureDataUrl = pending.dataUrl;
 
   const pageUrl = pending.pageUrl || "";
   const urlHints = parseChartUrl(pageUrl);
   if (urlHints.symbol) {
-    setStatusUI("ocr", `URL hint: ${urlHints.symbol} (${urlHints.source})`);
+    setStatusUI("ocr", `URL: ${urlHints.symbol}`);
   }
 
   let clientOcr = null;
@@ -225,24 +322,28 @@ async function maybeProcessPending() {
     clientVision = { trend_guess: "unknown", confidence: 0, notes: [String(e)] };
   }
 
+  // Fresh fusion: prefer OCR + URL; only use intentional override for THIS capture
+  const userOverride =
+    (pending.freshCapture ? pending.symbol : "") ||
+    captureOverrideSymbol ||
+    els.symbol.value.trim() ||
+    "";
+
   const fused = fuseHints({
-    userSymbol: els.symbol.value.trim() || pending.symbol || "",
+    userSymbol: userOverride,
     userTf: els.timeframe.value.trim() || pending.timeframe || "",
     urlHints,
     ocr: clientOcr,
     vision: clientVision,
+    preferDetection: true,
   });
 
   let symbol = fused.symbol;
   let timeframe = fused.timeframe;
   let exchange = fused.exchange || pending.exchange || els.exchange.value;
 
-  if (symbol && !els.symbol.value) {
-    els.symbol.value = symbol.replace(/USDT$/i, "");
-  }
-  if (timeframe && !els.timeframe.value) {
-    els.timeframe.value = timeframe;
-  }
+  // Reflect detected TF (not sticky symbol from old charts)
+  if (timeframe) els.timeframe.value = timeframe;
   if (exchange && els.exchange) {
     try {
       els.exchange.value = exchange;
@@ -251,7 +352,7 @@ async function maybeProcessPending() {
 
   setStatusUI(
     "ocr",
-    `Fused: ${symbol || "no symbol"} · ${timeframe || "?"} · ${clientVision?.trend_guess || "?"}`
+    `Detected: ${symbol || "—"} · ${timeframe || "?"} · ${clientVision?.trend_guess || "?"}`
   );
 
   pendingCapture = {
@@ -262,34 +363,33 @@ async function maybeProcessPending() {
     clientOcr,
     clientVision,
     clientHints: { url: urlHints, fuse_notes: fused.notes },
-    reason: "ocr_miss",
+    captureId: pending.id || `${Date.now()}`,
   };
 
-  // TradingView URL often gives symbol even when OCR fails
   if (!normalizeSymbolInput(symbol)) {
     setBusy(false);
     const snippet = clientOcr?.raw
       ? `OCR: “${String(clientOcr.raw).slice(0, 80).replace(/\s+/g, " ")}…”`
       : pageUrl
         ? `Page: ${pageUrl.slice(0, 60)}…`
-        : "Tip: open TradingView chart or type BTC / ETH";
+        : "Tip: open a TradingView chart or type BTC / ETH";
     showManualSymbolPanel({
       reason:
-        "Could not auto-detect symbol from OCR or page URL. Enter ticker to continue " +
-        "(chart image will still be fully analyzed on the server).",
+        "Could not auto-detect the symbol from OCR or the page URL. Enter the ticker to continue.",
       timeframe: pendingCapture.timeframe,
       hint: snippet,
     });
-    setStatusUI("error", "Symbol required — URL/OCR miss");
+    setStatusUI("error", "Symbol required");
     return;
   }
+
+  // Clear one-shot override so the next capture starts clean
+  captureOverrideSymbol = "";
+  els.symbol.value = "";
 
   await runAnalyzeWithSymbol(symbol, timeframe, pendingCapture);
 }
 
-/**
- * User clicked Analyze on the manual symbol panel.
- */
 async function runManualAnalyze() {
   const symbol = normalizeSymbolInput(els.manualSymbol.value);
   if (!symbol) {
@@ -303,8 +403,6 @@ async function runManualAnalyze() {
   els.manualHint.classList.remove("error");
   els.manualHint.textContent = "";
 
-  // Sync into settings field for next captures
-  els.symbol.value = symbol.replace(/\/USDT:USDT$/i, "").replace(/USDT$/i, "") || symbol;
   const timeframe =
     normalizeTimeframe(els.manualTimeframe.value) ||
     els.timeframe.value.trim() ||
@@ -316,22 +414,26 @@ async function runManualAnalyze() {
   }
 
   if (!pendingCapture?.dataUrl) {
-    // No capture yet — save symbol and prompt to capture
-    await saveSettingsFromForm();
     hideManualSymbolPanel();
-    setStatusUI("idle", `Symbol set to ${symbol} — capture a chart to analyze`);
-    showError("No chart captured yet. Click “Capture & Analyze Chart”, then confirm.");
+    setStatusUI("idle", `Symbol ${symbol} noted — capture a chart first`);
+    showError("No chart captured yet. Click “Capture & Analyze”, then enter the symbol if needed.");
+    // Store as one-shot override for the next capture only
+    captureOverrideSymbol = symbol;
+    els.symbol.value = symbol;
     return;
   }
 
   hideManualSymbolPanel();
+  captureOverrideSymbol = "";
+  els.symbol.value = "";
   await runAnalyzeWithSymbol(symbol, timeframe, pendingCapture);
 }
 
 async function runAnalyzeWithSymbol(symbol, timeframe, ctx) {
   hideError();
-  setBusy(true, `Analyzing ${symbol}…`);
-  setStatusUI("analyzing", `Sending ${symbol} to backend…`);
+  setBusy(true, `Analyzing ${displayBase(symbol)}…`);
+  els.loadingSteps.textContent = "Live data · confluence · risk plan";
+  setStatusUI("analyzing", `Sending ${displayBase(symbol)}…`);
 
   const analyze = await chrome.runtime.sendMessage({
     type: "ANALYZE_DATA_URL",
@@ -343,6 +445,7 @@ async function runAnalyzeWithSymbol(symbol, timeframe, ctx) {
     clientOcr: ctx.clientOcr,
     clientVision: ctx.clientVision,
     clientHints: ctx.clientHints,
+    captureId: ctx.captureId,
   });
 
   setBusy(false);
@@ -351,11 +454,11 @@ async function runAnalyzeWithSymbol(symbol, timeframe, ctx) {
     hideError();
     hideManualSymbolPanel();
     pendingCapture = null;
+    lastCaptureDataUrl = ctx.dataUrl;
     setStatusUI("done", "Analysis complete");
     renderResults(els.results, analyze.result);
-    // Persist successful symbol
-    els.symbol.value = symbol.replace(/\/USDT:USDT$/i, "").replace(/USDT$/i, "") || symbol;
-    await saveSettingsFromForm();
+    showThumb(ctx.dataUrl);
+    flashSuccess(`${displayBase(symbol)} · analysis ready`);
     return;
   }
 
@@ -369,7 +472,7 @@ async function runAnalyzeWithSymbol(symbol, timeframe, ctx) {
     showManualSymbolPanel({
       reason: err,
       timeframe: timeframe || ctx.timeframe || "",
-      hint: "Check the ticker format, e.g. BTC or BTC/USDT:USDT",
+      hint: "Try BTC, ETH, or BTC/USDT:USDT",
       prefill: symbol,
     });
     setStatusUI("error", "Symbol issue — try again");
@@ -382,22 +485,15 @@ async function runAnalyzeWithSymbol(symbol, timeframe, ctx) {
 function showManualSymbolPanel({ reason, timeframe, hint, prefill } = {}) {
   els.manualPanel.hidden = false;
   els.manualDesc.textContent =
-    reason ||
-    "OCR couldn’t read the ticker from the chart. Enter the symbol to continue analysis.";
+    reason || "Couldn’t read the ticker. Enter the symbol to continue.";
   els.manualHint.textContent = hint || "";
   els.manualHint.classList.remove("error");
   els.manualTimeframe.value = timeframe || els.timeframe.value.trim() || "";
-  if (prefill) {
-    els.manualSymbol.value = prefill;
-  } else if (!els.manualSymbol.value && els.symbol.value) {
-    els.manualSymbol.value = els.symbol.value;
-  }
-  // Focus after paint
+  if (prefill) els.manualSymbol.value = prefill;
   requestAnimationFrame(() => {
     els.manualSymbol.focus();
     els.manualSymbol.select();
   });
-  // Scroll panel into view inside popup
   els.manualPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
@@ -412,15 +508,31 @@ function hideManualSymbolPanel() {
 
 function normalizeSymbolInput(raw) {
   if (!raw) return "";
-  let s = String(raw).trim().toUpperCase().replace(/\s+/g, "");
-  if (!s) return "";
-  // Keep unified form if user typed it; otherwise bare base is fine for backend
-  return s;
+  return String(raw).trim().toUpperCase().replace(/\s+/g, "");
 }
 
 function normalizeTimeframe(raw) {
   if (!raw) return "";
   return String(raw).trim().toLowerCase();
+}
+
+function displayBase(sym) {
+  if (!sym) return "—";
+  return String(sym).split("/")[0].replace(/USDT$/i, "") || sym;
+}
+
+function showThumb(dataUrl) {
+  if (!dataUrl) return;
+  els.thumb.src = dataUrl;
+  els.thumb.classList.add("show");
+  if (els.thumbWrap) els.thumbWrap.hidden = false;
+  lastCaptureDataUrl = dataUrl;
+}
+
+function hideThumb() {
+  els.thumb.removeAttribute("src");
+  els.thumb.classList.remove("show");
+  if (els.thumbWrap) els.thumbWrap.hidden = true;
 }
 
 async function openSidePanel() {
@@ -431,6 +543,8 @@ function setBusy(on, text) {
   busy = on;
   els.btnCapture.disabled = on;
   if (els.btnSelectArea) els.btnSelectArea.disabled = on;
+  if (els.btnRefresh) els.btnRefresh.disabled = on;
+  if (els.btnClear) els.btnClear.disabled = on;
   if (els.btnManualAnalyze) els.btnManualAnalyze.disabled = on;
   if (on) {
     els.loading.classList.add("show");
@@ -449,6 +563,7 @@ function setStatusUI(phase, message) {
 }
 
 function showError(msg) {
+  hideSuccess();
   els.errorBanner.textContent = msg;
   els.errorBanner.classList.add("show");
 }
@@ -456,4 +571,19 @@ function showError(msg) {
 function hideError() {
   els.errorBanner.classList.remove("show");
   els.errorBanner.textContent = "";
+}
+
+function flashSuccess(msg) {
+  if (!els.successBanner) return;
+  hideError();
+  els.successBanner.textContent = msg;
+  els.successBanner.classList.add("show");
+  clearTimeout(flashSuccess._t);
+  flashSuccess._t = setTimeout(() => hideSuccess(), 2200);
+}
+
+function hideSuccess() {
+  if (!els.successBanner) return;
+  els.successBanner.classList.remove("show");
+  els.successBanner.textContent = "";
 }

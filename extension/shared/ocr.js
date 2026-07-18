@@ -369,23 +369,65 @@ export function parseChartText(text) {
 
 /**
  * Fuse user / URL / OCR / vision hints into best symbol + timeframe.
+ *
+ * When preferDetection is true (new captures), detection sources win over a
+ * sticky typed field unless the user provided an intentional override.
+ * Priority (preferDetection):
+ *   1) userSymbol only if clearly intentional (passed as override for this capture)
+ *   2) URL (TradingView etc.)
+ *   3) client OCR
+ * When preferDetection is false (legacy): user → URL → OCR
  */
-export function fuseHints({ userSymbol, userTf, urlHints, ocr, vision }) {
+export function fuseHints({
+  userSymbol,
+  userTf,
+  urlHints,
+  ocr,
+  vision,
+  preferDetection = true,
+}) {
   const notes = [];
-  let symbol = (userSymbol || "").trim();
+  const override = (userSymbol || "").trim();
+  let symbol = "";
   let timeframe = (userTf || "").trim();
   let exchange = "";
-  let source = "user";
+  let source = "";
 
-  if (!symbol && urlHints?.symbol && urlHints.confidence >= 0.5) {
-    symbol = urlHints.symbol;
-    source = urlHints.source || "url";
-    notes.push(`symbol from URL (${source}, conf ${urlHints.confidence})`);
-  }
-  if (!symbol && ocr?.symbol) {
-    symbol = ocr.symbol;
-    source = "ocr";
-    notes.push("symbol from client OCR");
+  const fromUrl =
+    urlHints?.symbol && (urlHints.confidence == null || urlHints.confidence >= 0.45)
+      ? String(urlHints.symbol).trim()
+      : "";
+  const fromOcr = ocr?.symbol ? String(ocr.symbol).trim() : "";
+
+  if (preferDetection) {
+    // Intentional override for THIS capture (user typed before capture / manual panel)
+    if (override) {
+      symbol = override;
+      source = "user_override";
+      notes.push("symbol from user override (this capture)");
+    } else if (fromUrl) {
+      symbol = fromUrl;
+      source = urlHints.source || "url";
+      notes.push(`symbol from URL (${source}, conf ${urlHints.confidence ?? "?"})`);
+    } else if (fromOcr) {
+      symbol = fromOcr;
+      source = "ocr";
+      notes.push("symbol from client OCR");
+    }
+  } else {
+    if (override) {
+      symbol = override;
+      source = "user";
+      notes.push("symbol from user");
+    } else if (fromUrl) {
+      symbol = fromUrl;
+      source = urlHints.source || "url";
+      notes.push(`symbol from URL (${source})`);
+    } else if (fromOcr) {
+      symbol = fromOcr;
+      source = "ocr";
+      notes.push("symbol from client OCR");
+    }
   }
 
   if (!timeframe && urlHints?.timeframe) {
@@ -398,6 +440,7 @@ export function fuseHints({ userSymbol, userTf, urlHints, ocr, vision }) {
   }
 
   if (urlHints?.exchange) exchange = urlHints.exchange;
+  else if (urlHints?.exchange_hint) exchange = urlHints.exchange_hint;
 
   if (vision?.trend_guess && vision.trend_guess !== "unknown") {
     notes.push(`client vision trend≈${vision.trend_guess}`);

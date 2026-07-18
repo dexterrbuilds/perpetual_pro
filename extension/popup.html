@@ -5,50 +5,64 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Perpetual Pro</title>
     <link rel="stylesheet" href="shared/styles.css" />
-    <!-- Load Tesseract UMD before ES modules (MV3-local bundle under lib/) -->
     <script src="lib/tesseract.min.js"></script>
   </head>
   <body class="popup">
     <header class="app-header">
       <div class="brand">
-        <img src="icons/icon48.png" alt="" />
+        <img src="icons/icon48.png" alt="" width="28" height="28" />
         <div>
           <h1>Perpetual Pro</h1>
-          <div class="sub">API · perpetual-pro.onrender.com</div>
+          <div class="sub">Chart → pro analysis</div>
         </div>
       </div>
-      <button id="btnSettings" class="ghost" title="Settings" type="button">⚙</button>
+      <button id="btnSettings" class="ghost icon-btn" title="Settings" type="button" aria-label="Settings">
+        ⚙
+      </button>
     </header>
 
-    <div class="status-bar">
+    <div class="status-bar" role="status" aria-live="polite">
       <span id="statusDot" class="status-dot"></span>
       <span id="statusText">Checking backend…</span>
     </div>
 
     <div class="controls">
       <div class="btn-row">
-        <button id="btnCapture" class="primary" type="button">Capture &amp; Analyze Chart</button>
+        <button id="btnCapture" class="primary" type="button" title="Capture the full visible tab and analyze">
+          Capture &amp; Analyze
+        </button>
       </div>
       <div class="btn-row">
-        <button id="btnSelectArea" type="button" title="Optional: drag-select chart region">Select area</button>
-        <button id="btnSidePanel" type="button">Side panel</button>
+        <button id="btnSelectArea" type="button" title="Optional: drag-select only the chart region">
+          Select area
+        </button>
+        <button id="btnSidePanel" type="button" title="Open the full side-panel report">
+          Side panel
+        </button>
       </div>
-      <div class="hint" style="margin-top: 2px">
-        Default: full visible tab · TradingView URL used for symbol when possible
-      </div>
+      <p class="hint">
+        Full tab by default · TradingView URL used for the pair when possible
+      </p>
 
-      <div class="field-row" id="settingsPanel" style="display: none">
+      <div class="field-row settings-panel" id="settingsPanel" hidden>
         <label class="field">
-          Symbol (optional)
-          <input id="symbol" type="text" placeholder="BTC" />
+          Symbol override
+          <input
+            id="symbol"
+            type="text"
+            placeholder="Leave blank to auto-detect"
+            autocomplete="off"
+            spellcheck="false"
+            title="Optional. Only for this capture — leave blank so OCR + URL decide."
+          />
         </label>
         <label class="field">
           Timeframe
-          <input id="timeframe" type="text" placeholder="15m" />
+          <input id="timeframe" type="text" placeholder="auto / 15m" autocomplete="off" />
         </label>
         <label class="field">
           Exchange
-          <select id="exchange">
+          <select id="exchange" title="Default venue for live data">
             <option value="binanceusdm">Binance USDM</option>
             <option value="bybit">Bybit</option>
             <option value="okx">OKX</option>
@@ -57,36 +71,36 @@
         </label>
         <label class="field">
           Higher TFs
-          <input id="higher" type="text" placeholder="1h,4h,1d" />
+          <input id="higher" type="text" placeholder="5m,1h,4h,1d" />
         </label>
-        <label class="field">
-          Sim capital ($)
-          <input id="balance" type="number" placeholder="1000" title="Simulated capital (default 1000)" />
-        </label>
-        <label class="field">
-          Risk %
-          <input id="risk" type="number" step="0.1" placeholder="1.0" title="Risk per trade of sim capital" />
-        </label>
-        <label class="field full" style="flex-direction: row; align-items: center; gap: 8px">
+        <label class="field full check-field">
           <input id="noNews" type="checkbox" />
-          Skip news
+          <span>Skip news fetch</span>
         </label>
-        <div class="btn-row" style="grid-column: 1 / -1">
-          <button id="btnSaveSettings" class="primary" type="button">Save settings</button>
+        <div class="btn-row settings-actions">
+          <button id="btnSaveSettings" class="primary" type="button">Save</button>
         </div>
+        <p class="hint settings-note">
+          Symbol override applies only to the next capture. Leave blank to always use the latest OCR + page URL.
+        </p>
       </div>
 
-      <div class="hint">Shortcut: <strong>Ctrl+Shift+P</strong> · Right-click image/page for menu</div>
-      <img id="thumb" class="thumb" alt="Capture preview" />
+      <p class="hint shortcut-hint">
+        Shortcut: <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> · Right-click chart image
+      </p>
+
+      <div id="thumbWrap" class="thumb-wrap" hidden>
+        <div class="thumb-label">Captured chart</div>
+        <img id="thumb" class="thumb" alt="Capture preview" />
+      </div>
     </div>
 
-    <!-- Shown when OCR cannot detect a symbol -->
     <section id="manualSymbolPanel" class="manual-symbol-panel" hidden>
       <div class="manual-symbol-inner">
         <div class="manual-symbol-icon" aria-hidden="true">◎</div>
         <h2 class="manual-symbol-title">Symbol not detected</h2>
         <p class="manual-symbol-desc" id="manualSymbolDesc">
-          OCR couldn’t read the ticker from the chart. Enter the symbol to continue analysis.
+          Couldn’t read the ticker from the chart. Enter the symbol to continue.
         </p>
         <label class="manual-symbol-label" for="manualSymbol">
           Symbol
@@ -121,19 +135,24 @@
       </div>
     </section>
 
-    <div id="errorBanner" class="error-banner"></div>
+    <div id="errorBanner" class="error-banner" role="alert"></div>
+    <div id="successBanner" class="success-banner" role="status"></div>
 
     <div id="loading" class="loading">
       <div class="spinner"></div>
       <div id="loadingText">Analyzing…</div>
-      <div class="hint" style="margin-top: 8px">OCR + backend confluence engine</div>
+      <div class="loading-steps" id="loadingSteps">OCR · live data · confluence</div>
     </div>
 
     <div id="results" class="results"></div>
 
     <div class="footer-actions">
-      <button id="btnRefresh" type="button">Refresh</button>
-      <button id="btnClear" type="button">Clear</button>
+      <button id="btnRefresh" type="button" title="Refresh backend status and reload last analysis">
+        Refresh
+      </button>
+      <button id="btnClear" type="button" title="Clear capture, results, and form fields">
+        Clear
+      </button>
     </div>
 
     <script type="module" src="popup.js"></script>

@@ -6,10 +6,19 @@
 /** Fixed production API — not user-configurable. */
 const API_BASE = "https://perpetual-pro.onrender.com";
 
+/**
+ * Hidden educational simulation capital only.
+ * Never shown as a wallet / settings field.
+ */
+const SIMULATED_CAPITAL_USD = 100;
+const DEFAULT_RISK_PCT = 1;
+
 const STORAGE_KEYS = {
   lastResult: "pp_last_result",
   settings: "pp_settings",
   status: "pp_status",
+  pending: "pp_pending_image",
+  lastCapture: "pp_last_capture",
 };
 
 // ---------------------------------------------------------------------------
@@ -50,6 +59,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         imageUrl: info.srcUrl,
         windowId: tab.windowId,
         pageUrl: tab.url || "",
+        freshCapture: true,
       });
     } else if (info.menuItemId === "pp-select-area") {
       await runPipeline({
@@ -57,6 +67,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         mode: "select-area",
         windowId: tab.windowId,
         pageUrl: tab.url || "",
+        freshCapture: true,
       });
     } else if (info.menuItemId === "pp-capture-analyze") {
       await runPipeline({
@@ -64,6 +75,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         mode: "visible",
         windowId: tab.windowId,
         pageUrl: tab.url || "",
+        freshCapture: true,
       });
     }
   } catch (err) {
@@ -76,12 +88,12 @@ chrome.commands.onCommand.addListener(async (command) => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return;
   try {
-    // Default: auto full-tab capture (manual select remains via context menu / UI)
     await runPipeline({
       tabId: tab.id,
       mode: "visible",
       windowId: tab.windowId,
       pageUrl: tab.url || "",
+      freshCapture: true,
     });
   } catch (err) {
     await setStatus({ phase: "error", message: String(err?.message || err) });
@@ -129,15 +141,20 @@ async function handleMessage(message, sender) {
       tab = tabs[0];
     }
     if (!tab?.id) throw new Error("No active tab");
-    const settings = await getSettings();
+    // Wipe previous result so UI never reuses stale analysis while capturing
+    if (message.freshCapture) {
+      await chrome.storage.local.remove([STORAGE_KEYS.lastResult]);
+    }
     await runPipeline({
       tabId: tab.id,
-      mode: message.mode || settings.captureMode || "visible",
+      mode: message.mode || "visible",
       windowId: tab.windowId,
-      symbol: message.symbol,
-      timeframe: message.timeframe,
-      exchange: message.exchange,
+      // Only explicit override from UI — never pull sticky defaultSymbol
+      symbol: message.symbol || "",
+      timeframe: message.timeframe || "",
+      exchange: message.exchange || "",
       pageUrl: tab.url || message.pageUrl || "",
+      freshCapture: true,
     });
     return { ok: true };
   }
@@ -155,10 +172,11 @@ async function handleMessage(message, sender) {
       rect: message.rect,
       dpr: message.dpr || 1,
       windowId: sender.tab.windowId,
-      symbol: message.symbol,
-      timeframe: message.timeframe,
-      exchange: message.exchange,
+      symbol: message.symbol || "",
+      timeframe: message.timeframe || "",
+      exchange: message.exchange || "",
       pageUrl,
+      freshCapture: true,
     });
     return { ok: true };
   }
@@ -178,8 +196,14 @@ async function handleMessage(message, sender) {
     return { ok: true };
   }
   if (type === "CLEAR_RESULT") {
-    await chrome.storage.local.remove([STORAGE_KEYS.lastResult]);
+    await chrome.storage.local.remove([
+      STORAGE_KEYS.lastResult,
+      STORAGE_KEYS.pending,
+      STORAGE_KEYS.lastCapture,
+    ]);
     await setStatus({ phase: "idle", message: "Ready" });
+    broadcast({ type: "CLEARED" });
+    broadcast({ type: "STATUS", phase: "idle", message: "Ready" });
     return { ok: true };
   }
   if (type === "ANALYZE_DATA_URL") {
@@ -187,6 +211,7 @@ async function handleMessage(message, sender) {
     try {
       const result = await postAnalyze({
         dataUrl: message.dataUrl,
+        // Always the symbol for THIS capture only
         symbol: message.symbol || "",
         timeframe: message.timeframe || "",
         exchange: message.exchange || settings.defaultExchange || "",
@@ -196,22 +221,32 @@ async function handleMessage(message, sender) {
         clientVision: message.clientVision || null,
         clientHints: message.clientHints || null,
       });
+      const packaged = {
+        ...result,
+        _meta: {
+          capturedAt: new Date().toISOString(),
+          clientOcr: message.clientOcr || null,
+          clientVision: message.clientVision || null,
+          pageUrl: message.pageUrl || "",
+          apiBase: API_BASE,
+          captureId: message.captureId || null,
+          // Persist image so Refresh can re-display the chart
+          imageDataUrl: message.dataUrl || null,
+          symbolUsed: message.symbol || result.symbol || "",
+        },
+      };
       await chrome.storage.local.set({
-        [STORAGE_KEYS.lastResult]: {
-          ...result,
-          _meta: {
-            capturedAt: new Date().toISOString(),
-            clientOcr: message.clientOcr || null,
-            clientVision: message.clientVision || null,
-            pageUrl: message.pageUrl || "",
-            apiBase: API_BASE,
-          },
+        [STORAGE_KEYS.lastResult]: packaged,
+        [STORAGE_KEYS.lastCapture]: {
+          dataUrl: message.dataUrl,
+          ts: Date.now(),
+          symbol: message.symbol || "",
         },
       });
-      await chrome.storage.local.remove(["pp_pending_image"]);
+      await chrome.storage.local.remove([STORAGE_KEYS.pending]);
       await setStatus({ phase: "done", message: "Analysis complete" });
-      broadcast({ type: "RESULT", result });
-      return { ok: true, result };
+      broadcast({ type: "RESULT", result: packaged });
+      return { ok: true, result: packaged };
     } catch (err) {
       const msg = String(err?.message || err);
       const friendly = friendlyBackendError(msg);
@@ -221,13 +256,17 @@ async function handleMessage(message, sender) {
     }
   }
   if (type === "GET_PENDING_IMAGE") {
-    const data = await chrome.storage.local.get(["pp_pending_image"]);
-    return { ok: true, pending: data.pp_pending_image || null };
+    const data = await chrome.storage.local.get([STORAGE_KEYS.pending]);
+    return { ok: true, pending: data[STORAGE_KEYS.pending] || null };
   }
   if (type === "CLAIM_PENDING_IMAGE") {
     const who = message.who || "ui";
     const pending = await tryClaimPending(who, message.id || null);
     return { ok: !!pending, pending };
+  }
+  if (type === "GET_LAST_CAPTURE") {
+    const data = await chrome.storage.local.get([STORAGE_KEYS.lastCapture]);
+    return { ok: true, capture: data[STORAGE_KEYS.lastCapture] || null };
   }
 
   return { ok: false, error: "Unknown message type" };
@@ -270,13 +309,14 @@ async function runPipeline(opts) {
     try {
       await chrome.tabs.sendMessage(opts.tabId, {
         type: "PP_START_SELECTION",
-        symbol: opts.symbol || settings.defaultSymbol || "",
+        // Only pass intentional override for this capture
+        symbol: opts.symbol || "",
         timeframe: opts.timeframe || settings.defaultTimeframe || "",
         exchange: opts.exchange || settings.defaultExchange || "",
       });
     } catch (err) {
       throw new Error(
-        "Could not start area selection on this page. Try another tab or use Capture visible tab."
+        "Could not start area selection on this page. Try another tab or use Capture & Analyze."
       );
     }
     return;
@@ -287,7 +327,6 @@ async function runPipeline(opts) {
     dataUrl = await captureVisible(opts.windowId);
   }
 
-  // Resolve page URL from tab if missing
   let pageUrl = opts.pageUrl || "";
   if (!pageUrl && opts.tabId) {
     try {
@@ -298,27 +337,36 @@ async function runPipeline(opts) {
 
   await prepareAndAnalyze(dataUrl, {
     settings,
-    symbol: opts.symbol || settings.defaultSymbol || "",
+    // Never fall back to settings.defaultSymbol (stale previous pair)
+    symbol: opts.symbol || "",
     timeframe: opts.timeframe || settings.defaultTimeframe || "",
     exchange: opts.exchange || settings.defaultExchange || "",
     tabId: opts.tabId,
     windowId: opts.windowId,
     pageUrl,
+    freshCapture: opts.freshCapture !== false,
   });
 }
 
 async function prepareAndAnalyze(dataUrl, ctx) {
   const pendingId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   await chrome.storage.local.set({
-    pp_pending_image: {
+    [STORAGE_KEYS.pending]: {
       id: pendingId,
       dataUrl,
-      symbol: ctx.symbol,
-      timeframe: ctx.timeframe,
-      exchange: ctx.exchange,
+      // Only the override for this capture (may be empty)
+      symbol: ctx.symbol || "",
+      timeframe: ctx.timeframe || "",
+      exchange: ctx.exchange || "",
       pageUrl: ctx.pageUrl || "",
       ts: Date.now(),
       claimedBy: null,
+      freshCapture: true,
+    },
+    [STORAGE_KEYS.lastCapture]: {
+      dataUrl,
+      ts: Date.now(),
+      symbol: ctx.symbol || "",
     },
   });
 
@@ -330,15 +378,15 @@ async function prepareAndAnalyze(dataUrl, ctx) {
     type: "PENDING_IMAGE",
     pending: {
       id: pendingId,
-      symbol: ctx.symbol,
-      timeframe: ctx.timeframe,
-      exchange: ctx.exchange,
+      symbol: ctx.symbol || "",
+      timeframe: ctx.timeframe || "",
+      exchange: ctx.exchange || "",
       pageUrl: ctx.pageUrl || "",
       ts: Date.now(),
+      freshCapture: true,
     },
   });
 
-  // Open side panel so Tesseract.js UI path can claim the image
   if (ctx.windowId != null && chrome.sidePanel?.open) {
     try {
       await chrome.sidePanel.open({ windowId: ctx.windowId });
@@ -348,36 +396,45 @@ async function prepareAndAnalyze(dataUrl, ctx) {
   // Fallback: if UI never claims, SW analyzes with backend OCR only
   await sleep(4500);
   const claimed = await tryClaimPending("service_worker", pendingId);
-  if (!claimed) return; // UI owns the pipeline
+  if (!claimed) return;
 
-  await setStatus({ phase: "analyzing", message: "Sending to backend (full OCR + analysis)…" });
+  await setStatus({ phase: "analyzing", message: "Sending to backend…" });
   broadcast({ type: "STATUS", phase: "analyzing", message: "Sending to backend…" });
 
   try {
     const result = await postAnalyze({
       dataUrl,
-      symbol: ctx.symbol,
-      timeframe: ctx.timeframe,
-      exchange: ctx.exchange,
+      symbol: ctx.symbol || "",
+      timeframe: ctx.timeframe || "",
+      exchange: ctx.exchange || "",
       settings: ctx.settings,
       pageUrl: ctx.pageUrl || "",
     });
 
+    const packaged = {
+      ...result,
+      _meta: {
+        capturedAt: new Date().toISOString(),
+        clientOcr: null,
+        pageUrl: ctx.pageUrl || "",
+        apiBase: API_BASE,
+        path: "service_worker",
+        imageDataUrl: dataUrl,
+        symbolUsed: ctx.symbol || result.symbol || "",
+      },
+    };
+
     await chrome.storage.local.set({
-      [STORAGE_KEYS.lastResult]: {
-        ...result,
-        _meta: {
-          capturedAt: new Date().toISOString(),
-          clientOcr: null,
-          pageUrl: ctx.pageUrl || "",
-          apiBase: API_BASE,
-          path: "service_worker",
-        },
+      [STORAGE_KEYS.lastResult]: packaged,
+      [STORAGE_KEYS.lastCapture]: {
+        dataUrl,
+        ts: Date.now(),
+        symbol: ctx.symbol || result.symbol || "",
       },
     });
-    await chrome.storage.local.remove(["pp_pending_image"]);
+    await chrome.storage.local.remove([STORAGE_KEYS.pending]);
     await setStatus({ phase: "done", message: "Analysis complete" });
-    broadcast({ type: "RESULT", result });
+    broadcast({ type: "RESULT", result: packaged });
 
     try {
       const bias = (result.bias || "neutral").toUpperCase();
@@ -387,26 +444,26 @@ async function prepareAndAnalyze(dataUrl, ctx) {
         type: "basic",
         iconUrl: "icons/icon128.png",
         title: `Perpetual Pro · ${bias}`,
-        message: `${result.symbol || ctx.symbol || "Chart"} · Confidence ${conf}`,
+        message: `${result.symbol || "Chart"} · Confidence ${conf}`,
       });
     } catch (_) {}
   } catch (err) {
     const friendly = friendlyBackendError(String(err?.message || err));
     await setStatus({ phase: "error", message: friendly });
     broadcast({ type: "STATUS", phase: "error", message: friendly });
-    await chrome.storage.local.remove(["pp_pending_image"]);
+    await chrome.storage.local.remove([STORAGE_KEYS.pending]);
   }
 }
 
 /** @returns {Promise<object|null>} pending payload if claim succeeded */
 async function tryClaimPending(who, expectedId = null) {
-  const data = await chrome.storage.local.get(["pp_pending_image"]);
-  const pending = data.pp_pending_image;
+  const data = await chrome.storage.local.get([STORAGE_KEYS.pending]);
+  const pending = data[STORAGE_KEYS.pending];
   if (!pending?.dataUrl) return null;
   if (expectedId && pending.id && pending.id !== expectedId) return null;
   if (pending.claimedBy && pending.claimedBy !== who) return null;
   pending.claimedBy = who;
-  await chrome.storage.local.set({ pp_pending_image: pending });
+  await chrome.storage.local.set({ [STORAGE_KEYS.pending]: pending });
   return pending;
 }
 
@@ -483,7 +540,6 @@ function friendlyBackendError(msg) {
 async function checkBackend() {
   try {
     const ctrl = new AbortController();
-    // Render free tier cold starts can be slow
     const t = setTimeout(() => ctrl.abort(), 15000);
     const res = await fetch(`${API_BASE}/health`, { signal: ctrl.signal });
     clearTimeout(t);
@@ -491,13 +547,12 @@ async function checkBackend() {
       return { ok: false, error: `Backend returned HTTP ${res.status}` };
     }
     const data = await res.json();
-    return { ok: true, health: data, apiBase: API_BASE };
+    return { ok: true, health: data };
   } catch (err) {
     return {
       ok: false,
       error: friendlyBackendError(String(err?.message || err)),
       detail: String(err?.message || err),
-      apiBase: API_BASE,
     };
   }
 }
@@ -524,16 +579,13 @@ async function postAnalyze({
   if (clientVision) form.append("client_vision", JSON.stringify(clientVision));
   if (clientHints) form.append("client_hints", JSON.stringify(clientHints));
   if (settings?.higher) form.append("higher", settings.higher);
-  // Simulated capital (default $1000) + risk % for position simulation
-  const simCap = settings?.balance != null && settings.balance !== "" ? settings.balance : 1000;
-  form.append("simulated_capital", String(simCap));
-  if (settings?.risk != null && settings.risk !== "") {
-    form.append("risk", String(settings.risk));
-  } else {
-    form.append("risk", "1");
-  }
+
+  // Hidden educational simulation only — never a user wallet
+  form.append("simulated_capital", String(SIMULATED_CAPITAL_USD));
+  form.append("risk", String(DEFAULT_RISK_PCT));
+
   if (settings?.noNews) form.append("no_news", "true");
-  if (settings?.darkTheme != null) form.append("dark_theme", String(!!settings.darkTheme));
+  form.append("dark_theme", "true");
 
   const res = await fetch(`${API_BASE}/analyze`, {
     method: "POST",
@@ -549,7 +601,7 @@ async function postAnalyze({
 
   if (res.status === 422) {
     const msg =
-      body?.message || body?.detail || "Could not detect symbol — set symbol in popup";
+      body?.message || body?.detail || "Could not detect symbol — enter ticker and retry";
     throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
   }
   if (!res.ok) {
@@ -566,27 +618,37 @@ async function postAnalyze({
 async function getSettings() {
   const data = await chrome.storage.local.get(STORAGE_KEYS.settings);
   const s = data[STORAGE_KEYS.settings] || {};
-  // Strip any legacy apiBase — API is fixed to Render deployment
-  const { apiBase: _legacy, ...rest } = s;
+  // Strip legacy user-facing API URL / balance fields
+  const {
+    apiBase: _legacyApi,
+    balance: _legacyBal,
+    risk: _legacyRisk,
+    ...rest
+  } = s;
   return {
-    defaultSymbol: "",
     defaultTimeframe: "",
     defaultExchange: "binanceusdm",
     higher: "5m,1h,4h,1d",
-    balance: "1000",
-    risk: "1",
     noNews: false,
     darkTheme: true,
-    captureMode: "visible", // auto full-tab; "select-area" remains optional
+    captureMode: "visible",
     ...rest,
+    // Force non-sticky symbol — never reuse previous pairs
+    defaultSymbol: "",
   };
 }
 
 async function saveSettings(partial) {
   const cur = await getSettings();
-  const { apiBase: _drop, ...clean } = { ...cur, ...partial };
+  const merged = { ...cur, ...partial };
+  // Never persist user-facing capital or API URL
+  delete merged.apiBase;
+  delete merged.balance;
+  delete merged.risk;
+  // Never stick a default symbol across captures
+  merged.defaultSymbol = "";
   await chrome.storage.local.set({
-    [STORAGE_KEYS.settings]: clean,
+    [STORAGE_KEYS.settings]: merged,
   });
 }
 

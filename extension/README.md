@@ -4,85 +4,82 @@ Capture TradingView / exchange charts and run **pro perpetual futures analysis**
 
 **`https://perpetual-pro.onrender.com`**
 
-(No user setting for backend URL — all extension calls use this host.)
+The API URL is hard-coded — there is **no** user setting for the backend.
 
 ## Features
 
-- **Popup** button: *Capture & Analyze Chart*
-- **Keyboard shortcut**: `Ctrl+Shift+P` (select area on the active tab)
-- **Right-click** on any image or page → analyze / select area
-- **Auto full-tab capture** via `chrome.tabs.captureVisibleTab` (default)
-- Optional **drag-select** region remains available
-- **Client OCR** (bundled Tesseract.js) + **light vision** (candles/trend/levels)
-- **TradingView URL** pair extraction as strong symbol fallback
-- Fuses **OCR + URL + vision** before calling backend
-- Backend re-runs dual OCR (Tesseract multi-PSM + EasyOCR) + OpenCV chart CV
-- **Side panel** results: bias, confidence, levels, confluence, patterns, news, risk
-- Loading states + clear errors (API wake-up / network)
-- Dark-mode UI
+- **Popup** · Capture & Analyze (full visible tab)
+- **Keyboard** · `Ctrl+Shift+P`
+- **Right-click** · image or page → analyze / select area
+- **Select area** · optional drag-select on the chart
+- **Client OCR** (bundled Tesseract.js) + light vision + TradingView URL fusion
+- **Fresh symbol every capture** · never reuses a previous pair; OCR + URL + optional one-shot override only
+- **Side panel** · full scannable report
+- **Simulation example** · educational `$100` illustration only (not a wallet); dynamic leverage from the model
+- **Suggested hold** · e.g. “4–24 hours” / “Swing – 2–7 days” from timeframe & setup
+- Dark, responsive popup UI · clear / refresh reset state cleanly
 
-## Prerequisites
-
-1. API is the Render deployment: [https://perpetual-pro.onrender.com/health](https://perpetual-pro.onrender.com/health)
-2. Free-tier Render apps may cold-start (~30s) on first request — retry if health fails once
-
-## Load unpacked in Chrome
+## Load unpacked
 
 1. Open `chrome://extensions`
 2. Enable **Developer mode**
-3. Click **Load unpacked**
-4. Select this folder: `perpetual_pro/extension`
-5. Pin **Perpetual Pro** to the toolbar
+3. **Load unpacked** → select `perpetual_pro/extension`
+4. Pin **Perpetual Pro**
 
 ## Usage
 
 | Action | Result |
 |--------|--------|
-| Popup → **Capture & Analyze Chart** | Full visible tab → OCR + vision + URL → `/analyze` |
-| Popup → **Select area** | Optional drag-select chart region |
-| `Ctrl+Shift+P` | Full visible tab capture + analyze |
-| Right-click image → **Analyze with Perpetual Pro** | Uses that image URL |
-| Right-click page → **Select chart area…** | Drag selection |
-| **Side panel** | Full-width report view |
+| **Capture & Analyze** | Full tab → OCR + vision + URL → `/analyze` |
+| **Select area** | Drag-select chart region |
+| `Ctrl+Shift+P` | Full tab capture + analyze |
+| Right-click image | Analyze that image |
+| **Refresh** | Backend health + last report + re-show capture |
+| **Clear** | Wipe symbol fields, capture, results, pending state |
+| **Side panel** | Full-width report |
 
-Optional **Symbol** / **Timeframe** in popup settings override OCR. If OCR misses the symbol, set it manually (e.g. `BTC`).
+Optional **Symbol override** in settings applies **only to the next capture**. Leave blank so every chart resolves from OCR + page URL.
+
+## Simulation (educational)
+
+The extension always requests analysis with a **hidden** simulated capital of **$100** for illustration. The report shows:
+
+> Simulation Example (for illustration only)  
+> If you trade this signal with $100 at the suggested Nx leverage:  
+> • At TP1 → +$…  
+> • At TP2 → +$…
+
+Suggested leverage comes from the backend model (ATR volatility, confidence, funding) — not a user leverage setting.
 
 ## Permissions
 
-- `activeTab` / `tabs` / `scripting` — capture & inject selection UI  
+- `activeTab` / `tabs` / `scripting` — capture & selection UI  
 - `contextMenus` — right-click actions  
 - `sidePanel` — results panel  
-- `storage` — settings + last report  
-- Host access to `https://perpetual-pro.onrender.com` only (OCR is fully offline)
+- `storage` — settings + last report + capture preview  
+- Host: `https://perpetual-pro.onrender.com` only  
 
 ## File map
 
 ```
 extension/
 ├── manifest.json
-├── background.js          # service worker
+├── background.js
 ├── popup.html / popup.js
 ├── sidepanel.html / sidepanel.js
 ├── content/select-area.js + .css
-├── shared/ocr.js, render.js, styles.css
-├── lib/                   # vendored Tesseract.js + eng.traineddata.gz
-│   ├── tesseract.min.js
-│   ├── worker.min.js
-│   ├── tesseract-core-simd-lstm.wasm.js
-│   ├── tesseract-core-simd-lstm.wasm
-│   └── lang-data/eng.traineddata.gz
-├── icons/
-└── README.md
+├── shared/ocr.js, render.js, vision_light.js, url_parse.js, styles.css
+├── lib/          # vendored Tesseract.js
+└── icons/
 ```
 
 ## Troubleshooting
 
 | Issue | Fix |
 |-------|-----|
-| “Cannot reach … API” | Render free tier may be cold-starting — wait ~30s and retry; check https://perpetual-pro.onrender.com/health |
-| Capture fails on Chrome Web Store / chrome:// pages | Use a normal https page (TradingView, etc.) |
-| OCR weak | Set Symbol manually; backend still runs full OCR |
-| Shortcut conflict | `chrome://extensions/shortcuts` |
+| Cannot reach API | Render free tier cold start — wait ~30s, Refresh |
+| Wrong symbol | Clear, leave override blank, recapture; or type override for that capture only |
+| Capture fails on chrome:// | Use a normal https page (TradingView, etc.) |
 
 ## Disclaimer
 

@@ -12,10 +12,13 @@ const els = {
   statusDot: $("statusDot"),
   statusText: $("statusText"),
   errorBanner: $("errorBanner"),
+  successBanner: $("successBanner"),
   loading: $("loading"),
   loadingText: $("loadingText"),
+  loadingSteps: $("loadingSteps"),
   results: $("results"),
   thumb: $("thumb"),
+  thumbWrap: $("thumbWrap"),
   btnCapture: $("btnCapture"),
   btnSelectArea: $("btnSelectArea"),
   btnRefresh: $("btnRefresh"),
@@ -25,29 +28,32 @@ const els = {
 };
 
 let processingPending = false;
+let lastCaptureDataUrl = null;
+/** Intentional one-shot override for the next capture only. */
+let captureOverrideSymbol = "";
+let busy = false;
 
 init();
 
 async function init() {
   const settings = (await chrome.runtime.sendMessage({ type: "GET_SETTINGS" }))?.settings || {};
-  els.symbol.value = settings.defaultSymbol || "";
+  // Never preload a sticky symbol
+  els.symbol.value = "";
   els.timeframe.value = settings.defaultTimeframe || "";
+  captureOverrideSymbol = "";
+
+  els.symbol.addEventListener("input", () => {
+    captureOverrideSymbol = els.symbol.value.trim();
+  });
 
   await refreshBackend();
-  await loadLast();
+  await loadLast({ restoreThumb: true });
   await claimPending();
 
   els.btnCapture.addEventListener("click", () => start("visible"));
   els.btnSelectArea?.addEventListener("click", () => start("select-area"));
-  els.btnRefresh.addEventListener("click", async () => {
-    await refreshBackend();
-    await loadLast();
-  });
-  els.btnClear.addEventListener("click", async () => {
-    await chrome.runtime.sendMessage({ type: "CLEAR_RESULT" });
-    renderResults(els.results, null);
-    hideError();
-  });
+  els.btnRefresh.addEventListener("click", onRefresh);
+  els.btnClear.addEventListener("click", onClear);
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg?.type === "STATUS") setStatus(msg.phase, msg.message);
@@ -56,20 +62,65 @@ async function init() {
       setStatus("done", "Analysis complete");
       hideError();
       renderResults(els.results, msg.result);
+      const img = msg.result?._meta?.imageDataUrl || lastCaptureDataUrl;
+      if (img) showThumb(img);
+      flashSuccess("Analysis complete");
     }
     if (msg?.type === "PENDING_IMAGE") claimPending();
+    if (msg?.type === "CLEARED") applyLocalClear();
   });
 
-  // Poll briefly for pending captures started while panel was closed
   const poll = setInterval(() => claimPending(), 800);
-  setTimeout(() => clearInterval(poll), 8000);
+  setTimeout(() => clearInterval(poll), 10000);
+}
+
+async function onRefresh() {
+  hideError();
+  setBusy(true, "Refreshing…");
+  if (els.loadingSteps) els.loadingSteps.textContent = "Backend · last report · capture";
+  try {
+    await refreshBackend();
+    await loadLast({ restoreThumb: true });
+    if (lastCaptureDataUrl) showThumb(lastCaptureDataUrl);
+    flashSuccess("Refreshed");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function onClear() {
+  hideError();
+  hideSuccess();
+  applyLocalClear();
+  await chrome.runtime.sendMessage({ type: "CLEAR_RESULT" });
+  await chrome.runtime.sendMessage({
+    type: "SAVE_SETTINGS",
+    settings: {
+      defaultSymbol: "",
+      defaultTimeframe: els.timeframe.value.trim(),
+    },
+  });
+  setStatus("idle", "Cleared · ready");
+  flashSuccess("All clear");
+}
+
+function applyLocalClear() {
+  lastCaptureDataUrl = null;
+  captureOverrideSymbol = "";
+  processingPending = false;
+  els.symbol.value = "";
+  els.timeframe.value = "";
+  hideThumb();
+  hideError();
+  renderResults(els.results, null);
 }
 
 async function refreshBackend() {
   const res = await chrome.runtime.sendMessage({ type: "CHECK_BACKEND" });
   if (res?.ok) {
-    setStatus("idle", "API online");
+    setStatus("idle", "Online · ready");
     els.statusDot.className = "status-dot ok";
+    hideError();
   } else {
     const msg =
       res?.error ||
@@ -80,28 +131,46 @@ async function refreshBackend() {
   }
 }
 
-async function loadLast() {
+async function loadLast({ restoreThumb = false } = {}) {
   const res = await chrome.runtime.sendMessage({ type: "GET_LAST_RESULT" });
-  renderResults(els.results, res?.result || null);
+  const result = res?.result || null;
+  renderResults(els.results, result);
+  if (restoreThumb && result?._meta?.imageDataUrl) {
+    lastCaptureDataUrl = result._meta.imageDataUrl;
+    showThumb(lastCaptureDataUrl);
+  }
 }
 
 async function start(mode) {
   hideError();
+  hideSuccess();
+  // Fresh capture: clear previous results so old symbol never lingers visually
+  renderResults(els.results, null);
+
+  const override = (captureOverrideSymbol || els.symbol.value).trim();
+
   setBusy(true, mode === "select-area" ? "Select area on the page…" : "Capturing full tab…");
+  if (els.loadingSteps) {
+    els.loadingSteps.textContent =
+      mode === "select-area" ? "Drag on the chart region" : "Full visible tab";
+  }
+
   const settings = (await chrome.runtime.sendMessage({ type: "GET_SETTINGS" }))?.settings || {};
   await chrome.runtime.sendMessage({
     type: "SAVE_SETTINGS",
     settings: {
       ...settings,
-      defaultSymbol: els.symbol.value.trim(),
+      defaultSymbol: "",
       defaultTimeframe: els.timeframe.value.trim(),
     },
   });
+
   const res = await chrome.runtime.sendMessage({
     type: "START_CAPTURE",
     mode: mode || "visible",
-    symbol: els.symbol.value.trim(),
+    symbol: override,
     timeframe: els.timeframe.value.trim(),
+    freshCapture: true,
   });
   if (!res?.ok) {
     setBusy(false);
@@ -120,9 +189,10 @@ async function claimPending() {
 
   processingPending = true;
   try {
-    setBusy(true, "OCR + vision + URL fusion…");
-    els.thumb.src = pending.dataUrl;
-    els.thumb.classList.add("show");
+    setBusy(true, "Reading chart…");
+    if (els.loadingSteps) els.loadingSteps.textContent = "OCR · vision · URL fusion";
+    showThumb(pending.dataUrl);
+    lastCaptureDataUrl = pending.dataUrl;
 
     const pageUrl = pending.pageUrl || "";
     const urlHints = parseChartUrl(pageUrl);
@@ -140,26 +210,46 @@ async function claimPending() {
       clientVision = { trend_guess: "unknown", confidence: 0 };
     }
 
+    // Only intentional override for THIS capture — never sticky previous pair
+    const userOverride =
+      (pending.freshCapture ? pending.symbol : "") ||
+      captureOverrideSymbol ||
+      els.symbol.value.trim() ||
+      "";
+
     const fused = fuseHints({
-      userSymbol: els.symbol.value.trim() || pending.symbol || "",
+      userSymbol: userOverride,
       userTf: els.timeframe.value.trim() || pending.timeframe || "",
       urlHints,
       ocr: clientOcr,
       vision: clientVision,
+      preferDetection: true,
     });
 
     let symbol = fused.symbol;
     let timeframe = fused.timeframe;
-    if (clientOcr?.symbol) els.symbol.value = clientOcr.symbol.replace(/USDT$/i, "");
-    else if (urlHints.symbol) els.symbol.value = urlHints.symbol.replace(/USDT$/i, "");
     if (timeframe) els.timeframe.value = timeframe;
+    // Clear override field so it never sticks as "old symbol"
+    captureOverrideSymbol = "";
+    els.symbol.value = "";
 
     setStatus(
       "ocr",
-      `Fused ${symbol || "?"} · ${timeframe || "?"} · vision ${clientVision?.trend_guess || "?"}`
+      `Detected ${symbol || "—"} · ${timeframe || "?"} · ${clientVision?.trend_guess || "?"}`
     );
 
-    setBusy(true, "Sending to API /analyze…");
+    if (!symbol) {
+      setBusy(false);
+      showError(
+        "Symbol not detected. Type a ticker (e.g. BTC) in Symbol override, then capture again — or use the popup for manual entry."
+      );
+      setStatus("error", "Symbol required");
+      return;
+    }
+
+    setBusy(true, `Analyzing ${symbol.split("/")[0]}…`);
+    if (els.loadingSteps) els.loadingSteps.textContent = "Live data · confluence · risk plan";
+
     const analyze = await chrome.runtime.sendMessage({
       type: "ANALYZE_DATA_URL",
       dataUrl: pending.dataUrl,
@@ -170,6 +260,7 @@ async function claimPending() {
       clientOcr,
       clientVision,
       clientHints: { url: urlHints, fuse_notes: fused.notes },
+      captureId: pending.id,
     });
 
     setBusy(false);
@@ -177,6 +268,8 @@ async function claimPending() {
       hideError();
       setStatus("done", "Analysis complete");
       renderResults(els.results, analyze.result);
+      showThumb(pending.dataUrl);
+      flashSuccess("Analysis complete");
     } else {
       const err = analyze?.error || "Analysis failed";
       showError(err);
@@ -187,9 +280,26 @@ async function claimPending() {
   }
 }
 
+function showThumb(dataUrl) {
+  if (!dataUrl) return;
+  els.thumb.src = dataUrl;
+  els.thumb.classList.add("show");
+  if (els.thumbWrap) els.thumbWrap.hidden = false;
+  lastCaptureDataUrl = dataUrl;
+}
+
+function hideThumb() {
+  els.thumb.removeAttribute("src");
+  els.thumb.classList.remove("show");
+  if (els.thumbWrap) els.thumbWrap.hidden = true;
+}
+
 function setBusy(on, text) {
+  busy = on;
   els.btnCapture.disabled = on;
   if (els.btnSelectArea) els.btnSelectArea.disabled = on;
+  if (els.btnRefresh) els.btnRefresh.disabled = on;
+  if (els.btnClear) els.btnClear.disabled = on;
   if (on) {
     els.loading.classList.add("show");
     els.loadingText.textContent = text || "Working…";
@@ -207,10 +317,27 @@ function setStatus(phase, message) {
 }
 
 function showError(msg) {
+  hideSuccess();
   els.errorBanner.textContent = msg;
   els.errorBanner.classList.add("show");
 }
 
 function hideError() {
   els.errorBanner.classList.remove("show");
+  els.errorBanner.textContent = "";
+}
+
+function flashSuccess(msg) {
+  if (!els.successBanner) return;
+  hideError();
+  els.successBanner.textContent = msg;
+  els.successBanner.classList.add("show");
+  clearTimeout(flashSuccess._t);
+  flashSuccess._t = setTimeout(() => hideSuccess(), 2200);
+}
+
+function hideSuccess() {
+  if (!els.successBanner) return;
+  els.successBanner.classList.remove("show");
+  els.successBanner.textContent = "";
 }

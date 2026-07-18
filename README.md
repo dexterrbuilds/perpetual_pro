@@ -158,12 +158,14 @@ Health: `GET /health`
 
 ### Chrome extension
 
-A Manifest V3 extension lives in [`extension/`](./extension/). It calls the fixed production API:
+A Manifest V3 extension lives in [`extension/`](./extension/). It calls the fixed production API (hard-coded, no API URL field):
 
 **`https://perpetual-pro.onrender.com`**
 
 1. Chrome → `chrome://extensions` → Developer mode → **Load unpacked** → select `extension/`
-2. Use **Capture & Analyze Chart**, `Ctrl+Shift+P`, or right-click a chart image
+2. Use **Capture & Analyze**, `Ctrl+Shift+P`, or right-click a chart image
+3. **Clear** resets capture, results, and form fields; **Refresh** reloads status + last report + chart preview
+4. Simulation uses a hidden educational **$100** example (not a wallet); report shows suggested hold time and dynamic leverage
 
 See [extension/README.md](./extension/README.md) for details.
 
