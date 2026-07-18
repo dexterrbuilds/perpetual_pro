@@ -1,7 +1,6 @@
 # perpetual_pro — production dependencies for Render / local
 # Pure-pandas indicator fallback is always available (no pandas-ta required at boot).
 
-python-3.12.0
 ccxt>=4.2.0
 pandas>=2.0.0
 numpy>=1.24.0
