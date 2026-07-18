@@ -104,11 +104,12 @@ cp .env.example .env
 
 **Note on EasyOCR:** first run downloads recognition models (~100MB). Use `ocr.engine: tesseract` in `config.yaml` if you want to skip EasyOCR.
 
-**Note on pandas-ta:** if install fails on your platform, try:
+**Indicators:** production uses **`pandas-ta-classic`** (import name `pandas_ta_classic`).  
+If it is missing, the app still boots and uses a pure-pandas fallback suite.
+
 ```bash
-pip install pandas-ta --no-cache-dir
-# or
-pip install git+https://github.com/twopirllc/pandas-ta.git
+pip install pandas-ta-classic>=0.4.0
+# verify: python scripts/check_ta_backend.py
 ```
 
 ---
@@ -286,7 +287,7 @@ Network-free unit tests cover symbol helpers, patterns, structure, risk, and con
 | Tesseract not found | Install binary; set `TESSERACT_CMD` |
 | EasyOCR slow first run | Model download; or set `ocr.engine: tesseract` |
 | Interactive capture fails | Use `--region` or `--image`; headless servers need `--image` |
-| pandas-ta import error | Reinstall; ensure numpy/pandas compatible versions |
+| Indicator backend missing | `pip install pandas-ta-classic` — app still runs with pure-pandas fallback |
 | News empty | Normal without keys; optional CryptoPanic token |
 
 ---

@@ -1,4 +1,4 @@
-"""Full technical indicator suite via pandas-ta when available, else pure pandas fallback."""
+"""Full technical indicator suite via pandas-ta-classic / pandas-ta, else pure pandas."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+from src.analysis.ta_backend import get_ta
 from src.utils.config import AnalysisConfig, AppConfig
 from src.utils.helpers import safe_float
 
-try:
-    import pandas_ta as ta
-except ImportError:  # pragma: no cover
-    ta = None  # type: ignore
+# Resolved lazily on first compute_indicators() call
+ta: Any = None
+_TA_BACKEND = "none"
 
 
 @dataclass
@@ -173,9 +173,14 @@ def compute_indicators(
     """
     Compute a broad professional indicator stack.
 
-    Uses pandas-ta when installed; otherwise a full pure-pandas suite
-    covering the same confluence inputs (80+ columns when pandas-ta is present).
+    Backend order:
+      1. ``pandas_ta_classic`` (PyPI: pandas-ta-classic)
+      2. ``pandas_ta`` (legacy package)
+      3. Pure-pandas fallback (always works)
     """
+    global ta, _TA_BACKEND
+    ta, _TA_BACKEND = get_ta()
+
     ac = analysis_cfg or (config.analysis if config else AnalysisConfig())
     if df is None or df.empty or len(df) < 30:
         return IndicatorSuite(
@@ -195,18 +200,28 @@ def compute_indicators(
 
     if ta is not None:
         try:
-            out, count = _compute_with_pandas_ta(out, ac)
+            out, count = _compute_with_pandas_ta(out, ac, ta)
+            logger.debug(
+                "Indicators via {} — {} columns",
+                _TA_BACKEND,
+                count,
+            )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("pandas-ta path failed ({}), using fallback: {}", exc, exc)
-            errors.append(f"pandas_ta_error:{exc}")
+            logger.warning(
+                "{} indicator path failed ({}); using pure-pandas fallback",
+                _TA_BACKEND,
+                exc,
+            )
+            errors.append(f"{_TA_BACKEND}_error:{exc}")
             out, count = _compute_fallback(out, ac)
             errors.append("used_fallback_indicators")
     else:
-        logger.info("pandas-ta not installed — using pure pandas indicator suite")
+        logger.info("No pandas-ta backend — using pure-pandas indicator suite")
         out, count = _compute_fallback(out, ac)
         errors.append("pandas_ta_not_installed_fallback")
 
     summary = _build_summary(out, ac)
+    summary["ta_backend"] = _TA_BACKEND
     divergences = detect_divergences(out)
     return IndicatorSuite(
         df=out,
@@ -217,140 +232,228 @@ def compute_indicators(
     )
 
 
-def _compute_with_pandas_ta(out: pd.DataFrame, ac: AnalysisConfig) -> Tuple[pd.DataFrame, int]:
-    count = 0
+def _safe_assign(out: pd.DataFrame, name: str, series: Any) -> None:
+    """Assign a Series into out without clobbering OHLCV."""
+    if series is None:
+        return
+    if isinstance(series, pd.Series):
+        out[name] = series
+    elif isinstance(series, pd.DataFrame) and not series.empty:
+        for c in series.columns:
+            if str(c).lower() not in ("open", "high", "low", "close", "volume"):
+                if c not in out.columns:
+                    out[c] = series[c]
+
+
+def _safe_join_df(out: pd.DataFrame, frame: Any) -> pd.DataFrame:
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return out
+    for c in frame.columns:
+        if c not in out.columns:
+            out[c] = frame[c]
+    return out
+
+
+def _compute_with_pandas_ta(
+    out: pd.DataFrame, ac: AnalysisConfig, ta_mod: Any
+) -> Tuple[pd.DataFrame, int]:
+    """
+    Core suite via pandas_ta_classic / pandas_ta functional API.
+
+    Uses ``ta_mod`` (already resolved) — do not import again inside.
+    """
+    ta = ta_mod
+    base_cols = {"open", "high", "low", "close", "volume"}
+
+    # --- Trend / MAs ---
     out["ema_fast"] = ta.ema(out["close"], length=ac.ema_fast)
     out["ema_mid"] = ta.ema(out["close"], length=ac.ema_mid)
     out["ema_slow"] = ta.ema(out["close"], length=ac.ema_slow)
-    out["ema_trend"] = ta.ema(out["close"], length=min(ac.ema_trend, max(50, len(out) // 2)))
+    out["ema_trend"] = ta.ema(
+        out["close"], length=min(ac.ema_trend, max(50, len(out) // 2))
+    )
     out["sma_20"] = ta.sma(out["close"], length=20)
     out["sma_50"] = ta.sma(out["close"], length=min(50, len(out) - 1))
     out["sma_200"] = ta.sma(out["close"], length=min(200, len(out) - 1))
     try:
         out["hma_21"] = ta.hma(out["close"], length=21)
-    except Exception:
+    except Exception as exc:
+        logger.debug("hma failed ({}): {}", type(exc).__name__, exc)
         out["hma_21"] = _ema(out["close"], 21)
     out["vwap"] = _session_vwap(out)
-    count += 9
 
+    # --- Momentum ---
     out["rsi"] = ta.rsi(out["close"], length=ac.rsi_period)
-    stoch = ta.stoch(out["high"], out["low"], out["close"], k=14, d=3, smooth_k=3)
-    if stoch is not None and not stoch.empty:
-        out = out.join(stoch)
-    macd = ta.macd(out["close"], fast=ac.macd_fast, slow=ac.macd_slow, signal=ac.macd_signal)
-    if macd is not None and not macd.empty:
-        out = out.join(macd)
-    out["willr"] = ta.willr(out["high"], out["low"], out["close"], length=14)
-    out["cci"] = ta.cci(out["high"], out["low"], out["close"], length=20)
-    out["roc"] = ta.roc(out["close"], length=10)
-    out["mom"] = ta.mom(out["close"], length=10)
+    try:
+        stoch = ta.stoch(out["high"], out["low"], out["close"], k=14, d=3, smooth_k=3)
+        out = _safe_join_df(out, stoch)
+    except Exception as exc:
+        logger.debug("stoch failed: {}", exc)
+    try:
+        macd = ta.macd(
+            out["close"],
+            fast=ac.macd_fast,
+            slow=ac.macd_slow,
+            signal=ac.macd_signal,
+        )
+        out = _safe_join_df(out, macd)
+    except Exception as exc:
+        logger.debug("macd failed: {}", exc)
+    try:
+        out["willr"] = ta.willr(out["high"], out["low"], out["close"], length=14)
+    except Exception as exc:
+        logger.debug("willr failed: {}", exc)
+    try:
+        out["cci"] = ta.cci(out["high"], out["low"], out["close"], length=20)
+    except Exception as exc:
+        logger.debug("cci failed: {}", exc)
+    try:
+        out["roc"] = ta.roc(out["close"], length=10)
+        out["mom"] = ta.mom(out["close"], length=10)
+    except Exception as exc:
+        logger.debug("roc/mom failed: {}", exc)
     try:
         out["ao"] = ta.ao(out["high"], out["low"])
     except Exception:
-        out["ao"] = _sma(out["high"] + out["low"], 5) / 2 - _sma(out["high"] + out["low"], 34) / 2
-    count += 10
+        out["ao"] = (
+            _sma(out["high"] + out["low"], 5) / 2
+            - _sma(out["high"] + out["low"], 34) / 2
+        )
 
+    # --- Volatility ---
     out["atr"] = ta.atr(out["high"], out["low"], out["close"], length=ac.atr_period)
-    out["natr"] = ta.natr(out["high"], out["low"], out["close"], length=ac.atr_period)
-    bb = ta.bbands(out["close"], length=20, std=2.0)
-    if bb is not None and not bb.empty:
-        out = out.join(bb)
+    try:
+        out["natr"] = ta.natr(out["high"], out["low"], out["close"], length=ac.atr_period)
+    except Exception as exc:
+        logger.debug("natr failed: {}", exc)
+        out["natr"] = out["atr"] / out["close"] * 100
+    try:
+        bb = ta.bbands(out["close"], length=20, std=2.0)
+        out = _safe_join_df(out, bb)
+    except Exception as exc:
+        logger.debug("bbands failed: {}", exc)
     out["donchian_h"] = out["high"].rolling(20).max()
     out["donchian_l"] = out["low"].rolling(20).min()
     out["std_20"] = out["close"].rolling(20).std()
-    count += 8
 
-    out["obv"] = ta.obv(out["close"], out["volume"])
+    # --- Volume ---
+    try:
+        out["obv"] = ta.obv(out["close"], out["volume"])
+    except Exception as exc:
+        logger.debug("obv failed: {}", exc)
     try:
         out["cmf"] = ta.cmf(out["high"], out["low"], out["close"], out["volume"], length=20)
     except Exception:
         out["cmf"] = _cmf(out["high"], out["low"], out["close"], out["volume"], 20)
-    out["mfi"] = ta.mfi(out["high"], out["low"], out["close"], out["volume"], length=14)
+    try:
+        out["mfi"] = ta.mfi(out["high"], out["low"], out["close"], out["volume"], length=14)
+    except Exception as exc:
+        logger.debug("mfi failed: {}", exc)
     out["vol_sma"] = ta.sma(out["volume"], length=20)
     out["vol_ratio"] = out["volume"] / out["vol_sma"].replace(0, np.nan)
-    count += 6
 
-    adx = ta.adx(out["high"], out["low"], out["close"], length=14)
-    if adx is not None and not adx.empty:
-        out = out.join(adx)
+    # --- Trend strength ---
     try:
-        st = ta.supertrend(out["high"], out["low"], out["close"], length=10, multiplier=3.0)
-        if st is not None and not st.empty:
-            out = out.join(st)
-    except Exception:
-        pass
+        adx = ta.adx(out["high"], out["low"], out["close"], length=14)
+        out = _safe_join_df(out, adx)
+        # Convenience alias for summary
+        adx_col = _col_like(out, "adx_14", "adx")
+        if adx_col and "adx" not in out.columns:
+            out["adx"] = out[adx_col]
+    except Exception as exc:
+        logger.debug("adx failed: {}", exc)
+
+    try:
+        st = ta.supertrend(
+            out["high"], out["low"], out["close"], length=10, multiplier=3.0
+        )
+        out = _safe_join_df(out, st)
+        # Aliases for confluence summary
+        st_dir = _col_like(out, "supertd", "supertrend_dir")
+        st_line = _col_like(out, "supert_")
+        if st_line and "supertrend" not in out.columns:
+            out["supertrend"] = out[st_line]
+        if st_dir and "supertrend_dir" not in out.columns:
+            out["supertrend_dir"] = out[st_dir]
+    except Exception as exc:
+        logger.warning("supertrend failed ({}): {}", type(exc).__name__, exc)
+
     try:
         ichi = ta.ichimoku(out["high"], out["low"], out["close"])
         if ichi is not None:
             if isinstance(ichi, tuple):
                 for part in ichi:
                     if part is not None and hasattr(part, "empty") and not part.empty:
-                        out = out.join(part, rsuffix="_ichi")
+                        out = _safe_join_df(out, part)
             elif hasattr(ichi, "empty") and not ichi.empty:
-                out = out.join(ichi, rsuffix="_ichi")
-    except Exception:
-        pass
+                out = _safe_join_df(out, ichi)
+    except Exception as exc:
+        logger.warning("ichimoku failed ({}): {}", type(exc).__name__, exc)
+
     try:
         squeeze = ta.squeeze(out["high"], out["low"], out["close"])
-        if squeeze is not None and not squeeze.empty:
-            out = out.join(squeeze)
+        out = _safe_join_df(out, squeeze)
+    except Exception as exc:
+        logger.debug("squeeze failed: {}", exc)
+
+    try:
+        if hasattr(ta, "linreg"):
+            out["linreg"] = ta.linreg(out["close"], length=20)
+        else:
+            out["linreg"] = out["close"].rolling(20).mean()
     except Exception:
-        pass
+        out["linreg"] = out["close"].rolling(20).mean()
+    out["zscore"] = (out["close"] - out["close"].rolling(20).mean()) / out[
+        "close"
+    ].rolling(20).std()
 
-    out["linreg"] = ta.linreg(out["close"], length=20) if hasattr(ta, "linreg") else out["close"].rolling(20).mean()
-    out["zscore"] = (out["close"] - out["close"].rolling(20).mean()) / out["close"].rolling(20).std()
-
-    # Broaden suite: major trend / momentum / volatility / volume / oscillators
+    # --- Expanded suite (best-effort; never abort) ---
     extra_calls = [
         ("ema_12", lambda: ta.ema(out["close"], length=12)),
         ("ema_26", lambda: ta.ema(out["close"], length=26)),
         ("sma_100", lambda: ta.sma(out["close"], length=min(100, len(out) - 1))),
-        ("wma_20", lambda: ta.wma(out["close"], length=20)),
-        ("tema_20", lambda: ta.tema(out["close"], length=20)),
-        ("dema_20", lambda: ta.dema(out["close"], length=20)),
-        ("kama_10", lambda: ta.kama(out["close"], length=10)),
+        ("wma_20", lambda: ta.wma(out["close"], length=20) if hasattr(ta, "wma") else None),
+        ("tema_20", lambda: ta.tema(out["close"], length=20) if hasattr(ta, "tema") else None),
+        ("dema_20", lambda: ta.dema(out["close"], length=20) if hasattr(ta, "dema") else None),
+        ("kama_10", lambda: ta.kama(out["close"], length=10) if hasattr(ta, "kama") else None),
         ("rsi_7", lambda: ta.rsi(out["close"], length=7)),
         ("rsi_21", lambda: ta.rsi(out["close"], length=21)),
-        ("cmo", lambda: ta.cmo(out["close"], length=14)),
-        ("ppo", lambda: ta.ppo(out["close"])),
-        ("trix", lambda: ta.trix(out["close"])),
-        ("fisher", lambda: ta.fisher(out["high"], out["low"])),
-        ("cg", lambda: ta.cg(out["close"], length=10)),
-        ("inertia", lambda: ta.inertia(out["close"], length=20)),
-        ("stochrsi", lambda: ta.stochrsi(out["close"])),
-        ("uo", lambda: ta.uo(out["high"], out["low"], out["close"])),
-        ("bop", lambda: ta.bop(out["open"], out["high"], out["low"], out["close"])),
-        ("true_range", lambda: ta.true_range(out["high"], out["low"], out["close"])),
-        ("accbands", lambda: ta.accbands(out["high"], out["low"], out["close"])),
-        ("donchian", lambda: ta.donchian(out["high"], out["low"])),
-        ("kc", lambda: ta.kc(out["high"], out["low"], out["close"])),
-        ("massi", lambda: ta.massi(out["high"], out["low"])),
-        ("pgo", lambda: ta.pgo(out["high"], out["low"], out["close"])),
-        ("efi", lambda: ta.efi(out["close"], out["volume"])),
-        ("pvt", lambda: ta.pvt(out["close"], out["volume"])),
-        ("nvi", lambda: ta.nvi(out["close"], out["volume"])),
-        ("pvi", lambda: ta.pvi(out["close"], out["volume"])),
-        ("eom", lambda: ta.eom(out["high"], out["low"], out["volume"])),
-        ("adosc", lambda: ta.adosc(out["high"], out["low"], out["close"], out["volume"])),
-        ("vortex", lambda: ta.vortex(out["high"], out["low"], out["close"])),
-        ("aroon", lambda: ta.aroon(out["high"], out["low"])),
-        ("psar", lambda: ta.psar(out["high"], out["low"], out["close"])),
-        ("qstick", lambda: ta.qstick(out["open"], out["close"])),
-        ("er", lambda: ta.er(out["close"])),
-        ("slope", lambda: ta.slope(out["close"])),
-        ("entropy", lambda: ta.entropy(out["close"])),
-        ("kurtosis", lambda: ta.kurtosis(out["close"])),
-        ("skew", lambda: ta.skew(out["close"])),
-        ("mad", lambda: ta.mad(out["close"])),
-        ("median", lambda: ta.median(out["close"])),
-        ("quantile", lambda: ta.quantile(out["close"])),
-        ("vhf", lambda: ta.vhf(out["close"])),
-        ("hwc", lambda: ta.hwc(out["close"])),
-        ("chop", lambda: ta.chop(out["high"], out["low"], out["close"])),
-        ("increasing", lambda: ta.increasing(out["close"])),
-        ("decreasing", lambda: ta.decreasing(out["close"])),
-        ("ttm_trend", lambda: ta.ttm_trend(out["high"], out["low"], out["close"])),
-        ("alloy", lambda: ta.alog(out["close"]) if hasattr(ta, "alog") else None),
+        ("cmo", lambda: ta.cmo(out["close"], length=14) if hasattr(ta, "cmo") else None),
+        ("ppo", lambda: ta.ppo(out["close"]) if hasattr(ta, "ppo") else None),
+        ("trix", lambda: ta.trix(out["close"]) if hasattr(ta, "trix") else None),
+        ("fisher", lambda: ta.fisher(out["high"], out["low"]) if hasattr(ta, "fisher") else None),
+        ("stochrsi", lambda: ta.stochrsi(out["close"]) if hasattr(ta, "stochrsi") else None),
+        ("uo", lambda: ta.uo(out["high"], out["low"], out["close"]) if hasattr(ta, "uo") else None),
+        ("bop", lambda: ta.bop(out["open"], out["high"], out["low"], out["close"]) if hasattr(ta, "bop") else None),
+        ("donchian", lambda: ta.donchian(out["high"], out["low"]) if hasattr(ta, "donchian") else None),
+        ("kc", lambda: ta.kc(out["high"], out["low"], out["close"]) if hasattr(ta, "kc") else None),
+        ("efi", lambda: ta.efi(out["close"], out["volume"]) if hasattr(ta, "efi") else None),
+        ("pvt", lambda: ta.pvt(out["close"], out["volume"]) if hasattr(ta, "pvt") else None),
+        # classic eom signature: high, low, close, volume
+        (
+            "eom",
+            lambda: ta.eom(out["high"], out["low"], out["close"], out["volume"])
+            if hasattr(ta, "eom")
+            else None,
+        ),
+        (
+            "adosc",
+            lambda: ta.adosc(out["high"], out["low"], out["close"], out["volume"])
+            if hasattr(ta, "adosc")
+            else None,
+        ),
+        ("vortex", lambda: ta.vortex(out["high"], out["low"], out["close"]) if hasattr(ta, "vortex") else None),
+        ("aroon", lambda: ta.aroon(out["high"], out["low"]) if hasattr(ta, "aroon") else None),
+        ("psar", lambda: ta.psar(out["high"], out["low"], out["close"]) if hasattr(ta, "psar") else None),
+        ("er", lambda: ta.er(out["close"]) if hasattr(ta, "er") else None),
+        ("slope", lambda: ta.slope(out["close"]) if hasattr(ta, "slope") else None),
+        ("chop", lambda: ta.chop(out["high"], out["low"], out["close"]) if hasattr(ta, "chop") else None),
+        (
+            "ttm_trend",
+            lambda: ta.ttm_trend(out["high"], out["low"], out["close"])
+            if hasattr(ta, "ttm_trend")
+            else None,
+        ),
     ]
     for name, fn in extra_calls:
         try:
@@ -358,32 +461,18 @@ def _compute_with_pandas_ta(out: pd.DataFrame, ac: AnalysisConfig) -> Tuple[pd.D
             if res is None:
                 continue
             if isinstance(res, pd.Series):
-                col = name if name not in out.columns else f"{name}_x"
-                out[col] = res
+                if name not in out.columns:
+                    out[name] = res
             elif isinstance(res, pd.DataFrame) and not res.empty:
-                for c in res.columns:
-                    if c not in out.columns:
-                        out[c] = res[c]
-        except Exception:
-            continue
+                out = _safe_join_df(out, res)
+        except Exception as exc:
+            logger.debug("extra indicator {} failed: {}", name, exc)
 
-    # Optional: CommonStrategy dump if available (best-effort, ignore failures)
-    try:
-        if hasattr(ta, "Strategy") and hasattr(out, "ta"):
-            # attach accessor via pandas_ta
-            pass
-        my_strategy = getattr(ta, "CommonStrategy", None)
-        if my_strategy is not None:
-            # Non-destructive: compute on a copy and merge missing cols
-            tmp = out[["open", "high", "low", "close", "volume"]].copy()
-            tmp.ta.strategy(my_strategy)
-            for c in tmp.columns:
-                if c not in out.columns and c not in ("open", "high", "low", "close", "volume"):
-                    out[c] = tmp[c]
-    except Exception as exc:
-        logger.debug("pandas-ta CommonStrategy skipped: {}", exc)
+    # NOTE: Do NOT run CommonStrategy / AllStrategy here.
+    # They may spawn multiprocessing pools which break on Render / uvicorn.
 
-    count = max(count, len([c for c in out.columns if c not in ("open", "high", "low", "close", "volume")]))
+    out = out.copy()  # defragment
+    count = len([c for c in out.columns if str(c).lower() not in base_cols])
     return out, count
 
 
@@ -610,15 +699,30 @@ def _build_summary(df: pd.DataFrame, ac: AnalysisConfig) -> Dict[str, Any]:
     rsi = g("rsi")
     atr = g("atr")
     adx = g("adx_14", "adx")
-    macd_col = _col_like(df, "macd_")
-    # Prefer line not signal/hist when matching
-    macd_cols = [c for c in df.columns if str(c).lower().startswith("macd") and "s_" not in str(c).lower() and "h_" not in str(c).lower()]
+    # Classic MACD cols: MACD_12_26_9, MACDs_12_26_9, MACDh_12_26_9
+    macd_cols = [
+        c
+        for c in df.columns
+        if str(c).upper().startswith("MACD")
+        and "S_" not in str(c).upper()
+        and "H_" not in str(c).upper()
+        and str(c).upper() != "MACD"
+        or str(c).lower() == "macd"
+    ]
+    # Prefer exact MACD_ prefix without s/h
+    macd_line_cols = [
+        c
+        for c in df.columns
+        if str(c).upper().startswith("MACD_")
+        and not str(c).upper().startswith("MACDS")
+        and not str(c).upper().startswith("MACDH")
+    ]
     macds_col = _col_like(df, "macds_")
     macdh_col = _col_like(df, "macdh_")
-    if macd_cols:
+    if macd_line_cols:
+        macd = safe_float(last.get(macd_line_cols[0]))
+    elif macd_cols:
         macd = safe_float(last.get(macd_cols[0]))
-    elif macd_col:
-        macd = safe_float(last.get(macd_col))
     else:
         macd = float("nan")
     macds = safe_float(last.get(macds_col)) if macds_col else float("nan")
@@ -631,12 +735,9 @@ def _build_summary(df: pd.DataFrame, ac: AnalysisConfig) -> Dict[str, Any]:
     vol_ratio = g("vol_ratio", default=1.0)
     cmf = g("cmf")
     mfi = g("mfi")
-    bb_lower = g("bbl", default=float("nan"))
-    bb_upper = g("bbu", default=float("nan"))
-    if np.isnan(bb_lower):
-        bb_lower = g("bbl_20_2.0", "bbl_20_2")
-    if np.isnan(bb_upper):
-        bb_upper = g("bbu_20_2.0", "bbu_20_2")
+    # Classic bbands: BBL_20_2.0 / BBU_20_2.0
+    bb_lower = g("bbl_20_2.0", "bbl_20_2", "bbl", default=float("nan"))
+    bb_upper = g("bbu_20_2.0", "bbu_20_2", "bbu", default=float("nan"))
 
     trend_votes = 0.0
     if not np.isnan(ema_fast) and not np.isnan(ema_slow):
