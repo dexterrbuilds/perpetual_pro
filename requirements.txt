@@ -1,10 +1,9 @@
-# perpetual_pro — production dependencies
-# Python 3.10+ recommended (3.9 works with built-in indicator fallback)
+# perpetual_pro — production dependencies for Render / local
+# Pure-pandas indicator fallback is always available (no pandas-ta required at boot).
+
 ccxt>=4.2.0
 pandas>=2.0.0
-pandas-ta-classic>=0.4.0
 numpy>=1.24.0
-mss>=9.0.0
 Pillow>=10.0.0
 opencv-python-headless>=4.8.0
 pytesseract>=0.3.10
@@ -17,13 +16,8 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 python-multipart>=0.0.9
 
-# Full indicator suite (optional — pure-pandas fallback is built-in if missing)
-# Prefer Python 3.10+ for latest wheels:
-#   pip install pandas-ta
-# If pip fails, the tool still computes 80+ indicators via src/analysis/indicators.py fallback.
-
-# Dual OCR second engine (optional; large model download on first use)
+# Local / desktop only (not required for API on Render):
+# mss>=9.0.0
 # easyocr>=1.7.0
-
-# Optional: local vision via Ollama (HTTP only, no extra pip dep)
-# Install Tesseract system package separately — see README
+# Optional enhanced indicators (import is optional; app boots without it):
+# pandas-ta-classic>=0.4.0

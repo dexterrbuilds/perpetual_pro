@@ -7,7 +7,6 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 from loguru import logger
 
 from src.utils.helpers import safe_float

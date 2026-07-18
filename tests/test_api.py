@@ -72,7 +72,6 @@ def test_analyze_from_image_full_pipeline_mocked(monkeypatch):
     from src.data.multi_tf import MultiTimeframeData
     from src.data.exchange import MarketSnapshot
     import pandas as pd
-    import pandas_ta as ta
 
     class FakeOCR:
         def __init__(self, *a, **k):

@@ -7,7 +7,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]

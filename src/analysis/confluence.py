@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 from loguru import logger
 
 from src.analysis.indicators import IndicatorSuite, compute_indicators

@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 from loguru import logger
 
 from src.utils.config import AppConfig, ExchangeConfig

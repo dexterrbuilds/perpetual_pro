@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import pandas as pd
-import pandas_ta as ta
 from loguru import logger
 
 from src.data.exchange import ExchangeClient, MarketSnapshot
