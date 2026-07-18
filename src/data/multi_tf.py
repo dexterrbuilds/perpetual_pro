@@ -55,9 +55,16 @@ def fetch_multi_timeframe(
     Higher TFs default from config or common prop stack (1h/4h/1d).
     """
     if higher_tfs is None:
-        higher_tfs = list(config.timeframes.higher) if config else ["1h", "4h", "1d"]
-    if config and limit is None:
-        limit = config.timeframes.ohlcv_limit
+        higher_tfs = (
+            list(config.timeframes.higher)
+            if config
+            else ["5m", "1h", "4h", "1d"]
+        )
+    # Max signal quality default stack (includes lower TF context when useful)
+    if config:
+        limit = max(limit or 0, int(config.timeframes.ohlcv_limit or 1000))
+    else:
+        limit = max(limit or 500, 1000)
 
     # Deduplicate while preserving order; always include primary
     ordered: List[str] = []

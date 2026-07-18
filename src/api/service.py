@@ -6,7 +6,8 @@ news + confluence, returning a clean JSON-serializable dict.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Union
 
@@ -23,6 +24,7 @@ from src.utils.config import AppConfig, load_config
 from src.utils.helpers import normalize_symbol
 from src.vision.chart_detect import ChartVision
 from src.vision.ocr import OCREngine
+from src.vision.url_symbol import parse_chart_url
 
 
 @dataclass
@@ -33,10 +35,17 @@ class AnalyzeRequest:
     timeframe: Optional[str] = None
     exchange: Optional[str] = None
     higher: Optional[List[str]] = None
-    account_balance: Optional[float] = None
-    risk_pct: Optional[float] = None
+    simulated_capital: Optional[float] = None  # default $1000 sim capital
+    risk_pct: Optional[float] = None  # default 1%
+    account_balance: Optional[float] = None  # legacy alias → simulated_capital
     no_news: bool = False
     dark_theme: Optional[bool] = None
+    use_llm: bool = True
+    # Client / browser fusion inputs
+    page_url: Optional[str] = None
+    client_ocr: Optional[Dict[str, Any]] = field(default_factory=dict)
+    client_vision: Optional[Dict[str, Any]] = field(default_factory=dict)
+    client_hints: Optional[Dict[str, Any]] = field(default_factory=dict)
 
 
 def _parse_higher(higher: Optional[Union[str, List[str]]], config: AppConfig) -> List[str]:
@@ -71,44 +80,89 @@ def analyze_from_image(
     img = _load_image(image)
     dark = req.dark_theme if req.dark_theme is not None else cfg.screen.dark_theme
 
-    # --- OCR ---
+    # --- URL hints (TradingView first-class) ---
+    url_hints = parse_chart_url(req.page_url)
+    client_ocr = req.client_ocr or {}
+    client_vision = req.client_vision or {}
+
+    # --- Server OCR: Tesseract + EasyOCR (full text) ---
     ocr_engine = OCREngine(config=cfg)
     ocr_result = ocr_engine.extract(img, dark_theme=dark)
+    # Merge client OCR text if richer
+    if client_ocr.get("all_text") or client_ocr.get("raw"):
+        extra = str(client_ocr.get("all_text") or client_ocr.get("raw") or "")
+        if extra and len(extra) > 20:
+            ocr_result.raw_text = (ocr_result.raw_text + "\n" + extra).strip()
+            ocr_result.meta["merged_client_ocr"] = True
+            # Re-parse combined text for more recall
+            ocr_engine._parse(ocr_result)
     logger.info(
-        "API OCR symbol={} tf={} conf={:.2f}",
+        "API OCR symbol={} tf={} conf={:.2f} url_symbol={}",
         ocr_result.symbol,
         ocr_result.timeframe,
         ocr_result.confidence,
+        url_hints.symbol,
     )
 
-    # --- Computer vision ---
+    # --- Computer vision (OpenCV chart structure) ---
     vision = ChartVision(config=cfg)
-    # Disable Ollama by default in API path if slow; still honor config
     vis = vision.analyze(img, dark_theme=dark)
+    # Soft-blend client vision trend if server weak
+    if vis.trend_guess == "unknown" and client_vision.get("trend_guess") in ("up", "down", "range"):
+        vis.trend_guess = client_vision["trend_guess"]
+        vis.notes.append("trend from client vision")
+        vis.confidence = max(vis.confidence, float(client_vision.get("confidence") or 0.3))
 
-    # --- Resolve symbol / timeframe ---
-    resolved_symbol = req.symbol or ocr_result.symbol
+    # --- Resolve symbol / timeframe (priority: user > URL > server OCR > client OCR) ---
+    resolve_notes: List[str] = []
+    resolved_symbol = req.symbol
+    if resolved_symbol:
+        resolve_notes.append("symbol=user")
+    elif url_hints.symbol and url_hints.confidence >= 0.5:
+        resolved_symbol = url_hints.symbol
+        resolve_notes.append(f"symbol=url({url_hints.source})")
+    elif ocr_result.symbol:
+        resolved_symbol = ocr_result.symbol
+        resolve_notes.append("symbol=server_ocr")
+    elif client_ocr.get("symbol"):
+        resolved_symbol = str(client_ocr["symbol"])
+        resolve_notes.append("symbol=client_ocr")
+
     if not resolved_symbol:
+        # Even without symbol, return vision analysis so client can prompt manually
         return {
             "ok": False,
             "error": "symbol_required",
             "message": (
-                "Could not detect symbol from image. "
-                "Pass form field 'symbol' (e.g. BTC or BTC/USDT:USDT)."
+                "Could not detect symbol from image, URL, or OCR. "
+                "Pass form field 'symbol' (e.g. BTC) — chart vision still ran."
             ),
             "ocr": {
-                "raw_preview": (ocr_result.raw_text or "")[:500],
+                "raw_preview": (ocr_result.raw_text or "")[:800],
                 "confidence": ocr_result.confidence,
                 "timeframe": ocr_result.timeframe,
                 "prices": ocr_result.prices[:20],
+                "indicators_mentioned": ocr_result.indicators_mentioned,
                 "engine_notes": ocr_result.engine_notes,
+                "all_text_len": len(ocr_result.raw_text or ""),
             },
             "vision": {
                 "candles_detected": vis.candles_detected,
                 "trend_guess": vis.trend_guess,
                 "confidence": vis.confidence,
                 "notes": vis.notes,
+                "horizontal_levels": len(vis.horizontal_levels_y),
             },
+            "url_hints": {
+                "symbol": url_hints.symbol,
+                "timeframe": url_hints.timeframe,
+                "exchange_hint": url_hints.exchange_hint,
+                "source": url_hints.source,
+                "confidence": url_hints.confidence,
+                "page_url": req.page_url,
+            },
+            "client_vision": client_vision or None,
+            "resolve_notes": resolve_notes,
         }
 
     try:
@@ -118,20 +172,42 @@ def analyze_from_image(
             "ok": False,
             "error": "invalid_symbol",
             "message": str(exc),
+            "url_hints": {"raw": url_hints.raw_pair, "source": url_hints.source},
         }
 
-    primary_tf = req.timeframe or ocr_result.timeframe or cfg.timeframes.primary
-    ex_id = (req.exchange or cfg.exchange.default).lower()
+    primary_tf = (
+        req.timeframe
+        or url_hints.timeframe
+        or ocr_result.timeframe
+        or (client_ocr.get("timeframe") if client_ocr else None)
+        or cfg.timeframes.primary
+    )
+    ex_id = (
+        req.exchange
+        or url_hints.exchange_hint
+        or cfg.exchange.default
+    )
+    if isinstance(ex_id, str):
+        ex_id = ex_id.lower()
     higher_tfs = _parse_higher(req.higher, cfg)
+    sim_capital = (
+        req.simulated_capital
+        if req.simulated_capital is not None
+        else req.account_balance
+    )
+    risk_pct = req.risk_pct
 
     vision_notes = (
         f"OCR: symbol={ocr_result.symbol} tf={ocr_result.timeframe} "
         f"conf={ocr_result.confidence:.2f}; "
+        f"URL: {url_hints.symbol or '—'} ({url_hints.source or 'n/a'}); "
         f"CV: candles={vis.candles_detected} trend≈{vis.trend_guess} "
-        f"conf={vis.confidence:.2f}"
+        f"conf={vis.confidence:.2f}; resolve={','.join(resolve_notes) or 'n/a'}"
     )
     if vis.ollama_summary:
         vision_notes += f" | Ollama: {vis.ollama_summary[:200]}"
+    if client_vision.get("trend_guess"):
+        vision_notes += f" | client_cv={client_vision.get('trend_guess')}"
 
     vision_payload = {
         "notes": vision_notes,
@@ -139,9 +215,19 @@ def analyze_from_image(
             "symbol": ocr_result.symbol,
             "timeframe": ocr_result.timeframe,
             "confidence": round(ocr_result.confidence, 4),
-            "prices": ocr_result.prices[:20],
+            "prices": ocr_result.prices[:30],
             "indicators_mentioned": ocr_result.indicators_mentioned,
             "engine_notes": ocr_result.engine_notes,
+            "all_text_preview": (ocr_result.raw_text or "")[:600],
+            "lines_count": len(ocr_result.lines),
+        },
+        "url_hints": {
+            "symbol": url_hints.symbol,
+            "timeframe": url_hints.timeframe,
+            "exchange_hint": url_hints.exchange_hint,
+            "source": url_hints.source,
+            "confidence": url_hints.confidence,
+            "page_url": req.page_url,
         },
         "cv": {
             "candles_detected": vis.candles_detected,
@@ -149,9 +235,21 @@ def analyze_from_image(
             "confidence": round(vis.confidence, 4),
             "notes": vis.notes,
             "horizontal_levels": len(vis.horizontal_levels_y),
+            "approx_support_ys": getattr(vis, "approx_support_ys", [])[:5],
+            "approx_resistance_ys": getattr(vis, "approx_resistance_ys", [])[:5],
             "volume_bars": vis.volume_bars,
             "ollama_summary": vis.ollama_summary or None,
         },
+        "client_ocr": {
+            "symbol": client_ocr.get("symbol"),
+            "timeframe": client_ocr.get("timeframe"),
+            "confidence": client_ocr.get("confidence"),
+            "indicators": client_ocr.get("indicators") or client_ocr.get("indicators_mentioned"),
+        }
+        if client_ocr
+        else None,
+        "client_vision": client_vision or None,
+        "resolve_notes": resolve_notes,
         "resolved_symbol": resolved_symbol,
         "resolved_timeframe": primary_tf,
         "exchange": ex_id,
@@ -179,8 +277,8 @@ def analyze_from_image(
                 ocr_prices=ocr_result.prices,
                 vision_notes=vision_notes,
                 config=cfg,
-                account_balance=req.account_balance,
-                risk_pct=req.risk_pct,
+                simulated_capital=sim_capital,
+                risk_pct=risk_pct,
             )
             data_mode = "vision_only"
         else:
@@ -195,8 +293,9 @@ def analyze_from_image(
             analysis = engine.analyze(
                 mtf,
                 news=news_bundle,
-                account_balance=req.account_balance,
-                risk_pct=req.risk_pct,
+                simulated_capital=sim_capital,
+                risk_pct=risk_pct,
+                use_llm=req.use_llm,
             )
             data_mode = "full"
             _apply_vision_conflict_warnings(analysis, vis.trend_guess, vis.confidence)
@@ -240,7 +339,7 @@ def _vision_only_analysis(
     ocr_prices: List[float],
     vision_notes: str,
     config: AppConfig,
-    account_balance: Optional[float],
+    simulated_capital: Optional[float],
     risk_pct: Optional[float],
 ) -> FullAnalysis:
     analysis = FullAnalysis(
@@ -264,11 +363,11 @@ def _vision_only_analysis(
     )
     analysis.warnings.append("Data fallback failed — vision-only mode")
     price = ocr_prices[len(ocr_prices) // 2] if ocr_prices else 0.0
-    analysis.meta = {"price": price, "atr": price * 0.01 if price else 0}
+    analysis.meta = {"price": price, "atr": price * 0.01 if price else 0, "is_simulation": True}
     if price:
         rm = RiskManager(
             config=config,
-            account_balance=account_balance,
+            simulated_capital=simulated_capital,
             risk_pct=risk_pct,
         )
         analysis.trade_plan = rm.build_plan(

@@ -80,13 +80,21 @@ def test_structure_analyzer_runs():
 
 
 def test_risk_manager_long_plan():
-    rm = RiskManager(account_balance=10000, risk_pct=1.0)
-    plan = rm.build_plan("long", price=100.0, atr=2.0, confidence=70)
+    rm = RiskManager(simulated_capital=1000, risk_pct=1.0)
+    plan = rm.build_plan("long", price=100.0, atr=2.0, confidence=70, funding_rate=0.0001)
     assert plan.direction == "long"
     assert plan.stop_loss < 100
     assert len(plan.take_profits) >= 1
     assert plan.position_size_units > 0
     assert plan.primary_rr > 0
+    assert plan.simulated_capital == 1000
+    assert plan.leverage_suggested >= 1
+    assert len(plan.potential_profits) >= 1
+    assert plan.is_simulation is True
+    setup = plan.to_primary_setup()
+    assert setup["tp1"] is not None
+    sim = plan.to_position_simulation()
+    assert sim["risk_amount"] > 0
 
 
 def test_load_config_defaults():

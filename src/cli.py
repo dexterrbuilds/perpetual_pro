@@ -91,7 +91,7 @@ def run_data_mode(
             analysis = engine.analyze(
                 mtf,
                 news=news_bundle,
-                account_balance=account_balance,
+                simulated_capital=account_balance,
                 risk_pct=risk_pct,
             )
 
@@ -256,7 +256,7 @@ def run_screen_mode(
             analysis = engine.analyze(
                 mtf,
                 news=news_bundle,
-                account_balance=account_balance,
+                simulated_capital=account_balance,
                 risk_pct=risk_pct,
             )
             if vis.trend_guess in ("up", "down"):
@@ -370,8 +370,18 @@ Examples:
         help="Higher timeframes comma-separated (e.g. 1h,4h,1d)",
     )
     parser.add_argument("--config", "-c", default=None, help="Path to config.yaml")
-    parser.add_argument("--balance", type=float, default=None, help="Account balance for sizing")
-    parser.add_argument("--risk", type=float, default=None, help="Risk percent per trade")
+    parser.add_argument(
+        "--balance",
+        type=float,
+        default=None,
+        help="Simulated capital for position sizing (default $1000)",
+    )
+    parser.add_argument(
+        "--risk",
+        type=float,
+        default=None,
+        help="Risk percent of simulated capital (default 1.0)",
+    )
     parser.add_argument("--no-news", action="store_true", help="Skip news fetch")
     parser.add_argument("--no-save", action="store_true", help="Do not save MD/JSON reports")
     parser.add_argument(

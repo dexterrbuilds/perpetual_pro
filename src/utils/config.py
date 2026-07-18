@@ -30,19 +30,36 @@ class ExchangeConfig:
 
 @dataclass
 class RiskConfig:
-    account_balance: float = 10000.0
+    """Simulated capital sizing — not a live exchange balance."""
+
+    simulated_capital: float = 1000.0
     risk_per_trade_pct: float = 1.0
-    max_leverage: int = 10
+    # Soft ceiling for *suggested* dynamic leverage (not exchange max)
+    leverage_ceiling: float = 20.0
+    leverage_floor: float = 1.0
     min_rr: float = 1.5
     default_stop_atr_mult: float = 1.5
     default_tp_atr_mults: List[float] = field(default_factory=lambda: [1.5, 2.5, 4.0])
+    # Legacy alias (read-only migration)
+    account_balance: float = 1000.0
+    max_leverage: int = 20
 
 
 @dataclass
 class TimeframesConfig:
     primary: str = "15m"
-    higher: List[str] = field(default_factory=lambda: ["1h", "4h", "1d"])
-    ohlcv_limit: int = 500
+    higher: List[str] = field(default_factory=lambda: ["5m", "1h", "4h", "1d"])
+    ohlcv_limit: int = 1000
+
+
+@dataclass
+class LLMConfig:
+    enabled: bool = True
+    groq_api_key: str = ""
+    gemini_api_key: str = ""
+    groq_model: str = "llama-3.1-8b-instant"
+    gemini_model: str = "gemini-2.0-flash"
+    timeout_s: int = 25
 
 
 @dataclass
@@ -135,6 +152,7 @@ class AppConfig:
     ocr: OCRConfig = field(default_factory=OCRConfig)
     screen: ScreenConfig = field(default_factory=ScreenConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     config_path: Optional[Path] = None
@@ -168,9 +186,11 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
     ocr = data.get("ocr", {}) or {}
     screen = data.get("screen", {}) or {}
     vision = data.get("vision", {}) or {}
+    llm = data.get("llm", {}) or {}
     output = data.get("output", {}) or {}
     logging_cfg = data.get("logging", {}) or {}
 
+    sim_cap = risk.get("simulated_capital", risk.get("account_balance", 1000.0))
     return AppConfig(
         exchange=ExchangeConfig(
             default=str(ex.get("default", "binanceusdm")),
@@ -182,17 +202,20 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             sandbox=bool(ex.get("sandbox", False)),
         ),
         risk=RiskConfig(
-            account_balance=float(risk.get("account_balance", 10000.0)),
+            simulated_capital=float(sim_cap),
+            account_balance=float(sim_cap),
             risk_per_trade_pct=float(risk.get("risk_per_trade_pct", 1.0)),
-            max_leverage=int(risk.get("max_leverage", 10)),
+            leverage_ceiling=float(risk.get("leverage_ceiling", risk.get("max_leverage", 20))),
+            leverage_floor=float(risk.get("leverage_floor", 1.0)),
+            max_leverage=int(risk.get("max_leverage", risk.get("leverage_ceiling", 20))),
             min_rr=float(risk.get("min_rr", 1.5)),
             default_stop_atr_mult=float(risk.get("default_stop_atr_mult", 1.5)),
             default_tp_atr_mults=list(risk.get("default_tp_atr_mults", [1.5, 2.5, 4.0])),
         ),
         timeframes=TimeframesConfig(
             primary=str(tf.get("primary", "15m")),
-            higher=list(tf.get("higher", ["1h", "4h", "1d"])),
-            ohlcv_limit=int(tf.get("ohlcv_limit", 500)),
+            higher=list(tf.get("higher", ["5m", "1h", "4h", "1d"])),
+            ohlcv_limit=int(tf.get("ohlcv_limit", 1000)),
         ),
         analysis=AnalysisConfig(
             rsi_period=int(an.get("rsi_period", 14)),
@@ -245,6 +268,14 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             ollama_model=str(vision.get("ollama_model", "llava")),
             ollama_timeout_s=int(vision.get("ollama_timeout_s", 45)),
         ),
+        llm=LLMConfig(
+            enabled=bool(llm.get("enabled", True)),
+            groq_api_key=str(llm.get("groq_api_key", "") or ""),
+            gemini_api_key=str(llm.get("gemini_api_key", "") or ""),
+            groq_model=str(llm.get("groq_model", "llama-3.1-8b-instant")),
+            gemini_model=str(llm.get("gemini_model", "gemini-2.0-flash")),
+            timeout_s=int(llm.get("timeout_s", 25)),
+        ),
         output=OutputConfig(
             save_markdown=bool(output.get("save_markdown", True)),
             save_json=bool(output.get("save_json", True)),
@@ -273,8 +304,13 @@ def _apply_env_overrides(cfg: AppConfig) -> AppConfig:
         cfg.exchange.default = os.environ["PERP_EXCHANGE"].strip().lower()
     if os.getenv("CRYPTOPANIC_TOKEN"):
         cfg.news.cryptopanic_token = os.environ["CRYPTOPANIC_TOKEN"]
-    if os.getenv("ACCOUNT_BALANCE"):
-        cfg.risk.account_balance = float(os.environ["ACCOUNT_BALANCE"])
+    if os.getenv("SIMULATED_CAPITAL"):
+        cfg.risk.simulated_capital = float(os.environ["SIMULATED_CAPITAL"])
+        cfg.risk.account_balance = cfg.risk.simulated_capital
+    elif os.getenv("ACCOUNT_BALANCE"):
+        # legacy env
+        cfg.risk.simulated_capital = float(os.environ["ACCOUNT_BALANCE"])
+        cfg.risk.account_balance = cfg.risk.simulated_capital
     if os.getenv("RISK_PER_TRADE_PCT"):
         cfg.risk.risk_per_trade_pct = float(os.environ["RISK_PER_TRADE_PCT"])
     if os.getenv("TESSERACT_CMD"):
@@ -283,6 +319,16 @@ def _apply_env_overrides(cfg: AppConfig) -> AppConfig:
         cfg.vision.ollama_base_url = os.environ["OLLAMA_BASE_URL"]
     if os.getenv("OLLAMA_MODEL"):
         cfg.vision.ollama_model = os.environ["OLLAMA_MODEL"]
+    if os.getenv("GROQ_API_KEY"):
+        cfg.llm.groq_api_key = os.environ["GROQ_API_KEY"]
+    if os.getenv("GEMINI_API_KEY"):
+        cfg.llm.gemini_api_key = os.environ["GEMINI_API_KEY"]
+    elif os.getenv("GOOGLE_API_KEY"):
+        cfg.llm.gemini_api_key = os.environ["GOOGLE_API_KEY"]
+    if os.getenv("GROQ_MODEL"):
+        cfg.llm.groq_model = os.environ["GROQ_MODEL"]
+    if os.getenv("GEMINI_MODEL"):
+        cfg.llm.gemini_model = os.environ["GEMINI_MODEL"]
     return cfg
 
 

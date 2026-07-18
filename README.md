@@ -157,11 +157,12 @@ Health: `GET /health`
 
 ### Chrome extension
 
-A Manifest V3 extension lives in [`extension/`](./extension/):
+A Manifest V3 extension lives in [`extension/`](./extension/). It calls the fixed production API:
 
-1. Start the API: `uvicorn main_server:app --reload --port 8000`
-2. Chrome → `chrome://extensions` → Developer mode → **Load unpacked** → select `extension/`
-3. Use **Capture & Analyze Chart**, `Ctrl+Shift+P`, or right-click a chart image
+**`https://perpetual-pro.onrender.com`**
+
+1. Chrome → `chrome://extensions` → Developer mode → **Load unpacked** → select `extension/`
+2. Use **Capture & Analyze Chart**, `Ctrl+Shift+P`, or right-click a chart image
 
 See [extension/README.md](./extension/README.md) for details.
 

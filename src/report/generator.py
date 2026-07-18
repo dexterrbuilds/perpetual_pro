@@ -244,27 +244,44 @@ class ReportGenerator:
             "symbol": analysis.symbol,
             "exchange": analysis.exchange_id,
             "primary_tf": analysis.primary_tf,
+            # Clear trading signal
+            "signal": {
+                "bias": analysis.bias,
+                "direction": analysis.direction,
+                "confidence_pct": analysis.confidence,
+                "setup_name": analysis.setup_name,
+                "strategy_tags": analysis.strategy_tags,
+                "confluence_score": analysis.confluence_total,
+            },
             "bias": analysis.bias,
             "direction": analysis.direction,
             "confidence": analysis.confidence,
             "setup_name": analysis.setup_name,
             "strategy_tags": analysis.strategy_tags,
             "confluence_total": analysis.confluence_total,
+            "confluence_breakdown": analysis.factor_breakdown(),
             "factors": analysis.factor_breakdown(),
+            "primary_setup": None,
+            "position_simulation": None,
             "trade_plan": None,
             "patterns": [],
             "structure": None,
             "key_levels": analysis.key_levels,
+            "key_reasons": list(getattr(analysis, "key_reasons", None) or []),
+            "key_risks": list(getattr(analysis, "key_risks", None) or []),
             "derivatives_notes": analysis.derivatives_notes,
             "multi_tf_notes": analysis.multi_tf_notes,
             "news": None,
             "scenarios": None,
             "trader_commentary": analysis.trader_commentary,
+            "llm_narrative": None,
             "warnings": analysis.warnings,
             "meta": analysis.meta,
             "disclaimer": DISCLAIMER,
         }
         if plan:
+            data["primary_setup"] = plan.to_primary_setup()
+            data["position_simulation"] = plan.to_position_simulation()
             data["trade_plan"] = {
                 "direction": plan.direction,
                 "entry_low": plan.entry_low,
@@ -274,12 +291,29 @@ class ReportGenerator:
                 "risk_reward": plan.risk_reward,
                 "position_size_units": plan.position_size_units,
                 "position_size_notional": plan.position_size_notional,
+                "margin_required": getattr(plan, "margin_required", None),
                 "risk_amount": plan.risk_amount,
                 "risk_pct": plan.risk_pct,
+                "simulated_capital": getattr(plan, "simulated_capital", None),
                 "leverage_suggested": plan.leverage_suggested,
+                "leverage_reasoning": getattr(plan, "leverage_reasoning", ""),
+                "potential_profits": getattr(plan, "potential_profits", []),
+                "potential_profit_pcts": getattr(plan, "potential_profit_pcts", []),
                 "quality": plan.quality,
                 "notes": plan.notes,
                 "invalidation": plan.invalidation,
+                "is_simulation": True,
+            }
+        if getattr(analysis, "llm", None):
+            llm = analysis.llm
+            data["llm_narrative"] = {
+                "signal_narrative": llm.signal_narrative,
+                "leverage_reasoning": llm.leverage_reasoning,
+                "key_reasons": llm.key_reasons,
+                "key_risks": llm.key_risks,
+                "scenarios": llm.scenarios,
+                "provider": llm.provider,
+                "model": llm.model,
             }
         if analysis.patterns:
             data["patterns"] = [

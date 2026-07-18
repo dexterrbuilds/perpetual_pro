@@ -12,7 +12,7 @@
         <img src="icons/icon48.png" alt="" />
         <div>
           <h1>Perpetual Pro</h1>
-          <div class="sub">Local FastAPI · localhost:8000</div>
+          <div class="sub">API · perpetual-pro.onrender.com</div>
         </div>
       </div>
       <button id="btnSettings" class="ghost" title="Settings" type="button">⚙</button>
@@ -28,15 +28,14 @@
         <button id="btnCapture" class="primary" type="button">Capture &amp; Analyze Chart</button>
       </div>
       <div class="btn-row">
-        <button id="btnVisible" type="button">Visible tab</button>
+        <button id="btnSelectArea" type="button" title="Optional: drag-select chart region">Select area</button>
         <button id="btnSidePanel" type="button">Side panel</button>
+      </div>
+      <div class="hint" style="margin-top: 2px">
+        Default: full visible tab · TradingView URL used for symbol when possible
       </div>
 
       <div class="field-row" id="settingsPanel" style="display: none">
-        <label class="field full">
-          API base
-          <input id="apiBase" type="text" placeholder="http://localhost:8000" />
-        </label>
         <label class="field">
           Symbol (optional)
           <input id="symbol" type="text" placeholder="BTC" />
@@ -59,12 +58,12 @@
           <input id="higher" type="text" placeholder="1h,4h,1d" />
         </label>
         <label class="field">
-          Balance
-          <input id="balance" type="number" placeholder="10000" />
+          Sim capital ($)
+          <input id="balance" type="number" placeholder="1000" title="Simulated capital (default 1000)" />
         </label>
         <label class="field">
           Risk %
-          <input id="risk" type="number" step="0.1" placeholder="1.0" />
+          <input id="risk" type="number" step="0.1" placeholder="1.0" title="Risk per trade of sim capital" />
         </label>
         <label class="field full" style="flex-direction: row; align-items: center; gap: 8px">
           <input id="noNews" type="checkbox" />

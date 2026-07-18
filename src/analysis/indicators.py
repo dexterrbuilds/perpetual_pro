@@ -299,6 +299,90 @@ def _compute_with_pandas_ta(out: pd.DataFrame, ac: AnalysisConfig) -> Tuple[pd.D
 
     out["linreg"] = ta.linreg(out["close"], length=20) if hasattr(ta, "linreg") else out["close"].rolling(20).mean()
     out["zscore"] = (out["close"] - out["close"].rolling(20).mean()) / out["close"].rolling(20).std()
+
+    # Broaden suite: major trend / momentum / volatility / volume / oscillators
+    extra_calls = [
+        ("ema_12", lambda: ta.ema(out["close"], length=12)),
+        ("ema_26", lambda: ta.ema(out["close"], length=26)),
+        ("sma_100", lambda: ta.sma(out["close"], length=min(100, len(out) - 1))),
+        ("wma_20", lambda: ta.wma(out["close"], length=20)),
+        ("tema_20", lambda: ta.tema(out["close"], length=20)),
+        ("dema_20", lambda: ta.dema(out["close"], length=20)),
+        ("kama_10", lambda: ta.kama(out["close"], length=10)),
+        ("rsi_7", lambda: ta.rsi(out["close"], length=7)),
+        ("rsi_21", lambda: ta.rsi(out["close"], length=21)),
+        ("cmo", lambda: ta.cmo(out["close"], length=14)),
+        ("ppo", lambda: ta.ppo(out["close"])),
+        ("trix", lambda: ta.trix(out["close"])),
+        ("fisher", lambda: ta.fisher(out["high"], out["low"])),
+        ("cg", lambda: ta.cg(out["close"], length=10)),
+        ("inertia", lambda: ta.inertia(out["close"], length=20)),
+        ("stochrsi", lambda: ta.stochrsi(out["close"])),
+        ("uo", lambda: ta.uo(out["high"], out["low"], out["close"])),
+        ("bop", lambda: ta.bop(out["open"], out["high"], out["low"], out["close"])),
+        ("true_range", lambda: ta.true_range(out["high"], out["low"], out["close"])),
+        ("accbands", lambda: ta.accbands(out["high"], out["low"], out["close"])),
+        ("donchian", lambda: ta.donchian(out["high"], out["low"])),
+        ("kc", lambda: ta.kc(out["high"], out["low"], out["close"])),
+        ("massi", lambda: ta.massi(out["high"], out["low"])),
+        ("pgo", lambda: ta.pgo(out["high"], out["low"], out["close"])),
+        ("efi", lambda: ta.efi(out["close"], out["volume"])),
+        ("pvt", lambda: ta.pvt(out["close"], out["volume"])),
+        ("nvi", lambda: ta.nvi(out["close"], out["volume"])),
+        ("pvi", lambda: ta.pvi(out["close"], out["volume"])),
+        ("eom", lambda: ta.eom(out["high"], out["low"], out["volume"])),
+        ("adosc", lambda: ta.adosc(out["high"], out["low"], out["close"], out["volume"])),
+        ("vortex", lambda: ta.vortex(out["high"], out["low"], out["close"])),
+        ("aroon", lambda: ta.aroon(out["high"], out["low"])),
+        ("psar", lambda: ta.psar(out["high"], out["low"], out["close"])),
+        ("qstick", lambda: ta.qstick(out["open"], out["close"])),
+        ("er", lambda: ta.er(out["close"])),
+        ("slope", lambda: ta.slope(out["close"])),
+        ("entropy", lambda: ta.entropy(out["close"])),
+        ("kurtosis", lambda: ta.kurtosis(out["close"])),
+        ("skew", lambda: ta.skew(out["close"])),
+        ("mad", lambda: ta.mad(out["close"])),
+        ("median", lambda: ta.median(out["close"])),
+        ("quantile", lambda: ta.quantile(out["close"])),
+        ("vhf", lambda: ta.vhf(out["close"])),
+        ("hwc", lambda: ta.hwc(out["close"])),
+        ("chop", lambda: ta.chop(out["high"], out["low"], out["close"])),
+        ("increasing", lambda: ta.increasing(out["close"])),
+        ("decreasing", lambda: ta.decreasing(out["close"])),
+        ("ttm_trend", lambda: ta.ttm_trend(out["high"], out["low"], out["close"])),
+        ("alloy", lambda: ta.alog(out["close"]) if hasattr(ta, "alog") else None),
+    ]
+    for name, fn in extra_calls:
+        try:
+            res = fn()
+            if res is None:
+                continue
+            if isinstance(res, pd.Series):
+                col = name if name not in out.columns else f"{name}_x"
+                out[col] = res
+            elif isinstance(res, pd.DataFrame) and not res.empty:
+                for c in res.columns:
+                    if c not in out.columns:
+                        out[c] = res[c]
+        except Exception:
+            continue
+
+    # Optional: CommonStrategy dump if available (best-effort, ignore failures)
+    try:
+        if hasattr(ta, "Strategy") and hasattr(out, "ta"):
+            # attach accessor via pandas_ta
+            pass
+        my_strategy = getattr(ta, "CommonStrategy", None)
+        if my_strategy is not None:
+            # Non-destructive: compute on a copy and merge missing cols
+            tmp = out[["open", "high", "low", "close", "volume"]].copy()
+            tmp.ta.strategy(my_strategy)
+            for c in tmp.columns:
+                if c not in out.columns and c not in ("open", "high", "low", "close", "volume"):
+                    out[c] = tmp[c]
+    except Exception as exc:
+        logger.debug("pandas-ta CommonStrategy skipped: {}", exc)
+
     count = max(count, len([c for c in out.columns if c not in ("open", "high", "low", "close", "volume")]))
     return out, count
 

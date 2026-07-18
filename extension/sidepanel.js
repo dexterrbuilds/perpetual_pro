@@ -1,7 +1,9 @@
 /**
  * Perpetual Pro — side panel (full results + OCR claim)
  */
-import { lightOcr } from "./shared/ocr.js";
+import { fuseHints, lightOcr } from "./shared/ocr.js";
+import { parseChartUrl } from "./shared/url_parse.js";
+import { lightVision } from "./shared/vision_light.js";
 import { renderResults } from "./shared/render.js";
 
 const $ = (id) => document.getElementById(id);
@@ -15,7 +17,7 @@ const els = {
   results: $("results"),
   thumb: $("thumb"),
   btnCapture: $("btnCapture"),
-  btnVisible: $("btnVisible"),
+  btnSelectArea: $("btnSelectArea"),
   btnRefresh: $("btnRefresh"),
   btnClear: $("btnClear"),
   symbol: $("symbol"),
@@ -35,8 +37,8 @@ async function init() {
   await loadLast();
   await claimPending();
 
-  els.btnCapture.addEventListener("click", () => start("select-area"));
-  els.btnVisible.addEventListener("click", () => start("visible"));
+  els.btnCapture.addEventListener("click", () => start("visible"));
+  els.btnSelectArea?.addEventListener("click", () => start("select-area"));
   els.btnRefresh.addEventListener("click", async () => {
     await refreshBackend();
     await loadLast();
@@ -64,18 +66,14 @@ async function init() {
 }
 
 async function refreshBackend() {
-  const settings = (await chrome.runtime.sendMessage({ type: "GET_SETTINGS" }))?.settings || {};
-  const res = await chrome.runtime.sendMessage({
-    type: "CHECK_BACKEND",
-    apiBase: settings.apiBase,
-  });
+  const res = await chrome.runtime.sendMessage({ type: "CHECK_BACKEND" });
   if (res?.ok) {
-    setStatus("idle", "Backend online");
+    setStatus("idle", "API online");
     els.statusDot.className = "status-dot ok";
   } else {
     const msg =
       res?.error ||
-      "Backend not running. Start: uvicorn main_server:app --reload --port 8000";
+      "Cannot reach Perpetual Pro API (Render may be waking up — retry in ~30s).";
     setStatus("error", msg);
     els.statusDot.className = "status-dot err";
     showError(msg);
@@ -89,8 +87,7 @@ async function loadLast() {
 
 async function start(mode) {
   hideError();
-  setBusy(true, mode === "select-area" ? "Select area on the page…" : "Capturing…");
-  // save overrides
+  setBusy(true, mode === "select-area" ? "Select area on the page…" : "Capturing full tab…");
   const settings = (await chrome.runtime.sendMessage({ type: "GET_SETTINGS" }))?.settings || {};
   await chrome.runtime.sendMessage({
     type: "SAVE_SETTINGS",
@@ -102,7 +99,7 @@ async function start(mode) {
   });
   const res = await chrome.runtime.sendMessage({
     type: "START_CAPTURE",
-    mode,
+    mode: mode || "visible",
     symbol: els.symbol.value.trim(),
     timeframe: els.timeframe.value.trim(),
   });
@@ -123,34 +120,56 @@ async function claimPending() {
 
   processingPending = true;
   try {
-    setBusy(true, "Light OCR (Tesseract.js)…");
+    setBusy(true, "OCR + vision + URL fusion…");
     els.thumb.src = pending.dataUrl;
     els.thumb.classList.add("show");
 
-    let symbol = els.symbol.value.trim() || pending.symbol || "";
-    let timeframe = els.timeframe.value.trim() || pending.timeframe || "";
-    let clientOcr = null;
+    const pageUrl = pending.pageUrl || "";
+    const urlHints = parseChartUrl(pageUrl);
 
+    let clientOcr = null;
+    let clientVision = null;
     try {
       clientOcr = await lightOcr(pending.dataUrl);
-      if (!symbol && clientOcr.symbol) symbol = clientOcr.symbol;
-      if (!timeframe && clientOcr.timeframe) timeframe = clientOcr.timeframe;
-      if (clientOcr.symbol) els.symbol.value = clientOcr.symbol.replace(/USDT$/i, "");
-      if (clientOcr.timeframe) els.timeframe.value = clientOcr.timeframe;
-      setStatus("ocr", `OCR hint: ${symbol || "—"} ${timeframe || ""}`);
     } catch (_) {
-      setStatus("ocr", "Client OCR skipped");
+      clientOcr = { symbol: "", timeframe: "" };
+    }
+    try {
+      clientVision = await lightVision(pending.dataUrl);
+    } catch (_) {
+      clientVision = { trend_guess: "unknown", confidence: 0 };
     }
 
-    setBusy(true, "Sending to FastAPI /analyze…");
+    const fused = fuseHints({
+      userSymbol: els.symbol.value.trim() || pending.symbol || "",
+      userTf: els.timeframe.value.trim() || pending.timeframe || "",
+      urlHints,
+      ocr: clientOcr,
+      vision: clientVision,
+    });
+
+    let symbol = fused.symbol;
+    let timeframe = fused.timeframe;
+    if (clientOcr?.symbol) els.symbol.value = clientOcr.symbol.replace(/USDT$/i, "");
+    else if (urlHints.symbol) els.symbol.value = urlHints.symbol.replace(/USDT$/i, "");
+    if (timeframe) els.timeframe.value = timeframe;
+
+    setStatus(
+      "ocr",
+      `Fused ${symbol || "?"} · ${timeframe || "?"} · vision ${clientVision?.trend_guess || "?"}`
+    );
+
+    setBusy(true, "Sending to API /analyze…");
     const analyze = await chrome.runtime.sendMessage({
       type: "ANALYZE_DATA_URL",
       dataUrl: pending.dataUrl,
       symbol,
       timeframe,
-      exchange: pending.exchange,
-      apiBase: pending.apiBase,
+      exchange: fused.exchange || pending.exchange,
+      pageUrl,
       clientOcr,
+      clientVision,
+      clientHints: { url: urlHints, fuse_notes: fused.notes },
     });
 
     setBusy(false);
@@ -170,7 +189,7 @@ async function claimPending() {
 
 function setBusy(on, text) {
   els.btnCapture.disabled = on;
-  els.btnVisible.disabled = on;
+  if (els.btnSelectArea) els.btnSelectArea.disabled = on;
   if (on) {
     els.loading.classList.add("show");
     els.loadingText.textContent = text || "Working…";

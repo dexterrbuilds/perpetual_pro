@@ -74,6 +74,10 @@ class OCREngine:
                 logger.warning("Could not set tesseract_cmd: {}", exc)
 
     def extract(self, image: Image.Image, dark_theme: Optional[bool] = None) -> OCRResult:
+        """
+        Advanced dual OCR: Tesseract (multi-PSM) + EasyOCR fallback.
+        Extracts all visible text then parses symbol / TF / prices / indicators.
+        """
         processed, meta = preprocess_chart_image(image, dark_theme=dark_theme, for_ocr=True)
         pil_img = cv_to_pil(processed) if isinstance(processed, np.ndarray) else processed
 
@@ -81,47 +85,60 @@ class OCREngine:
         texts: List[Tuple[str, float, str]] = []  # text, conf, engine
 
         if engine in ("tesseract", "dual"):
-            t_text, t_conf = self._run_tesseract(pil_img)
+            # Multi-PSM for denser UI chrome (symbol bar + axes)
+            for psm, tag in ((6, "tess_psm6"), (11, "tess_psm11"), (4, "tess_psm4")):
+                t_text, t_conf = self._run_tesseract(pil_img, psm=psm)
+                if t_text.strip():
+                    texts.append((t_text, t_conf, tag))
+            # Also raw image (dark theme labels sometimes lost in preprocess)
+            t_text, t_conf = self._run_tesseract(image, psm=6)
             if t_text.strip():
-                texts.append((t_text, t_conf, "tesseract"))
+                texts.append((t_text, t_conf, "tesseract_raw"))
 
         if engine in ("easyocr", "dual"):
             e_text, e_conf = self._run_easyocr(processed)
             if e_text.strip():
                 texts.append((e_text, e_conf, "easyocr"))
+            # EasyOCR on original RGB as fallback
+            if not e_text.strip() or e_conf < 0.25:
+                e2, c2 = self._run_easyocr(image)
+                if e2.strip():
+                    texts.append((e2, c2, "easyocr_raw"))
 
         if not texts:
-            # Last resort: OCR on original without preprocess
-            t_text, t_conf = self._run_tesseract(image)
+            t_text, t_conf = self._run_tesseract(image, psm=3)
             if t_text.strip():
-                texts.append((t_text, t_conf, "tesseract_raw"))
+                texts.append((t_text, t_conf, "tesseract_last"))
 
-        combined = "\n".join(t[0] for t in texts)
+        # Deduplicate overlapping lines while keeping order
+        combined = _merge_ocr_texts([t[0] for t in texts])
         conf = float(np.mean([t[1] for t in texts])) if texts else 0.0
         result = OCRResult(
             raw_text=combined,
             confidence=conf,
             engine_notes=[f"{t[2]}:{t[1]:.2f}" for t in texts],
             lines=[ln.strip() for ln in combined.splitlines() if ln.strip()],
-            meta={"preprocess": meta},
+            meta={"preprocess": meta, "engines_used": [t[2] for t in texts]},
         )
         self._parse(result)
         logger.info(
-            "OCR symbol={} tf={} conf={:.2f} engines={}",
+            "OCR symbol={} tf={} conf={:.2f} engines={} chars={}",
             result.symbol,
             result.timeframe,
             result.confidence,
             result.engine_notes,
+            len(combined),
         )
         return result
 
-    def _run_tesseract(self, image: Image.Image) -> Tuple[str, float]:
+    def _run_tesseract(self, image: Image.Image, psm: int = 6) -> Tuple[str, float]:
         try:
             import pytesseract
 
-            # PSM 6 = assume uniform block of text; also try 11 sparse
-            config = "--psm 6"
-            data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config=config)
+            config = f"--psm {psm}"
+            data = pytesseract.image_to_data(
+                image, output_type=pytesseract.Output.DICT, config=config
+            )
             words = []
             confs = []
             for txt, conf in zip(data.get("text", []), data.get("conf", [])):
@@ -141,7 +158,7 @@ class OCREngine:
             avg = float(np.mean(confs)) if confs else (0.4 if text.strip() else 0.0)
             return text, avg
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Tesseract OCR failed: {}", exc)
+            logger.warning("Tesseract OCR failed (psm={}): {}", psm, exc)
             return "", 0.0
 
     def _run_easyocr(self, image: np.ndarray | Image.Image) -> Tuple[str, float]:
@@ -259,3 +276,26 @@ class OCREngine:
             if kw in upper:
                 inds.append(kw)
         result.indicators_mentioned = inds
+
+
+def _merge_ocr_texts(parts: List[str]) -> str:
+    """Join multi-engine OCR outputs, drop near-duplicate lines."""
+    seen = set()
+    lines: List[str] = []
+    for part in parts:
+        for ln in str(part).splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            key = re.sub(r"\s+", " ", s.lower())[:120]
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(s)
+        blob = re.sub(r"\s+", " ", str(part)).strip()
+        if blob:
+            key = blob.lower()[:120]
+            if key not in seen:
+                seen.add(key)
+                lines.append(blob)
+    return "\n".join(lines)

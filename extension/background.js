@@ -3,7 +3,9 @@
  * Commands, context menus, capture orchestration, API bridge.
  */
 
-const DEFAULT_API = "http://localhost:8000";
+/** Fixed production API — not user-configurable. */
+const API_BASE = "https://perpetual-pro.onrender.com";
+
 const STORAGE_KEYS = {
   lastResult: "pp_last_result",
   settings: "pp_settings",
@@ -47,18 +49,21 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         mode: "image-url",
         imageUrl: info.srcUrl,
         windowId: tab.windowId,
+        pageUrl: tab.url || "",
       });
     } else if (info.menuItemId === "pp-select-area") {
       await runPipeline({
         tabId: tab.id,
         mode: "select-area",
         windowId: tab.windowId,
+        pageUrl: tab.url || "",
       });
     } else if (info.menuItemId === "pp-capture-analyze") {
       await runPipeline({
         tabId: tab.id,
         mode: "visible",
         windowId: tab.windowId,
+        pageUrl: tab.url || "",
       });
     }
   } catch (err) {
@@ -71,10 +76,12 @@ chrome.commands.onCommand.addListener(async (command) => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return;
   try {
+    // Default: auto full-tab capture (manual select remains via context menu / UI)
     await runPipeline({
       tabId: tab.id,
-      mode: "select-area",
+      mode: "visible",
       windowId: tab.windowId,
+      pageUrl: tab.url || "",
     });
   } catch (err) {
     await setStatus({ phase: "error", message: String(err?.message || err) });
@@ -110,7 +117,7 @@ async function handleMessage(message, sender) {
     return { ok: true };
   }
   if (type === "CHECK_BACKEND") {
-    return checkBackend(message.apiBase);
+    return checkBackend();
   }
   if (type === "START_CAPTURE") {
     const tabId = message.tabId || sender.tab?.id;
@@ -122,19 +129,26 @@ async function handleMessage(message, sender) {
       tab = tabs[0];
     }
     if (!tab?.id) throw new Error("No active tab");
+    const settings = await getSettings();
     await runPipeline({
       tabId: tab.id,
-      mode: message.mode || "select-area",
+      mode: message.mode || settings.captureMode || "visible",
       windowId: tab.windowId,
       symbol: message.symbol,
       timeframe: message.timeframe,
       exchange: message.exchange,
+      pageUrl: tab.url || message.pageUrl || "",
     });
     return { ok: true };
   }
   if (type === "AREA_SELECTED") {
     const tabId = sender.tab?.id;
     if (!tabId) throw new Error("No tab for area selection");
+    let pageUrl = sender.tab?.url || "";
+    try {
+      const t = await chrome.tabs.get(tabId);
+      pageUrl = t.url || pageUrl;
+    } catch (_) {}
     await runPipeline({
       tabId,
       mode: "crop",
@@ -144,6 +158,7 @@ async function handleMessage(message, sender) {
       symbol: message.symbol,
       timeframe: message.timeframe,
       exchange: message.exchange,
+      pageUrl,
     });
     return { ok: true };
   }
@@ -169,15 +184,17 @@ async function handleMessage(message, sender) {
   }
   if (type === "ANALYZE_DATA_URL") {
     const settings = await getSettings();
-    const apiBase = (message.apiBase || settings.apiBase || DEFAULT_API).replace(/\/$/, "");
     try {
       const result = await postAnalyze({
-        apiBase,
         dataUrl: message.dataUrl,
         symbol: message.symbol || "",
         timeframe: message.timeframe || "",
         exchange: message.exchange || settings.defaultExchange || "",
         settings,
+        pageUrl: message.pageUrl || "",
+        clientOcr: message.clientOcr || null,
+        clientVision: message.clientVision || null,
+        clientHints: message.clientHints || null,
       });
       await chrome.storage.local.set({
         [STORAGE_KEYS.lastResult]: {
@@ -185,7 +202,9 @@ async function handleMessage(message, sender) {
           _meta: {
             capturedAt: new Date().toISOString(),
             clientOcr: message.clientOcr || null,
-            apiBase,
+            clientVision: message.clientVision || null,
+            pageUrl: message.pageUrl || "",
+            apiBase: API_BASE,
           },
         },
       });
@@ -195,9 +214,7 @@ async function handleMessage(message, sender) {
       return { ok: true, result };
     } catch (err) {
       const msg = String(err?.message || err);
-      const friendly = /Failed to fetch|NetworkError|ECONNREFUSED/i.test(msg)
-        ? "Backend not running. Start: uvicorn main_server:app --reload --port 8000"
-        : msg;
+      const friendly = friendlyBackendError(msg);
       await setStatus({ phase: "error", message: friendly });
       broadcast({ type: "STATUS", phase: "error", message: friendly });
       return { ok: false, error: friendly };
@@ -222,16 +239,13 @@ async function handleMessage(message, sender) {
 
 async function runPipeline(opts) {
   const settings = await getSettings();
-  const apiBase = (settings.apiBase || DEFAULT_API).replace(/\/$/, "");
 
   await setStatus({ phase: "capturing", message: "Capturing chart…" });
   broadcast({ type: "STATUS", phase: "capturing", message: "Capturing chart…" });
 
-  const health = await checkBackend(apiBase);
+  const health = await checkBackend();
   if (!health.ok) {
-    const msg =
-      health.error ||
-      "Backend not running. Start: uvicorn main_server:app --reload --port 8000";
+    const msg = health.error || friendlyBackendError("unreachable");
     await setStatus({ phase: "error", message: msg });
     broadcast({ type: "STATUS", phase: "error", message: msg });
     try {
@@ -273,14 +287,23 @@ async function runPipeline(opts) {
     dataUrl = await captureVisible(opts.windowId);
   }
 
+  // Resolve page URL from tab if missing
+  let pageUrl = opts.pageUrl || "";
+  if (!pageUrl && opts.tabId) {
+    try {
+      const t = await chrome.tabs.get(opts.tabId);
+      pageUrl = t.url || "";
+    } catch (_) {}
+  }
+
   await prepareAndAnalyze(dataUrl, {
-    apiBase,
     settings,
     symbol: opts.symbol || settings.defaultSymbol || "",
     timeframe: opts.timeframe || settings.defaultTimeframe || "",
     exchange: opts.exchange || settings.defaultExchange || "",
     tabId: opts.tabId,
     windowId: opts.windowId,
+    pageUrl,
   });
 }
 
@@ -293,7 +316,7 @@ async function prepareAndAnalyze(dataUrl, ctx) {
       symbol: ctx.symbol,
       timeframe: ctx.timeframe,
       exchange: ctx.exchange,
-      apiBase: ctx.apiBase,
+      pageUrl: ctx.pageUrl || "",
       ts: Date.now(),
       claimedBy: null,
     },
@@ -301,7 +324,7 @@ async function prepareAndAnalyze(dataUrl, ctx) {
 
   await setStatus({
     phase: "ocr",
-    message: "Image captured — running OCR + analysis…",
+    message: "Image captured — OCR + vision + URL fusion…",
   });
   broadcast({
     type: "PENDING_IMAGE",
@@ -310,7 +333,7 @@ async function prepareAndAnalyze(dataUrl, ctx) {
       symbol: ctx.symbol,
       timeframe: ctx.timeframe,
       exchange: ctx.exchange,
-      apiBase: ctx.apiBase,
+      pageUrl: ctx.pageUrl || "",
       ts: Date.now(),
     },
   });
@@ -332,12 +355,12 @@ async function prepareAndAnalyze(dataUrl, ctx) {
 
   try {
     const result = await postAnalyze({
-      apiBase: ctx.apiBase,
       dataUrl,
       symbol: ctx.symbol,
       timeframe: ctx.timeframe,
       exchange: ctx.exchange,
       settings: ctx.settings,
+      pageUrl: ctx.pageUrl || "",
     });
 
     await chrome.storage.local.set({
@@ -346,7 +369,8 @@ async function prepareAndAnalyze(dataUrl, ctx) {
         _meta: {
           capturedAt: new Date().toISOString(),
           clientOcr: null,
-          apiBase: ctx.apiBase,
+          pageUrl: ctx.pageUrl || "",
+          apiBase: API_BASE,
           path: "service_worker",
         },
       },
@@ -367,10 +391,7 @@ async function prepareAndAnalyze(dataUrl, ctx) {
       });
     } catch (_) {}
   } catch (err) {
-    const msg = String(err?.message || err);
-    const friendly = /Failed to fetch|NetworkError|ECONNREFUSED/i.test(msg)
-      ? "Backend not running. Start: uvicorn main_server:app --reload --port 8000"
-      : msg;
+    const friendly = friendlyBackendError(String(err?.message || err));
     await setStatus({ phase: "error", message: friendly });
     broadcast({ type: "STATUS", phase: "error", message: friendly });
     await chrome.storage.local.remove(["pp_pending_image"]);
@@ -452,45 +473,69 @@ async function cropDataUrl(dataUrl, rect, dpr = 1) {
 // Backend
 // ---------------------------------------------------------------------------
 
-async function checkBackend(apiBase) {
-  const base = (apiBase || DEFAULT_API).replace(/\/$/, "");
+function friendlyBackendError(msg) {
+  if (/Failed to fetch|NetworkError|ECONNREFUSED|abort|unreachable|Load failed/i.test(msg)) {
+    return "Cannot reach Perpetual Pro API (Render may be waking up — retry in ~30s).";
+  }
+  return msg;
+}
+
+async function checkBackend() {
   try {
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 2500);
-    const res = await fetch(`${base}/health`, { signal: ctrl.signal });
+    // Render free tier cold starts can be slow
+    const t = setTimeout(() => ctrl.abort(), 15000);
+    const res = await fetch(`${API_BASE}/health`, { signal: ctrl.signal });
     clearTimeout(t);
     if (!res.ok) {
       return { ok: false, error: `Backend returned HTTP ${res.status}` };
     }
     const data = await res.json();
-    return { ok: true, health: data };
+    return { ok: true, health: data, apiBase: API_BASE };
   } catch (err) {
     return {
       ok: false,
-      error: "Backend not running. Start: uvicorn main_server:app --reload --port 8000",
+      error: friendlyBackendError(String(err?.message || err)),
       detail: String(err?.message || err),
+      apiBase: API_BASE,
     };
   }
 }
 
-async function postAnalyze({ apiBase, dataUrl, symbol, timeframe, exchange, settings }) {
+async function postAnalyze({
+  dataUrl,
+  symbol,
+  timeframe,
+  exchange,
+  settings,
+  pageUrl = "",
+  clientOcr = null,
+  clientVision = null,
+  clientHints = null,
+}) {
   const blob = await (await fetch(dataUrl)).blob();
   const form = new FormData();
   form.append("image", blob, "chart.png");
   if (symbol) form.append("symbol", symbol);
   if (timeframe) form.append("timeframe", timeframe);
   if (exchange) form.append("exchange", exchange);
+  if (pageUrl) form.append("page_url", pageUrl);
+  if (clientOcr) form.append("client_ocr", JSON.stringify(clientOcr));
+  if (clientVision) form.append("client_vision", JSON.stringify(clientVision));
+  if (clientHints) form.append("client_hints", JSON.stringify(clientHints));
   if (settings?.higher) form.append("higher", settings.higher);
-  if (settings?.balance != null && settings.balance !== "") {
-    form.append("balance", String(settings.balance));
-  }
+  // Simulated capital (default $1000) + risk % for position simulation
+  const simCap = settings?.balance != null && settings.balance !== "" ? settings.balance : 1000;
+  form.append("simulated_capital", String(simCap));
   if (settings?.risk != null && settings.risk !== "") {
     form.append("risk", String(settings.risk));
+  } else {
+    form.append("risk", "1");
   }
   if (settings?.noNews) form.append("no_news", "true");
   if (settings?.darkTheme != null) form.append("dark_theme", String(!!settings.darkTheme));
 
-  const res = await fetch(`${apiBase}/analyze`, {
+  const res = await fetch(`${API_BASE}/analyze`, {
     method: "POST",
     body: form,
   });
@@ -520,26 +565,28 @@ async function postAnalyze({ apiBase, dataUrl, symbol, timeframe, exchange, sett
 
 async function getSettings() {
   const data = await chrome.storage.local.get(STORAGE_KEYS.settings);
-  const s = data[STORAGE_KEYS.settings];
+  const s = data[STORAGE_KEYS.settings] || {};
+  // Strip any legacy apiBase — API is fixed to Render deployment
+  const { apiBase: _legacy, ...rest } = s;
   return {
-    apiBase: DEFAULT_API,
     defaultSymbol: "",
     defaultTimeframe: "",
     defaultExchange: "binanceusdm",
-    higher: "1h,4h,1d",
-    balance: "",
-    risk: "",
+    higher: "5m,1h,4h,1d",
+    balance: "1000",
+    risk: "1",
     noNews: false,
     darkTheme: true,
-    captureMode: "select-area",
-    ...(s || {}),
+    captureMode: "visible", // auto full-tab; "select-area" remains optional
+    ...rest,
   };
 }
 
 async function saveSettings(partial) {
   const cur = await getSettings();
+  const { apiBase: _drop, ...clean } = { ...cur, ...partial };
   await chrome.storage.local.set({
-    [STORAGE_KEYS.settings]: { ...cur, ...partial },
+    [STORAGE_KEYS.settings]: clean,
   });
 }
 

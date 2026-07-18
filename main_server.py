@@ -116,21 +116,49 @@ async def analyze(
     ),
     higher: Optional[str] = Form(
         None,
-        description="Comma-separated higher TFs, e.g. 1h,4h,1d",
+        description="Comma-separated higher TFs, e.g. 5m,1h,4h,1d",
     ),
-    balance: Optional[float] = Form(None, description="Account balance for position sizing"),
-    risk: Optional[float] = Form(None, description="Risk percent per trade"),
+    simulated_capital: Optional[float] = Form(
+        None,
+        description="Simulated capital for position sizing (default $1000). Not a live balance.",
+    ),
+    balance: Optional[float] = Form(
+        None,
+        description="Legacy alias for simulated_capital",
+    ),
+    risk: Optional[float] = Form(
+        None,
+        description="Risk percent of simulated capital per trade (default 1.0)",
+    ),
     no_news: bool = Form(False, description="Skip news fetch"),
+    no_llm: bool = Form(False, description="Skip Groq/Gemini narrative layer"),
     dark_theme: Optional[bool] = Form(
         None,
         description="Chart is dark theme (default from config)",
     ),
+    page_url: Optional[str] = Form(
+        None,
+        description="Active tab URL (TradingView preferred) for symbol/timeframe extraction",
+    ),
+    client_ocr: Optional[str] = Form(
+        None,
+        description="JSON string of client-side OCR results (Tesseract.js)",
+    ),
+    client_vision: Optional[str] = Form(
+        None,
+        description="JSON string of client-side light vision results",
+    ),
+    client_hints: Optional[str] = Form(
+        None,
+        description="JSON string of fused client hints",
+    ),
 ) -> JSONResponse:
     """
-    Analyze an uploaded chart screenshot.
+    Maximum-signal chart analysis.
 
-    Pipeline: OCR + computer vision → live OHLCV/derivatives → indicators →
-    patterns → market structure → news → weighted confluence → trade plan.
+    Pipeline: OCR + CV → multi-TF OHLCV + funding/OI/L-S → full indicator suite →
+    patterns + market structure → news → weighted confluence → dynamic leverage
+    simulation → optional LLM narrative.
     """
     cfg = get_config()
 
@@ -163,15 +191,33 @@ async def analyze(
     if higher:
         higher_list = [x.strip() for x in higher.split(",") if x.strip()]
 
+    sim_cap = simulated_capital if simulated_capital is not None else balance
+
+    def _parse_json_field(raw: Optional[str]) -> dict:
+        if not raw:
+            return {}
+        try:
+            import json
+
+            val = json.loads(raw)
+            return val if isinstance(val, dict) else {}
+        except Exception:
+            return {}
+
     req = AnalyzeRequest(
         symbol=symbol.strip() if symbol else None,
         timeframe=timeframe.strip() if timeframe else None,
         exchange=exchange.strip().lower() if exchange else None,
         higher=higher_list,
-        account_balance=balance,
+        simulated_capital=sim_cap,
         risk_pct=risk,
         no_news=bool(no_news),
         dark_theme=dark_theme,
+        use_llm=not bool(no_llm),
+        page_url=page_url.strip() if page_url else None,
+        client_ocr=_parse_json_field(client_ocr),
+        client_vision=_parse_json_field(client_vision),
+        client_hints=_parse_json_field(client_hints),
     )
 
     try:

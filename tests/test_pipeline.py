@@ -81,7 +81,9 @@ def test_full_confluence_pipeline(tmp_path):
     )
 
     engine = ConfluenceEngine(cfg)
-    analysis = engine.analyze(mtf, news=news, account_balance=10000, risk_pct=1.0)
+    analysis = engine.analyze(
+        mtf, news=news, simulated_capital=1000, risk_pct=1.0, use_llm=False
+    )
 
     assert analysis.bias in ("bullish", "bearish", "neutral")
     assert 0 <= analysis.confidence <= 100
@@ -91,6 +93,8 @@ def test_full_confluence_pipeline(tmp_path):
     assert analysis.patterns is not None
     assert analysis.trader_commentary
     assert analysis.scenarios is not None
+    assert analysis.trade_plan.is_simulation
+    assert analysis.key_reasons is not None
 
     # Report export
     cfg.output.output_dir = str(tmp_path)
@@ -103,3 +107,5 @@ def test_full_confluence_pipeline(tmp_path):
     payload = paths["json"].read_text(encoding="utf-8")
     assert "NOT FINANCIAL ADVICE" in payload or "not financial advice" in payload.lower()
     assert "confluence_total" in payload
+    assert "primary_setup" in payload
+    assert "position_simulation" in payload

@@ -1,7 +1,9 @@
 /**
  * Perpetual Pro — popup controller
  */
-import { lightOcr } from "./shared/ocr.js";
+import { fuseHints, lightOcr } from "./shared/ocr.js";
+import { parseChartUrl } from "./shared/url_parse.js";
+import { lightVision } from "./shared/vision_light.js";
 import { renderResults } from "./shared/render.js";
 
 const $ = (id) => document.getElementById(id);
@@ -17,12 +19,11 @@ const els = {
   settingsPanel: $("settingsPanel"),
   btnSettings: $("btnSettings"),
   btnCapture: $("btnCapture"),
-  btnVisible: $("btnVisible"),
+  btnSelectArea: $("btnSelectArea"),
   btnSidePanel: $("btnSidePanel"),
   btnSaveSettings: $("btnSaveSettings"),
   btnRefresh: $("btnRefresh"),
   btnClear: $("btnClear"),
-  apiBase: $("apiBase"),
   symbol: $("symbol"),
   timeframe: $("timeframe"),
   exchange: $("exchange"),
@@ -45,7 +46,6 @@ const els = {
  *   dataUrl: string,
  *   timeframe: string,
  *   exchange: string,
- *   apiBase: string,
  *   clientOcr: object | null,
  *   reason: string
  * }} */
@@ -66,8 +66,10 @@ async function init() {
   });
 
   els.btnSaveSettings.addEventListener("click", saveSettingsFromForm);
-  els.btnCapture.addEventListener("click", () => startCapture("select-area"));
-  els.btnVisible.addEventListener("click", () => startCapture("visible"));
+  // Primary: auto full-tab capture
+  els.btnCapture.addEventListener("click", () => startCapture("visible"));
+  // Optional manual region
+  els.btnSelectArea?.addEventListener("click", () => startCapture("select-area"));
   els.btnSidePanel.addEventListener("click", openSidePanel);
   els.btnRefresh.addEventListener("click", async () => {
     await refreshBackendStatus();
@@ -120,7 +122,6 @@ async function init() {
 async function loadSettingsIntoForm() {
   const res = await chrome.runtime.sendMessage({ type: "GET_SETTINGS" });
   const s = res?.settings || {};
-  els.apiBase.value = s.apiBase || "http://localhost:8000";
   els.symbol.value = s.defaultSymbol || "";
   els.timeframe.value = s.defaultTimeframe || "";
   els.exchange.value = s.defaultExchange || "binanceusdm";
@@ -132,7 +133,6 @@ async function loadSettingsIntoForm() {
 
 async function saveSettingsFromForm() {
   const settings = {
-    apiBase: els.apiBase.value.trim() || "http://localhost:8000",
     defaultSymbol: els.symbol.value.trim(),
     defaultTimeframe: els.timeframe.value.trim(),
     defaultExchange: els.exchange.value,
@@ -148,16 +148,15 @@ async function saveSettingsFromForm() {
 }
 
 async function refreshBackendStatus() {
-  const apiBase = els.apiBase.value.trim() || "http://localhost:8000";
-  const res = await chrome.runtime.sendMessage({ type: "CHECK_BACKEND", apiBase });
+  const res = await chrome.runtime.sendMessage({ type: "CHECK_BACKEND" });
   if (res?.ok) {
-    setStatusUI("idle", "Backend online · ready");
+    setStatusUI("idle", "API online · ready");
     els.statusDot.className = "status-dot ok";
     hideError();
   } else {
     const msg =
       res?.error ||
-      "Backend not running. Start: uvicorn main_server:app --reload --port 8000";
+      "Cannot reach Perpetual Pro API (Render may be waking up — retry in ~30s).";
     setStatusUI("error", msg);
     els.statusDot.className = "status-dot err";
     showError(msg);
@@ -173,11 +172,14 @@ async function loadLastResult() {
 async function startCapture(mode) {
   hideError();
   hideManualSymbolPanel();
-  setBusy(true, mode === "select-area" ? "Select chart area on the page…" : "Capturing tab…");
+  setBusy(
+    true,
+    mode === "select-area" ? "Select chart area on the page…" : "Capturing full tab…"
+  );
   await saveSettingsFromForm();
   const res = await chrome.runtime.sendMessage({
     type: "START_CAPTURE",
-    mode,
+    mode: mode || "visible",
     symbol: els.symbol.value.trim(),
     timeframe: els.timeframe.value.trim(),
     exchange: els.exchange.value,
@@ -200,52 +202,85 @@ async function maybeProcessPending() {
   const pending = claim?.pending;
   if (!claim?.ok || !pending?.dataUrl) return;
 
-  setBusy(true, "Light OCR (Tesseract.js)…");
+  setBusy(true, "OCR + vision + URL fusion…");
   els.thumb.src = pending.dataUrl;
   els.thumb.classList.add("show");
 
-  let symbol = els.symbol.value.trim() || pending.symbol || "";
-  let timeframe = els.timeframe.value.trim() || pending.timeframe || "";
-  let clientOcr = null;
-
-  try {
-    clientOcr = await lightOcr(pending.dataUrl);
-    if (!symbol && clientOcr.symbol) symbol = clientOcr.symbol;
-    if (!timeframe && clientOcr.timeframe) timeframe = clientOcr.timeframe;
-    if (clientOcr.symbol && !els.symbol.value) {
-      els.symbol.value = clientOcr.symbol.replace(/USDT$/i, "");
-    }
-    if (clientOcr.timeframe && !els.timeframe.value) {
-      els.timeframe.value = clientOcr.timeframe;
-    }
-    setStatusUI("ocr", `OCR: ${symbol || "no symbol"} · ${timeframe || "?"} `);
-  } catch (e) {
-    setStatusUI("ocr", "OCR failed — enter symbol manually");
+  const pageUrl = pending.pageUrl || "";
+  const urlHints = parseChartUrl(pageUrl);
+  if (urlHints.symbol) {
+    setStatusUI("ocr", `URL hint: ${urlHints.symbol} (${urlHints.source})`);
   }
 
-  // Keep capture context for manual retry
+  let clientOcr = null;
+  let clientVision = null;
+  try {
+    clientOcr = await lightOcr(pending.dataUrl);
+  } catch (e) {
+    clientOcr = { error: String(e?.message || e), symbol: "", timeframe: "" };
+  }
+  try {
+    clientVision = await lightVision(pending.dataUrl);
+  } catch (e) {
+    clientVision = { trend_guess: "unknown", confidence: 0, notes: [String(e)] };
+  }
+
+  const fused = fuseHints({
+    userSymbol: els.symbol.value.trim() || pending.symbol || "",
+    userTf: els.timeframe.value.trim() || pending.timeframe || "",
+    urlHints,
+    ocr: clientOcr,
+    vision: clientVision,
+  });
+
+  let symbol = fused.symbol;
+  let timeframe = fused.timeframe;
+  let exchange = fused.exchange || pending.exchange || els.exchange.value;
+
+  if (symbol && !els.symbol.value) {
+    els.symbol.value = symbol.replace(/USDT$/i, "");
+  }
+  if (timeframe && !els.timeframe.value) {
+    els.timeframe.value = timeframe;
+  }
+  if (exchange && els.exchange) {
+    try {
+      els.exchange.value = exchange;
+    } catch (_) {}
+  }
+
+  setStatusUI(
+    "ocr",
+    `Fused: ${symbol || "no symbol"} · ${timeframe || "?"} · ${clientVision?.trend_guess || "?"}`
+  );
+
   pendingCapture = {
     dataUrl: pending.dataUrl,
-    timeframe: timeframe || els.timeframe.value.trim() || "",
-    exchange: pending.exchange || els.exchange.value,
-    apiBase: pending.apiBase || els.apiBase.value,
+    timeframe: timeframe || "",
+    exchange,
+    pageUrl,
     clientOcr,
+    clientVision,
+    clientHints: { url: urlHints, fuse_notes: fused.notes },
     reason: "ocr_miss",
   };
 
-  // If still no symbol after OCR → prompt user (don't call backend empty)
+  // TradingView URL often gives symbol even when OCR fails
   if (!normalizeSymbolInput(symbol)) {
     setBusy(false);
+    const snippet = clientOcr?.raw
+      ? `OCR: “${String(clientOcr.raw).slice(0, 80).replace(/\s+/g, " ")}…”`
+      : pageUrl
+        ? `Page: ${pageUrl.slice(0, 60)}…`
+        : "Tip: open TradingView chart or type BTC / ETH";
     showManualSymbolPanel({
-      reason: clientOcr?.error
-        ? "OCR error — enter the symbol to continue."
-        : "OCR couldn’t read the ticker from this chart. Enter the symbol to continue analysis.",
+      reason:
+        "Could not auto-detect symbol from OCR or page URL. Enter ticker to continue " +
+        "(chart image will still be fully analyzed on the server).",
       timeframe: pendingCapture.timeframe,
-      hint: clientOcr?.raw
-        ? `OCR text snippet: “${String(clientOcr.raw).slice(0, 80).replace(/\s+/g, " ")}…”`
-        : "Tip: BTC, ETH, or full form BTC/USDT:USDT",
+      hint: snippet,
     });
-    setStatusUI("error", "Symbol required — enter ticker below");
+    setStatusUI("error", "Symbol required — URL/OCR miss");
     return;
   }
 
@@ -304,8 +339,10 @@ async function runAnalyzeWithSymbol(symbol, timeframe, ctx) {
     symbol,
     timeframe: timeframe || "",
     exchange: ctx.exchange || els.exchange.value,
-    apiBase: ctx.apiBase || els.apiBase.value,
+    pageUrl: ctx.pageUrl || "",
     clientOcr: ctx.clientOcr,
+    clientVision: ctx.clientVision,
+    clientHints: ctx.clientHints,
   });
 
   setBusy(false);
@@ -393,7 +430,7 @@ async function openSidePanel() {
 function setBusy(on, text) {
   busy = on;
   els.btnCapture.disabled = on;
-  els.btnVisible.disabled = on;
+  if (els.btnSelectArea) els.btnSelectArea.disabled = on;
   if (els.btnManualAnalyze) els.btnManualAnalyze.disabled = on;
   if (on) {
     els.loading.classList.add("show");

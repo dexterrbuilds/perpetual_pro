@@ -1,30 +1,30 @@
 # Perpetual Pro — Chrome Extension (Manifest V3)
 
-Capture TradingView / exchange charts and run **pro perpetual futures analysis** against the local FastAPI backend at `http://localhost:8000`.
+Capture TradingView / exchange charts and run **pro perpetual futures analysis** against the fixed production API:
+
+**`https://perpetual-pro.onrender.com`**
+
+(No user setting for backend URL — all extension calls use this host.)
 
 ## Features
 
 - **Popup** button: *Capture & Analyze Chart*
 - **Keyboard shortcut**: `Ctrl+Shift+P` (select area on the active tab)
 - **Right-click** on any image or page → analyze / select area
-- Capture **visible tab** or **drag-select a region**
-- **Light OCR** with **bundled** Tesseract.js under `lib/` (no CDN; symbol / timeframe hints)
-- Full analysis via backend `POST /analyze` (OCR + data + indicators + patterns + news + confluence)
+- **Auto full-tab capture** via `chrome.tabs.captureVisibleTab` (default)
+- Optional **drag-select** region remains available
+- **Client OCR** (bundled Tesseract.js) + **light vision** (candles/trend/levels)
+- **TradingView URL** pair extraction as strong symbol fallback
+- Fuses **OCR + URL + vision** before calling backend
+- Backend re-runs dual OCR (Tesseract multi-PSM + EasyOCR) + OpenCV chart CV
 - **Side panel** results: bias, confidence, levels, confluence, patterns, news, risk
-- Loading states + clear errors (*Backend not running…*)
+- Loading states + clear errors (API wake-up / network)
 - Dark-mode UI
 
 ## Prerequisites
 
-1. Start the Python API from the `perpetual_pro` project root:
-
-```bash
-cd /path/to/perpetual_pro
-source .venv/bin/activate
-uvicorn main_server:app --reload --port 8000
-```
-
-2. Confirm health: open [http://localhost:8000/health](http://localhost:8000/health)
+1. API is the Render deployment: [https://perpetual-pro.onrender.com/health](https://perpetual-pro.onrender.com/health)
+2. Free-tier Render apps may cold-start (~30s) on first request — retry if health fails once
 
 ## Load unpacked in Chrome
 
@@ -38,9 +38,9 @@ uvicorn main_server:app --reload --port 8000
 
 | Action | Result |
 |--------|--------|
-| Popup → **Capture & Analyze Chart** | Drag-select chart region → OCR → `/analyze` |
-| Popup → **Visible tab** | Full viewport capture |
-| `Ctrl+Shift+P` | Select area on current tab |
+| Popup → **Capture & Analyze Chart** | Full visible tab → OCR + vision + URL → `/analyze` |
+| Popup → **Select area** | Optional drag-select chart region |
+| `Ctrl+Shift+P` | Full visible tab capture + analyze |
 | Right-click image → **Analyze with Perpetual Pro** | Uses that image URL |
 | Right-click page → **Select chart area…** | Drag selection |
 | **Side panel** | Full-width report view |
@@ -53,7 +53,7 @@ Optional **Symbol** / **Timeframe** in popup settings override OCR. If OCR misse
 - `contextMenus` — right-click actions  
 - `sidePanel` — results panel  
 - `storage` — settings + last report  
-- Host access to `http://localhost:8000` only (OCR is fully offline)
+- Host access to `https://perpetual-pro.onrender.com` only (OCR is fully offline)
 
 ## File map
 
@@ -79,11 +79,10 @@ extension/
 
 | Issue | Fix |
 |-------|-----|
-| “Backend not running” | Start uvicorn on port 8000; check firewall |
+| “Cannot reach … API” | Render free tier may be cold-starting — wait ~30s and retry; check https://perpetual-pro.onrender.com/health |
 | Capture fails on Chrome Web Store / chrome:// pages | Use a normal https page (TradingView, etc.) |
 | OCR weak | Set Symbol manually; backend still runs full OCR |
 | Shortcut conflict | `chrome://extensions/shortcuts` |
-| CORS | Not needed for extension → localhost with host_permissions |
 
 ## Disclaimer
 

@@ -10,6 +10,7 @@ import pandas as pd
 from loguru import logger
 
 from src.analysis.indicators import IndicatorSuite, compute_indicators
+from src.analysis.llm import LLMNarrative, NarrativeLLM
 from src.analysis.market_structure import MarketStructureAnalyzer, StructureReport
 from src.analysis.patterns import PatternDetector, PatternReport
 from src.analysis.risk import RiskManager, ScenarioSet, TradePlan
@@ -61,6 +62,9 @@ class FullAnalysis:
     derivatives_notes: List[str] = field(default_factory=list)
     key_levels: List[Dict[str, Any]] = field(default_factory=list)
     trader_commentary: str = ""
+    key_reasons: List[str] = field(default_factory=list)
+    key_risks: List[str] = field(default_factory=list)
+    llm: Optional[LLMNarrative] = None
     warnings: List[str] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
 
@@ -93,13 +97,16 @@ class ConfluenceEngine:
         self,
         mtf: MultiTimeframeData,
         news: Optional[NewsBundle] = None,
-        account_balance: Optional[float] = None,
+        simulated_capital: Optional[float] = None,
         risk_pct: Optional[float] = None,
+        account_balance: Optional[float] = None,  # legacy alias
+        use_llm: bool = True,
     ) -> FullAnalysis:
-        if account_balance is not None or risk_pct is not None:
+        capital = simulated_capital if simulated_capital is not None else account_balance
+        if capital is not None or risk_pct is not None:
             self.risk = RiskManager(
                 config=self.config,
-                account_balance=account_balance,
+                simulated_capital=capital,
                 risk_pct=risk_pct,
             )
 
@@ -204,13 +211,15 @@ class ConfluenceEngine:
         support, resistance = self._nearest_levels(struct, price)
         result.key_levels = self._collect_levels(struct, price)
 
-        # Trade plan
+        # Trade plan — dynamic leverage + simulated capital
+        funding = mtf.snapshot.funding_rate if mtf.snapshot else None
         plan = self.risk.build_plan(
             direction=direction,
             price=price,
             atr=atr,
             structure_stops=(support, resistance),
             confidence=conf,
+            funding_rate=funding,
         )
         result.trade_plan = plan
         result.scenarios = self.risk.scenarios(
@@ -222,21 +231,88 @@ class ConfluenceEngine:
             resistance=resistance,
         )
 
-        result.trader_commentary = self._commentary(result)
+        # Deterministic reasons first
+        result.key_reasons = self._key_reasons(result, ind, struct, pat)
+        result.key_risks = self._key_risks(result, atr, price, funding)
+
+        # LLM narrative (Groq / Gemini / local fallback)
+        if use_llm:
+            try:
+                llm_ctx = {
+                    "symbol": result.symbol,
+                    "exchange": result.exchange_id,
+                    "primary_tf": result.primary_tf,
+                    "bias": bias,
+                    "direction": direction,
+                    "confidence": conf,
+                    "setup_name": result.setup_name,
+                    "confluence_total": result.confluence_total,
+                    "top_factors": result.factor_breakdown(),
+                    "structure": struct.summary,
+                    "patterns": [h.name for h in (pat.hits[:5] if pat else [])],
+                    "derivatives": der_notes,
+                    "multi_tf": htf_notes[:4],
+                    "leverage_suggested": plan.leverage_suggested,
+                    "leverage_engine": plan.leverage_reasoning,
+                    "atr_pct": plan.atr_pct,
+                    "funding_rate_pct": (funding * 100.0) if funding is not None else None,
+                    "primary_setup": plan.to_primary_setup(),
+                    "position_simulation": plan.to_position_simulation(),
+                }
+                narrative = NarrativeLLM(self.config).generate(llm_ctx)
+                result.llm = narrative
+                if narrative.signal_narrative:
+                    result.trader_commentary = narrative.signal_narrative
+                else:
+                    result.trader_commentary = self._commentary(result)
+                if narrative.key_reasons:
+                    result.key_reasons = narrative.key_reasons
+                if narrative.key_risks:
+                    result.key_risks = narrative.key_risks
+                # Enrich scenario narratives if provided
+                if result.scenarios and narrative.scenarios:
+                    for key in ("bullish", "base", "bearish"):
+                        text = narrative.scenarios.get(key)
+                        if text and hasattr(result.scenarios, key):
+                            sc = getattr(result.scenarios, key)
+                            if isinstance(sc, dict):
+                                sc["narrative"] = text
+                if plan.leverage_reasoning and narrative.leverage_reasoning:
+                    plan.leverage_reasoning = (
+                        f"{plan.leverage_reasoning} LLM: {narrative.leverage_reasoning}"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("LLM narrative layer failed: {}", exc)
+                result.trader_commentary = self._commentary(result)
+        else:
+            result.trader_commentary = self._commentary(result)
+
         result.meta = {
             "price": price,
             "atr": atr,
+            "atr_pct": plan.atr_pct,
             "indicator_count": ind.indicator_count,
             "bars_primary": len(primary),
             "timeframes": mtf.all_timeframes(),
+            "volume_profile": {
+                "poc": struct.volume_profile_poc,
+                "vah": struct.volume_profile_vah,
+                "val": struct.volume_profile_val,
+            },
+            "funding_rate": funding,
+            "open_interest": mtf.snapshot.open_interest if mtf.snapshot else None,
+            "long_short_ratio": mtf.snapshot.long_short_ratio if mtf.snapshot else None,
+            "simulated_capital": plan.simulated_capital,
+            "is_simulation": True,
         }
         logger.info(
-            "Analysis {} {} bias={} conf={:.1f}% score={:.3f}",
+            "Analysis {} {} bias={} conf={:.1f}% score={:.3f} lev={:.1f}x",
             result.symbol,
             result.primary_tf,
             result.bias,
             result.confidence,
             result.confluence_total,
+            plan.leverage_suggested,
         )
         return result
 
@@ -508,7 +584,7 @@ class ConfluenceEngine:
     def _commentary(self, a: FullAnalysis) -> str:
         """Senior trader style narrative."""
         parts: List[str] = []
-        price = a.meta.get("price")
+        price = a.meta.get("price") if a.meta else None
         parts.append(
             f"On {a.primary_tf}, {a.symbol} prints a {a.bias} lean "
             f"({a.confidence:.0f}% confidence) via weighted confluence "
@@ -536,9 +612,53 @@ class ConfluenceEngine:
             parts.append(
                 f"Playbook: {a.setup_name}. Entry {format_price(tp.entry_low, price)}–"
                 f"{format_price(tp.entry_high, price)}, SL {format_price(tp.stop_loss, price)}, "
-                f"R:R TP1 {tp.primary_rr:.2f} ({tp.quality})."
+                f"R:R TP1 {tp.primary_rr:.2f} ({tp.quality}). "
+                f"Sim leverage ~{tp.leverage_suggested:.1f}x on ${tp.simulated_capital:,.0f}."
             )
         else:
             parts.append("No clean asymmetric trade — stand aside or scalp only with tiny size.")
-        parts.append("This is analytical output, not financial advice.")
+        parts.append("Simulation / research only — not financial advice.")
         return " ".join(parts)
+
+    def _key_reasons(
+        self,
+        a: FullAnalysis,
+        ind: IndicatorSuite,
+        struct: StructureReport,
+        pat: PatternReport,
+    ) -> List[str]:
+        reasons: List[str] = []
+        for f in sorted(a.factors, key=lambda x: abs(x.weighted), reverse=True)[:5]:
+            if abs(f.score) < 0.05:
+                continue
+            side = "supports long" if f.score > 0 else "supports short"
+            reasons.append(f"{f.name.title()} {side} ({f.score:+.2f}): {f.detail[:100]}")
+        if struct.last_bos:
+            reasons.append(f"Market structure BOS: {struct.last_bos}")
+        if struct.last_choch:
+            reasons.append(f"CHoCH: {struct.last_choch}")
+        if pat.hits:
+            reasons.append(f"Top pattern: {pat.hits[0].name} ({pat.hits[0].bias})")
+        return reasons[:8]
+
+    def _key_risks(
+        self,
+        a: FullAnalysis,
+        atr: float,
+        price: float,
+        funding: Optional[float],
+    ) -> List[str]:
+        risks = [
+            "Perpetual futures can gap; stops may slip during liquidations.",
+            "This is a simulated risk model — not live account advice.",
+        ]
+        atr_pct = (atr / price * 100) if price else 0
+        if atr_pct > 2.5:
+            risks.append(f"High ATR ({atr_pct:.2f}% of price) — widen invalidation tolerance.")
+        if funding is not None and abs(funding) > 0.0005:
+            risks.append(f"Funding not neutral ({funding*100:+.4f}%) — squeeze risk.")
+        if a.confidence < 45:
+            risks.append("Confidence below 45% — prefer skip or micro size.")
+        if a.trade_plan and a.trade_plan.quality == "poor":
+            risks.append("Plan quality poor (R:R / confluence) — do not force the trade.")
+        return risks[:8]

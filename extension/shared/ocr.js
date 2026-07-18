@@ -1,6 +1,6 @@
 /**
- * Light client-side OCR via locally bundled Tesseract.js + symbol/timeframe heuristics.
- * All assets live under extension/lib/ — no CDN / network required for OCR.
+ * Light client-side OCR via locally bundled Tesseract.js + rich chart text parsing.
+ * Backend also runs Tesseract + EasyOCR for maximum recall.
  */
 
 const LIB = {
@@ -17,9 +17,6 @@ function libUrl(rel) {
   return chrome.runtime.getURL(rel);
 }
 
-/**
- * Load the UMD build into the page (exposes window.Tesseract).
- */
 export async function ensureTesseract() {
   if (window.Tesseract) return window.Tesseract;
   if (_tessReady) return _tessReady;
@@ -56,30 +53,24 @@ function localPaths() {
     workerPath: libUrl(LIB.worker),
     corePath: libUrl(LIB.core),
     langPath: libUrl(LIB.lang),
-    // Avoid gzip worker dependency issues on some Chromium builds: prefer .gz which is shipped
     gzip: true,
     cacheMethod: "none",
     logger: () => {},
   };
 }
 
-/**
- * Reuse a single worker across OCR calls for speed.
- */
 async function getWorker() {
   if (_workerPromise) return _workerPromise;
   _workerPromise = (async () => {
     const Tesseract = await ensureTesseract();
     const paths = localPaths();
-    const worker = await Tesseract.createWorker("eng", 1, {
+    return Tesseract.createWorker("eng", 1, {
       workerPath: paths.workerPath,
       corePath: paths.corePath,
       langPath: paths.langPath,
       cacheMethod: "none",
       logger: () => {},
-      // workerBlobURL: true is default; works with local workerPath
     });
-    return worker;
   })();
   try {
     return await _workerPromise;
@@ -90,12 +81,11 @@ async function getWorker() {
 }
 
 /**
+ * Full light OCR pass — extract all text + structured fields.
  * @param {string} dataUrl
- * @returns {Promise<{symbol:string,timeframe:string,raw:string,confidence:number,error?:string}>}
  */
 export async function lightOcr(dataUrl) {
   try {
-    // Prefer createWorker (explicit local paths). Fall back to recognize() with paths.
     let raw = "";
     let conf = 0;
     try {
@@ -112,15 +102,25 @@ export async function lightOcr(dataUrl) {
       conf = Number(result?.data?.confidence || 0) / 100;
     }
     const parsed = parseChartText(raw);
-    return { ...parsed, raw: raw.slice(0, 400), confidence: conf };
+    return {
+      ...parsed,
+      raw: raw.slice(0, 2000),
+      all_text: raw.slice(0, 4000),
+      confidence: conf,
+      engine: "tesseract.js",
+    };
   } catch (err) {
     console.warn("[Perpetual Pro] Light OCR skipped:", err);
     _workerPromise = null;
     return {
       symbol: "",
       timeframe: "",
+      prices: [],
+      indicators: [],
       raw: "",
+      all_text: "",
       confidence: 0,
+      engine: "none",
       error: String(err?.message || err),
     };
   }
@@ -130,92 +130,41 @@ export function parseChartText(text) {
   const upper = (text || "").toUpperCase();
   let timeframe = "";
   const tfRe = /\b(1M|3M|5M|15M|30M|45M|1H|2H|4H|6H|12H|1D|3D|1W)\b/g;
-  const tfs = upper.match(tfRe);
-  if (tfs && tfs.length) {
-    const map = {
-      "1M": "1m",
-      "3M": "3m",
-      "5M": "5m",
-      "15M": "15m",
-      "30M": "30m",
-      "45M": "45m",
-      "1H": "1h",
-      "2H": "2h",
-      "4H": "4h",
-      "6H": "6h",
-      "12H": "12h",
-      "1D": "1d",
-      "3D": "3d",
-      "1W": "1w",
-    };
-    for (const p of [
-      "15M",
-      "5M",
-      "1H",
-      "4H",
-      "1D",
-      "30M",
-      "1M",
-      "3M",
-      "45M",
-      "2H",
-      "6H",
-      "12H",
-      "3D",
-      "1W",
-    ]) {
-      if (tfs.includes(p)) {
-        timeframe = map[p] || p.toLowerCase();
-        break;
-      }
+  const tfs = upper.match(tfRe) || [];
+  const map = {
+    "1M": "1m",
+    "3M": "3m",
+    "5M": "5m",
+    "15M": "15m",
+    "30M": "30m",
+    "45M": "45m",
+    "1H": "1h",
+    "2H": "2h",
+    "4H": "4h",
+    "6H": "6h",
+    "12H": "12h",
+    "1D": "1d",
+    "3D": "3d",
+    "1W": "1w",
+  };
+  for (const p of ["15M", "5M", "1H", "4H", "1D", "30M", "1M", "3M", "45M", "2H", "6H", "12H", "3D", "1W"]) {
+    if (tfs.includes(p)) {
+      timeframe = map[p];
+      break;
     }
   }
 
   const blacklist = new Set([
-    "USD",
-    "USDT",
-    "USDC",
-    "PERP",
-    "SPOT",
-    "LONG",
-    "SHORT",
-    "BUY",
-    "SELL",
-    "OPEN",
-    "HIGH",
-    "LOW",
-    "CLOSE",
-    "VOLUME",
-    "PRICE",
-    "CHART",
-    "TIME",
-    "BINANCE",
-    "BYBIT",
-    "OKX",
-    "BITGET",
-    "UTC",
-    "GMT",
-    "CROSS",
-    "ISOLATED",
-    "MARKET",
-    "LIMIT",
-    "RSI",
-    "MACD",
-    "EMA",
-    "SMA",
-    "ATR",
-    "VWAP",
-    "THE",
-    "AND",
-    "FOR",
-    "ROE",
-    "PNL",
+    "USD", "USDT", "USDC", "PERP", "SPOT", "LONG", "SHORT", "BUY", "SELL", "OPEN",
+    "HIGH", "LOW", "CLOSE", "VOLUME", "PRICE", "CHART", "TIME", "BINANCE", "BYBIT",
+    "OKX", "BITGET", "UTC", "GMT", "CROSS", "ISOLATED", "MARKET", "LIMIT", "RSI",
+    "MACD", "EMA", "SMA", "ATR", "VWAP", "THE", "AND", "FOR", "ROE", "PNL", "AVG",
   ]);
 
   let symbol = "";
   const patterns = [
-    /\b([A-Z]{2,10})[\/\-_]?USDT\b/,
-    /\b([A-Z]{2,10})[\/\-_]?USD\b/,
+    /\b([A-Z]{2,10})[\/\-_]?USDT\.?P?\b/,
+    /\b([A-Z]{2,10})[\/\-_]?USDC\b/,
     /\b(1000[A-Z]{2,8})USDT\b/,
     /\b(BTC|ETH|SOL|XRP|DOGE|BNB|ADA|AVAX|LINK|DOT|PEPE|WIF|SUI|ARB|OP|TIA|SEI|NEAR|APT|INJ)\b/,
   ];
@@ -224,11 +173,83 @@ export function parseChartText(text) {
     if (m) {
       const base = m[1];
       if (base && !blacklist.has(base)) {
-        symbol = base.endsWith("USDT") ? base : `${base}USDT`;
+        symbol = base.endsWith("USDT") || base.endsWith("USDC") ? base : `${base}USDT`;
         break;
       }
     }
   }
 
-  return { symbol, timeframe };
+  // Prices
+  const prices = [];
+  const priceRe = /\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b|\b\d+\.\d{2,8}\b/g;
+  let pm;
+  while ((pm = priceRe.exec(text || "")) !== null) {
+    const v = parseFloat(pm[0].replace(/,/g, ""));
+    if (!Number.isFinite(v) || v <= 0) continue;
+    if (v > 1900 && v < 2100 && Number.isInteger(v)) continue;
+    prices.push(v);
+  }
+
+  const indicators = [];
+  const indList = [
+    "RSI", "MACD", "EMA", "SMA", "VWAP", "ATR", "BB", "BOLL", "STOCH",
+    "VOLUME", "OI", "FUNDING", "ICHIMOKU", "CVD", "OBV", "SUPERTREND", "ADX",
+  ];
+  for (const kw of indList) {
+    if (upper.includes(kw)) indicators.push(kw);
+  }
+
+  return {
+    symbol,
+    timeframe,
+    prices: [...new Set(prices.map((p) => Math.round(p * 1e8) / 1e8))].slice(0, 40),
+    indicators,
+  };
+}
+
+/**
+ * Fuse user / URL / OCR / vision hints into best symbol + timeframe.
+ */
+export function fuseHints({ userSymbol, userTf, urlHints, ocr, vision }) {
+  const notes = [];
+  let symbol = (userSymbol || "").trim();
+  let timeframe = (userTf || "").trim();
+  let exchange = "";
+  let source = "user";
+
+  if (!symbol && urlHints?.symbol && urlHints.confidence >= 0.5) {
+    symbol = urlHints.symbol;
+    source = urlHints.source || "url";
+    notes.push(`symbol from URL (${source}, conf ${urlHints.confidence})`);
+  }
+  if (!symbol && ocr?.symbol) {
+    symbol = ocr.symbol;
+    source = "ocr";
+    notes.push("symbol from client OCR");
+  }
+
+  if (!timeframe && urlHints?.timeframe) {
+    timeframe = urlHints.timeframe;
+    notes.push("timeframe from URL");
+  }
+  if (!timeframe && ocr?.timeframe) {
+    timeframe = ocr.timeframe;
+    notes.push("timeframe from OCR");
+  }
+
+  if (urlHints?.exchange) exchange = urlHints.exchange;
+
+  // Vision cannot give symbol but can reinforce direction
+  if (vision?.trend_guess && vision.trend_guess !== "unknown") {
+    notes.push(`client vision trend≈${vision.trend_guess}`);
+  }
+
+  return {
+    symbol,
+    timeframe,
+    exchange,
+    source,
+    notes,
+    canAnalyzeWithoutSymbol: false, // backend may still use vision-only path if we force a default — we don't
+  };
 }
