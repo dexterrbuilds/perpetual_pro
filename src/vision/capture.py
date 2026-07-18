@@ -1,4 +1,8 @@
-"""Screen capture via mss with interactive or region modes."""
+"""Screen capture via mss with interactive or region modes.
+
+``mss`` is optional — only required for local screen capture CLI features.
+The FastAPI service never imports this at startup.
+"""
 
 from __future__ import annotations
 
@@ -7,12 +11,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
-import mss
-import mss.tools
 from loguru import logger
 from PIL import Image
 
 from src.utils.helpers import ensure_dir, utc_now_iso
+
+try:
+    import mss
+    import mss.tools  # noqa: F401
+except ImportError:  # pragma: no cover
+    mss = None  # type: ignore
 
 
 @dataclass
@@ -24,6 +32,14 @@ class CaptureResult:
     mode: str = "full"
 
 
+def _require_mss() -> None:
+    if mss is None:
+        raise RuntimeError(
+            "Screen capture requires the 'mss' package. "
+            "Install with: pip install mss"
+        )
+
+
 class ScreenCapture:
     """Capture full screen, monitor, or explicit region."""
 
@@ -31,6 +47,7 @@ class ScreenCapture:
         self.output_dir = ensure_dir(output_dir)
 
     def list_monitors(self) -> list:
+        _require_mss()
         with mss.mss() as sct:
             return list(sct.monitors)
 
@@ -38,10 +55,13 @@ class ScreenCapture:
         """
         monitor: 0 = all monitors virtual, 1+ = specific monitor
         """
+        _require_mss()
         with mss.mss() as sct:
             monitors = sct.monitors
             if monitor < 0 or monitor >= len(monitors):
-                raise ValueError(f"Invalid monitor index {monitor}; available 0..{len(monitors)-1}")
+                raise ValueError(
+                    f"Invalid monitor index {monitor}; available 0..{len(monitors)-1}"
+                )
             mon = monitors[monitor]
             shot = sct.grab(mon)
             img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
@@ -59,7 +79,13 @@ class ScreenCapture:
         height: int,
         save: bool = True,
     ) -> CaptureResult:
-        region = {"left": int(left), "top": int(top), "width": int(width), "height": int(height)}
+        _require_mss()
+        region = {
+            "left": int(left),
+            "top": int(top),
+            "width": int(width),
+            "height": int(height),
+        }
         if width <= 0 or height <= 0:
             raise ValueError("width and height must be positive")
         with mss.mss() as sct:
@@ -83,12 +109,16 @@ class ScreenCapture:
             if region:
                 return self.capture_region(*region, save=save)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Interactive selection failed ({}). Falling back to full screen.", exc)
+            logger.warning(
+                "Interactive selection failed ({}). Falling back to full screen.", exc
+            )
 
         logger.info(
             "Using full primary monitor. Tip: pass --region L,T,W,H for precise crop."
         )
-        return self.capture_full(monitor=1 if len(self.list_monitors()) > 1 else 0, save=save)
+        return self.capture_full(
+            monitor=1 if len(self.list_monitors()) > 1 else 0, save=save
+        )
 
     def capture_from_file(self, path: Union[str, Path]) -> CaptureResult:
         p = Path(path)
@@ -97,7 +127,13 @@ class ScreenCapture:
         img = Image.open(p).convert("RGB")
         return CaptureResult(
             image=img,
-            region={"left": 0, "top": 0, "width": img.width, "height": img.height, "file": str(p)},
+            region={
+                "left": 0,
+                "top": 0,
+                "width": img.width,
+                "height": img.height,
+                "file": str(p),
+            },
             path=p,
             mode="file",
         )
@@ -144,7 +180,6 @@ class ScreenCapture:
             x1, y1 = event.x, event.y
             left, top = min(x0, x1), min(y0, y1)
             width, height = abs(x1 - x0), abs(y1 - y0)
-            # Map canvas to screen (fullscreen origin 0,0)
             sx = root.winfo_rootx()
             sy = root.winfo_rooty()
             if width > 10 and height > 10:
@@ -159,7 +194,6 @@ class ScreenCapture:
         canvas.bind("<ButtonRelease-1>", on_release)
         root.bind("<Escape>", on_escape)
 
-        # Hint label
         canvas.create_text(
             root.winfo_screenwidth() // 2,
             40,
