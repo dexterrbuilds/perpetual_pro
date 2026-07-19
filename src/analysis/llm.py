@@ -15,15 +15,33 @@ from src.utils.config import AppConfig
 
 @dataclass
 class LLMNarrative:
+    # Short human narrative
     signal_narrative: str = ""
+    # Structured trade card fields for high-leverage perp scalps
+    direction: str = ""  # long | short | flat
+    entry_zones: List[Dict[str, Any]] = field(default_factory=list)  # [{"low": 123, "high": 125, "note": "tight"}]
+    alternative_entries: List[Dict[str, Any]] = field(default_factory=list)
+    stop_loss: Dict[str, Any] = field(default_factory=dict)  # {"price": 122, "reason": "invalidates structure"}
+    tps: List[Dict[str, Any]] = field(default_factory=list)  # [{"label":"TP1","price":126,"rr":0.6}]
+    max_hold_hours: int = 24
+    suggested_leverage: float = 20.0
+    suggested_leverage_range: str = "20x-100x"
     leverage_reasoning: str = ""
+    funding_impact: str = ""
+    volume_confidence: float = 0.0
+
+    # Reasons / risks / scenarios
     key_reasons: List[str] = field(default_factory=list)
     key_risks: List[str] = field(default_factory=list)
     scenarios: Dict[str, str] = field(default_factory=dict)  # bullish/base/bearish text
+
+    # Meta
     provider: str = "none"
     model: str = ""
     raw_ok: bool = False
     error: str = ""
+    # Compact trader-style card (human readable, emojis ok)
+    trade_card: str = ""
 
 
 class NarrativeLLM:
@@ -76,22 +94,34 @@ class NarrativeLLM:
         return self._fallback(context, provider="local_fallback")
 
     def _build_prompt(self, ctx: Dict[str, Any]) -> str:
+        # Updated prompt to request a professional trader-style trade card optimized
+        # for high-leverage crypto perpetual day-trading and scalping.
         return (
             "You are a senior crypto perpetual futures day trader / scalper. "
-            "Focus on short-term setups (5m–1h, 4h confirm), hold ≤12–24h, leverage 20x–100x. "
-            "Given the analysis JSON, respond with ONLY valid JSON (no markdown) matching:\n"
+            "Prioritize 5m, 15m, 1h (4h for confirmation). Hold time typically ≤12–24 hours. "
+            "Leverage should be aggressive (20x–100x) and dynamic based on volatility, confidence, and funding. "
+            "Signal styles: short-term mean reversion, breakout retests, and momentum scalps. "
+            "Entries must be tight zones; include alternative entries on retests. "
+            "Respond with ONLY valid JSON (no markdown) matching the schema below. Be concise, professional, non-hype, and risk-aware. Not financial advice.\n\n"
+            "JSON_SCHEMA:\n"
             "{\n"
-            '  "signal_narrative": "3-5 sentences explaining the trade signal",\n'
-            '  "leverage_reasoning": "2-3 sentences on why suggested leverage is appropriate",\n'
-            '  "key_reasons": ["bullet reason 1", "bullet reason 2", "..."],\n'
-            '  "key_risks": ["risk 1", "risk 2", "..."],\n'
-            '  "scenarios": {\n'
-            '    "bullish": "1-2 sentences",\n'
-            '    "base": "1-2 sentences",\n'
-            '    "bearish": "1-2 sentences"\n'
-            "  }\n"
-            "}\n"
-            "Be precise, non-hype, risk-aware. Not financial advice.\n\n"
+            '  "direction": "long|short|flat",\n'
+            '  "signal_narrative": "3-5 concise sentences explaining the trade",\n'
+            '  "entry_zones": [{"low": <num>, "high": <num>, "note": "tight|retention"}],\n'
+            '  "alternative_entries": [{"low": <num>, "high": <num>, "note": "retest/alt"}],\n'
+            '  "stop_loss": {"price": <num>, "reason": "text"},\n'
+            '  "tps": [{"label":"TP1","price":<num>,"rr":<num>,"note":"short-term"}, ... up to 4],\n'
+            '  "max_hold_hours": <int>,  /* typically 12 or 24 */\n'
+            '  "suggested_leverage": <num>,\n'
+            '  "suggested_leverage_range": "20x-100x (or narrower)",\n'
+            '  "leverage_reasoning": "short justification for leverage choice",\n'
+            '  "funding_impact": "how funding rate affects this trade (short)",\n'
+            '  "volume_confidence": <0.0-1.0>,\n'
+            '  "key_reasons": ["reason 1", "reason 2"],\n'
+            '  "key_risks": ["risk 1", "risk 2"],\n'
+            '  "scenarios": {"bullish":"...","base":"...","bearish":"..."},\n'
+            '  "trade_card": "Human-friendly single-line card with emojis and clear fields"\n'
+            "}\n\n"
             f"ANALYSIS:\n{json.dumps(ctx, default=str)[:12000]}"
         )
 
@@ -160,9 +190,48 @@ class NarrativeLLM:
 
     def _from_parsed(self, parsed: Dict[str, Any], provider: str, model: str) -> LLMNarrative:
         scenarios = parsed.get("scenarios") or {}
+
+        # Helper to coerce numeric fields safely
+        def _safe_num(v, default=None):
+            try:
+                return float(v) if v is not None else default
+            except Exception:
+                return default
+
+        entry_z = parsed.get("entry_zones") or parsed.get("entry_zones", [])
+        alt_z = parsed.get("alternative_entries") or []
+        stop = parsed.get("stop_loss") or {}
+        tps = parsed.get("tps") or []
+
         return LLMNarrative(
             signal_narrative=str(parsed.get("signal_narrative") or ""),
+            direction=str(parsed.get("direction") or ""),
+            entry_zones=[{
+                "low": _safe_num(e.get("low"), None) if isinstance(e, dict) else None,
+                "high": _safe_num(e.get("high"), None) if isinstance(e, dict) else None,
+                "note": e.get("note") if isinstance(e, dict) else str(e),
+            } for e in entry_z][:3],
+            alternative_entries=[{
+                "low": _safe_num(e.get("low"), None) if isinstance(e, dict) else None,
+                "high": _safe_num(e.get("high"), None) if isinstance(e, dict) else None,
+                "note": e.get("note") if isinstance(e, dict) else str(e),
+            } for e in alt_z][:3],
+            stop_loss={
+                "price": _safe_num(stop.get("price"), None) if isinstance(stop, dict) else None,
+                "reason": str(stop.get("reason") or "") if isinstance(stop, dict) else str(stop),
+            },
+            tps=[{
+                "label": str(t.get("label") or f"TP{i+1}"),
+                "price": _safe_num(t.get("price"), None),
+                "rr": _safe_num(t.get("rr"), None),
+                "note": str(t.get("note") or "")
+            } for i, t in enumerate(tps)][:4],
+            max_hold_hours=int(parsed.get("max_hold_hours") or parsed.get("max_hold") or 24),
+            suggested_leverage=_safe_num(parsed.get("suggested_leverage"), 20.0) or 20.0,
+            suggested_leverage_range=str(parsed.get("suggested_leverage_range") or "20x-100x"),
             leverage_reasoning=str(parsed.get("leverage_reasoning") or ""),
+            funding_impact=str(parsed.get("funding_impact") or ""),
+            volume_confidence=_safe_num(parsed.get("volume_confidence"), 0.0) or 0.0,
             key_reasons=[str(x) for x in (parsed.get("key_reasons") or [])][:8],
             key_risks=[str(x) for x in (parsed.get("key_risks") or [])][:8],
             scenarios={
@@ -170,6 +239,7 @@ class NarrativeLLM:
                 "base": str(scenarios.get("base") or ""),
                 "bearish": str(scenarios.get("bearish") or ""),
             },
+            trade_card=str(parsed.get("trade_card") or parsed.get("card") or ""),
             provider=provider,
             model=model,
             raw_ok=True,
@@ -184,7 +254,9 @@ class NarrativeLLM:
         funding = ctx.get("funding_rate_pct")
         factors = ctx.get("top_factors") or []
         direction = ctx.get("direction", "flat")
+        price = ctx.get("price") or None
 
+        # Build compact reasons from top factors
         reasons = []
         for f in factors[:5]:
             if isinstance(f, dict):
@@ -202,30 +274,77 @@ class NarrativeLLM:
         if funding is not None and abs(float(funding)) > 0.03:
             risks.append(f"Funding extreme ({funding}%) — squeeze risk against crowded side.")
 
+        # Heuristic entry / tp / sl generation when LLM not available
+        entry_zones = []
+        alt_entries = []
+        stop = {}
+        tps = []
+        if price:
+            # Tight entry band ±0.25–0.75% depending on confidence
+            band_pct = 0.25 if conf >= 70 else 0.5 if conf >= 50 else 0.8
+            low = price * (1 - band_pct / 100) if direction == "long" else price * (1 + band_pct / 100)
+            high = price * (1 + band_pct / 100) if direction == "long" else price * (1 - band_pct / 100)
+            entry_zones = [{"low": low, "high": high, "note": "primary tight zone"}]
+            # alternative on retest ~1-1.5x band
+            alt_band = band_pct * 1.8
+            alt_low = price * (1 - alt_band / 100) if direction == "long" else price * (1 + alt_band / 100)
+            alt_high = price * (1 + alt_band / 100) if direction == "long" else price * (1 - alt_band / 100)
+            alt_entries = [{"low": alt_low, "high": alt_high, "note": "retest/alt"}]
+            # stop ~ ATR-based or a fixed percent
+            stop_loss_price = price * (1 - 0.6 / 100) if direction == "long" else price * (1 + 0.6 / 100)
+            stop = {"price": stop_loss_price, "reason": "Invalidates structure / tight scalp stop"}
+
+            # TP stack realistic short-term: TP1 0.6–1.0%, TP2 1.2–2.0%, TP3 2.5–4.0%, TP4 5%+ (only if strong)
+            tp_moves = [0.6, 1.6, 3.0, 6.0]
+            for i, move in enumerate(tp_moves):
+                if direction == "long":
+                    tp_price = price * (1 + move / 100)
+                else:
+                    tp_price = price * (1 - move / 100)
+                tps.append({"label": f"TP{i+1}", "price": tp_price, "rr": None, "note": f"~{move:.2f}%"})
+
         narrative = (
-            f"{setup}: bias is {bias} ({conf:.0f}% confidence) with directional lean {direction}. "
-            f"Structure, multi-timeframe trend, and derivatives context form a weighted confluence. "
-            f"Aggressive perp style: suggested ~{lev:.0f}x (20x–100x band), hold typically ≤12–24h. "
-            f"Risk ~1% of simulated capital; do not chase if the entry zone is missed."
+            f"{setup}: {direction} bias {bias} ({conf:.0f}% conf). "
+            f"Confluence from short-term momentum, volume, funding and micro-structure. "
+            f"Suggested leverage ~{lev:.0f}x within 20x–100x band; tighten to ~20x if funding/ATR hostile. "
+            f"Hold typically ≤12–24h; scale out at TP1–TP4."
         )
         lev_reason = (
-            f"Suggested perp leverage ~{lev:.0f}x (band 20x–100x) from ATR {atr_pct:.2f}% of price, "
-            f"confidence {conf:.0f}%, and funding. Calmer tape + higher conf → more aggression; "
-            f"funding against you clips toward 20x. Simulation only — not a mandate."
+            f"Leverage chosen ~{lev:.0f}x based on confidence {conf:.0f}%, ATR {atr_pct:.2f}%, funding {funding}. "
+            "Higher conf + low funding → push toward upper band; hostile funding → reduce toward 20x."
         )
         scenarios = {
-            "bullish": "Continuation if HTF demand holds and momentum expands with rising volume.",
-            "base": "Range / mean-reversion until BOS; trade edges only or stand aside.",
-            "bearish": "Breakdown if support fails on volume and funding flips against longs.",
+            "bullish": "Continuation if short-term momentum and volume expand and funding stabilizes.",
+            "base": "Range / retest — prefer edges, micro-size on weak conviction.",
+            "bearish": "Fail structure with rising volume and funding flip against position.",
         }
-        if bias == "bullish":
-            scenarios["bullish"] = "Primary path: hold structure, reclaim mid-range, push toward TP stack."
-        elif bias == "bearish":
-            scenarios["bearish"] = "Primary path: fail resistance, lose mid-range, extend toward TP stack."
+
+        # Compact trader card with emojis
+        card_lines = []
+        card_lines.append(f"{ '🟢' if direction=='long' else '🔴' if direction=='short' else '⚪️'} {setup} — {direction.upper()} ({conf:.0f}% )")
+        if entry_zones:
+            ez = entry_zones[0]
+            card_lines.append(f"Entry: {ez['low']:.4f}–{ez['high']:.4f} {ez['note']}")
+        if stop:
+            card_lines.append(f"Stop: {stop['price']:.4f} — {stop['reason']}")
+        for tp in (tps[:4] if tps else []):
+            card_lines.append(f"{tp['label']}: {tp['price']:.4f} ({tp['note']})")
+        card_lines.append(f"Lev: ~{lev:.0f}x (20x–100x). Hold ≤12–24h")
+        trade_card = " | ".join(card_lines)
 
         return LLMNarrative(
             signal_narrative=narrative,
+            direction=direction,
+            entry_zones=entry_zones,
+            alternative_entries=alt_entries,
+            stop_loss=stop,
+            tps=tps,
+            max_hold_hours=24,
+            suggested_leverage=lev,
+            suggested_leverage_range="20x-100x",
             leverage_reasoning=lev_reason,
+            funding_impact=(f"Funding {funding}%" if funding is not None else "n/a"),
+            volume_confidence=float(ctx.get("volume_confidence") or 0.0),
             key_reasons=reasons,
             key_risks=risks,
             scenarios=scenarios,
@@ -233,4 +352,5 @@ class NarrativeLLM:
             model="heuristic",
             raw_ok=False,
             error="No LLM keys or provider failed — used local narrative engine.",
+            trade_card=trade_card,
         )
