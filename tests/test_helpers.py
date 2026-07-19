@@ -20,6 +20,7 @@ from src.utils.helpers import (
     timeframe_to_minutes,
 )
 from src.analysis.patterns import PatternDetector
+from src.data.exchange import ExchangeClient
 from src.analysis.market_structure import MarketStructureAnalyzer
 from src.analysis.risk import RiskManager
 from src.utils.config import load_config
@@ -33,6 +34,30 @@ def test_normalize_symbol_variants():
     assert normalize_symbol("1000PEPEUSDT") == "1000PEPE/USDT:USDT"
     assert normalize_symbol("BONK") == "BONK/USDT:USDT"
     assert normalize_symbol("BONK/USD") == "BONK/USDT:USDT"
+    assert normalize_symbol("BNBUSDU2026") == "BNB/USDT:USDT"
+    assert normalize_symbol("BNB/USDT:USDU2026") == "BNB/USDT:USDT"
+
+
+def test_exchange_client_uses_cleaned_perpetual_symbol_for_ticker():
+    class DummyExchange:
+        def __init__(self):
+            self.calls = []
+            self.markets = {}
+
+        def fetch_ticker(self, symbol):
+            self.calls.append(symbol)
+            return {"last": 574.12, "close": 574.12}
+
+    client = ExchangeClient.__new__(ExchangeClient)
+    client.exchange_id = "binanceusdm"
+    client._exchange = DummyExchange()
+    client._markets_loaded = True
+    client.exchange_cfg = None
+
+    result = client.fetch_ticker("BNBUSDU2026")
+
+    assert result["last"] == 574.12
+    assert client._exchange.calls == ["BNB/USDT:USDT"]
 
 
 def test_symbol_base():

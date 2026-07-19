@@ -45,6 +45,24 @@ def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+def _clean_symbol_text(raw: str) -> str:
+    """Strip common corruption patterns from exchange symbols before normalization."""
+    if not raw:
+        raise ValueError("Symbol is empty")
+
+    s = raw.strip().upper()
+    s = re.sub(r"[\s\-_]+", "", s)
+
+    for suffix in ("PERP", "SWAP", "USDTM", "USD-M"):
+        if s.endswith(suffix) and len(s) > len(suffix) + 1:
+            s = s[: -len(suffix)]
+
+    # Remove quarterly/settlement suffixes such as USDU2026 or USD2026.
+    s = re.sub(r"(?:USDT|USDC|USD|BUSD|USDU)\d{4}$", "", s)
+    s = re.sub(r"(?::)(?:USDT|USDC|USD|BUSD|USDU)\d{4}$", "", s)
+    return s
+
+
 def normalize_symbol(raw: str, quote: str = "USDT") -> str:
     """
     Normalize user/OCR symbol strings to CCXT unified perpetual format.
@@ -56,27 +74,16 @@ def normalize_symbol(raw: str, quote: str = "USDT") -> str:
         ETH-PERP -> ETH/USDT:USDT
         1000PEPE -> 1000PEPE/USDT:USDT
         BONK -> BONK/USDT:USDT
+        BNBUSDU2026 -> BNB/USDT:USDT
     """
-    if not raw:
-        raise ValueError("Symbol is empty")
-
-    s = raw.strip().upper()
-    s = s.replace(" ", "")
-    s = s.replace("-", "").replace("_", "")
-
-    # Strip common suffixes
-    for suffix in ("PERP", "SWAP", "USDTM", "USD-M"):
-        if s.endswith(suffix) and len(s) > len(suffix) + 1:
-            s = s[: -len(suffix)]
-
-    # Already unified with settle
-    if ":" in s and "/" in s:
-        return s
+    s = _clean_symbol_text(raw)
 
     # BTC/USDT or BTC/USDT:USDT
     if "/" in s:
         base, rest = s.split("/", 1)
-        rest = rest.split(":")[0] or quote
+        rest = rest.split(":", 1)[0] or quote
+        if not rest:
+            rest = quote
         if rest in {"USD", "BUSD"}:
             rest = "USDT"
         return f"{base}/{rest}:{rest}"

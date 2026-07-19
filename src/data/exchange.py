@@ -149,6 +149,7 @@ class ExchangeClient:
             logger.debug("load_markets skipped: {}", exc)
 
         unified = normalize_symbol(symbol)
+        logger.info("Symbol input '{}' -> cleaned symbol '{}'", symbol, unified)
         markets = self._exchange.markets or {}
         base = unified.split("/")[0]
         base_quote = unified.split(":")[0] if ":" in unified else unified
@@ -243,6 +244,7 @@ class ExchangeClient:
 
     def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
         normalized_symbol = normalize_symbol(symbol)
+        logger.info("Ticker input '{}' -> cleaned symbol '{}'", symbol, normalized_symbol)
         candidates = self._build_symbol_candidates(normalized_symbol, symbol)
         last_error: Optional[Exception] = None
 
