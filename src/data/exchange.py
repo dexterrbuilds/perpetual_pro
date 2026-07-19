@@ -147,23 +147,31 @@ class ExchangeClient:
             self.load_markets()
         except Exception as exc:  # noqa: BLE001
             logger.debug("load_markets skipped: {}", exc)
+
         unified = normalize_symbol(symbol)
         markets = self._exchange.markets or {}
-
-        if unified in markets:
-            return unified
-
-        # Try without settle suffix
+        base = unified.split("/")[0]
         base_quote = unified.split(":")[0] if ":" in unified else unified
-        candidates = [
+
+        candidates: List[str] = [
             unified,
             base_quote,
             f"{base_quote}:USDT",
             f"{base_quote}:USDC",
+            f"{base}/USDT",
+            f"{base}/USDT:USDT",
+            f"{base}/USD",
+            f"{base}/USD:USDT",
+            f"{base}USDT",
+            f"{base}USDC",
+            f"{base}USD",
             symbol.upper(),
         ]
+
+        if unified in markets:
+            return unified
+
         # Also try common linear swap formats
-        base = unified.split("/")[0]
         for m_id, m in markets.items():
             if not m.get("swap") and not m.get("future"):
                 continue
@@ -234,12 +242,57 @@ class ExchangeClient:
         raise RuntimeError(f"Failed to fetch OHLCV for {symbol}: {last_err}")
 
     def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
-        resolved = self.resolve_symbol(symbol)
-        try:
-            return self._exchange.fetch_ticker(resolved)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Ticker fetch failed for {}: {}", resolved, exc)
-            return {}
+        normalized_symbol = normalize_symbol(symbol)
+        candidates = self._build_symbol_candidates(normalized_symbol, symbol)
+        last_error: Optional[Exception] = None
+
+        for candidate in candidates:
+            try:
+                result = self._exchange.fetch_ticker(candidate)
+                if result:
+                    price = None
+                    for key in ("last", "close", "ask", "bid"):
+                        price = result.get(key)
+                        if price is not None:
+                            break
+                    if price is not None:
+                        logger.debug(
+                            "Ticker fetch success for '{}' using '{}' -> price={}",
+                            symbol,
+                            candidate,
+                            price,
+                        )
+                        return result
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.debug("Ticker fetch failed for {} ({}): {}", candidate, symbol, exc)
+
+        logger.warning(
+            "Ticker fetch failed for '{}' using candidates {}; last_error={}",
+            symbol,
+            candidates,
+            last_error,
+        )
+        return {}
+
+    def _build_symbol_candidates(self, normalized_symbol: str, original_symbol: str) -> List[str]:
+        base = normalized_symbol.split("/")[0]
+        base_quote = normalized_symbol.split(":")[0] if ":" in normalized_symbol else normalized_symbol
+        variants = [
+            normalized_symbol,
+            base_quote,
+            f"{base_quote}:USDT",
+            f"{base_quote}:USDC",
+            f"{base}/USDT",
+            f"{base}/USDT:USDT",
+            f"{base}/USD",
+            f"{base}/USD:USDT",
+            f"{base}USDT",
+            f"{base}USDC",
+            f"{base}USD",
+            original_symbol.upper(),
+        ]
+        return [v for v in dict.fromkeys(variants) if v]
 
     def fetch_funding_rate(self, symbol: str) -> Dict[str, Any]:
         resolved = self.resolve_symbol(symbol)

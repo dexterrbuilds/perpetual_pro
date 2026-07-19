@@ -31,6 +31,8 @@ def test_normalize_symbol_variants():
     assert normalize_symbol("ETH/USDT") == "ETH/USDT:USDT"
     assert normalize_symbol("SOL/USDT:USDT") == "SOL/USDT:USDT"
     assert normalize_symbol("1000PEPEUSDT") == "1000PEPE/USDT:USDT"
+    assert normalize_symbol("BONK") == "BONK/USDT:USDT"
+    assert normalize_symbol("BONK/USD") == "BONK/USDT:USDT"
 
 
 def test_symbol_base():

@@ -55,6 +55,7 @@ def normalize_symbol(raw: str, quote: str = "USDT") -> str:
         BTC/USDT -> BTC/USDT:USDT
         ETH-PERP -> ETH/USDT:USDT
         1000PEPE -> 1000PEPE/USDT:USDT
+        BONK -> BONK/USDT:USDT
     """
     if not raw:
         raise ValueError("Symbol is empty")
@@ -75,17 +76,19 @@ def normalize_symbol(raw: str, quote: str = "USDT") -> str:
     # BTC/USDT or BTC/USDT:USDT
     if "/" in s:
         base, rest = s.split("/", 1)
-        quote_part = rest.split(":")[0] or quote
-        return f"{base}/{quote_part}:{quote_part}"
+        rest = rest.split(":")[0] or quote
+        if rest in {"USD", "BUSD"}:
+            rest = "USDT"
+        return f"{base}/{rest}:{rest}"
 
-    # BTCUSDT / ETHUSDC
+    # BTCUSDT / ETHUSDC / BONKUSD
     for q in ("USDT", "USDC", "USD", "BUSD"):
         if s.endswith(q) and len(s) > len(q):
             base = s[: -len(q)]
             settle = "USDT" if q in ("USD", "BUSD") else q
             return f"{base}/{settle}:{settle}"
 
-    # Bare base asset
+    # Bare base asset (e.g. BONK -> BONK/USDT:USDT)
     base = re.sub(r"[^A-Z0-9]", "", s)
     if not base:
         raise ValueError(f"Cannot parse symbol from: {raw!r}")
