@@ -156,6 +156,27 @@ Response JSON includes `ok`, `bias`, `confidence`, `trade_plan`, `factors`, `pat
 
 Health: `GET /health`
 
+### Streamlit web app
+
+A private-friendly Streamlit companion app lives in [streamlit_app.py](./streamlit_app.py). It can:
+- run single-symbol analysis
+- scan a watchlist of symbols and rank setups
+- upload a chart image for analysis
+- export markdown reports
+
+Run locally:
+
+```bash
+streamlit run streamlit_app.py --server.port 8501
+```
+
+Set optional env vars for privacy and backend routing:
+
+```bash
+export STREAMLIT_PASSWORD="change-me"
+export BACKEND_URL="http://127.0.0.1:8000"
+```
+
 ### Chrome extension
 
 A Manifest V3 extension lives in [`extension/`](./extension/). It calls the fixed production API (hard-coded, no API URL field):
