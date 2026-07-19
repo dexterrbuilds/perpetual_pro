@@ -131,6 +131,9 @@ async function handleMessage(message, sender) {
   if (type === "CHECK_BACKEND") {
     return checkBackend();
   }
+  if (type === "SCAN_SYMBOLS") {
+    return scanSymbols(message);
+  }
   if (type === "START_CAPTURE") {
     const tabId = message.tabId || sender.tab?.id;
     let tab;
@@ -535,6 +538,26 @@ function friendlyBackendError(msg) {
     return "Cannot reach Perpetual Pro API (Render may be waking up — retry in ~30s).";
   }
   return msg;
+}
+
+async function scanSymbols(message) {
+  const symbols = Array.isArray(message?.symbols) ? message.symbols : [];
+  const form = new FormData();
+  form.append("symbols", symbols.join(","));
+  if (message?.timeframe) form.append("timeframe", message.timeframe);
+  if (message?.exchange) form.append("exchange", message.exchange);
+  if (message?.noNews) form.append("no_news", "true");
+  const res = await fetch(`${API_BASE}/scan`, { method: "POST", body: form });
+  let body;
+  try {
+    body = await res.json();
+  } catch {
+    throw new Error(`Backend error HTTP ${res.status}`);
+  }
+  if (!res.ok) {
+    throw new Error(body?.error || body?.message || `HTTP ${res.status}`);
+  }
+  return body;
 }
 
 async function checkBackend() {

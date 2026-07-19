@@ -64,6 +64,92 @@ def _load_image(image: Union[Image.Image, bytes, BytesIO]) -> Image.Image:
     return Image.open(BytesIO(image)).convert("RGB")
 
 
+def _build_analysis_payload(
+    analysis: FullAnalysis,
+    request: Optional[AnalyzeRequest] = None,
+    config: Optional[AppConfig] = None,
+    image: Optional[Union[Image.Image, bytes, BytesIO]] = None,
+) -> Dict[str, Any]:
+    plan = analysis.trade_plan or None
+    price = analysis.meta.get("price") if analysis.meta else None
+    direction = analysis.direction or analysis.bias or "flat"
+    payload = {
+        "ok": True,
+        "data_mode": "full",
+        "symbol": analysis.symbol,
+        "exchange": analysis.exchange_id,
+        "primary_tf": analysis.primary_tf,
+        "generated_at": analysis.generated_at,
+        "bias": analysis.bias,
+        "direction": analysis.direction,
+        "confidence": analysis.confidence,
+        "setup_name": analysis.setup_name,
+        "strategy_tags": analysis.strategy_tags,
+        "confluence_total": analysis.confluence_total,
+        "confluence_breakdown": analysis.factor_breakdown(),
+        "factors": analysis.factor_breakdown(),
+        "trade_plan": plan.to_position_simulation() if plan else None,
+        "primary_setup": plan.to_primary_setup() if plan else None,
+        "position_simulation": plan.to_position_simulation() if plan else None,
+        "patterns": [],
+        "key_levels": analysis.key_levels,
+        "key_reasons": analysis.key_reasons,
+        "key_risks": analysis.key_risks,
+        "trader_commentary": analysis.trader_commentary,
+        "news": None,
+        "snapshot": None,
+        "structure": None,
+        "warnings": analysis.warnings,
+        "vision": None,
+        "meta": analysis.meta,
+        "disclaimer": "NOT FINANCIAL ADVICE",
+        "signal": {
+            "bias": analysis.bias,
+            "direction": direction,
+            "confidence_pct": analysis.confidence,
+            "setup_name": analysis.setup_name,
+            "strategy_tags": analysis.strategy_tags,
+            "confluence_score": analysis.confluence_total,
+        },
+    }
+    if analysis.snapshot:
+        payload["snapshot"] = {
+            "symbol": analysis.snapshot.symbol,
+            "exchange_id": analysis.snapshot.exchange_id,
+            "last": analysis.snapshot.last,
+            "bid": analysis.snapshot.bid,
+            "ask": analysis.snapshot.ask,
+            "mark": analysis.snapshot.mark,
+            "index": analysis.snapshot.index,
+            "percentage_24h": analysis.snapshot.percentage_24h,
+            "funding_rate": analysis.snapshot.funding_rate,
+            "open_interest": analysis.snapshot.open_interest,
+            "open_interest_value": analysis.snapshot.open_interest_value,
+        }
+    if analysis.news:
+        payload["news"] = {
+            "summary": analysis.news.summary,
+            "aggregate_sentiment": analysis.news.aggregate_sentiment,
+            "bias": analysis.news.bias,
+            "items": [item.to_dict() if hasattr(item, "to_dict") else item for item in analysis.news.items],
+        }
+    if analysis.structure:
+        payload["structure"] = {
+            "summary": analysis.structure.summary,
+            "structure_score": analysis.structure.structure_score,
+            "wyckoff_phase": analysis.structure.wyckoff_phase,
+            "volume_profile_poc": analysis.structure.volume_profile_poc,
+            "volume_profile_val": analysis.structure.volume_profile_val,
+            "volume_profile_vah": analysis.structure.volume_profile_vah,
+        }
+    if analysis.indicators:
+        payload["indicators"] = {
+            "summary": analysis.indicators.summary,
+            "divergences": [d.to_dict() if hasattr(d, "to_dict") else d for d in analysis.indicators.divergences],
+        }
+    return payload
+
+
 def analyze_from_image(
     image: Union[Image.Image, bytes, BytesIO],
     request: Optional[AnalyzeRequest] = None,
@@ -319,6 +405,105 @@ def analyze_from_image(
         return payload
     finally:
         client.close()
+
+
+def scan_symbols(
+    symbols: Optional[List[str]] = None,
+    request: Optional[AnalyzeRequest] = None,
+    config: Optional[AppConfig] = None,
+) -> Dict[str, Any]:
+    """Run a fast multi-symbol scan and rank setups by confluence score."""
+    req = request or AnalyzeRequest()
+    cfg = config or load_config()
+    symbol_list = [s.strip() for s in (symbols or []) if s and s.strip()]
+    if not symbol_list:
+        return {"ok": False, "error": "no_symbols", "ranked_results": []}
+
+    primary_tf = req.timeframe or cfg.timeframes.primary
+    ex_id = req.exchange or cfg.exchange.default
+    if isinstance(ex_id, str):
+        ex_id = ex_id.lower().replace("-", "").replace("_", "")
+    if isinstance(ex_id, str):
+        from src.data.exchange import EXCHANGE_MAP
+
+        ex_id = EXCHANGE_MAP.get(ex_id, ex_id)
+
+    ranked_results: List[Dict[str, Any]] = []
+    for symbol in symbol_list[:40]:
+        try:
+            normalized_symbol = normalize_symbol(symbol)
+            client = ExchangeClient(exchange_id=ex_id, config=cfg)
+            try:
+                mtf = fetch_multi_timeframe(
+                    client,
+                    symbol=normalized_symbol,
+                    primary_tf=primary_tf,
+                    higher_tfs=["1h", "4h"],
+                    limit=120,
+                    include_snapshot=True,
+                    config=cfg,
+                )
+                if mtf.primary.empty:
+                    continue
+
+                news_bundle = None
+                if not req.no_news and cfg.news.enabled:
+                    try:
+                        news_bundle = NewsAnalyzer(config=cfg).analyze(normalized_symbol)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Scan news failed for {}: {}", normalized_symbol, exc)
+
+                engine = ConfluenceEngine(cfg)
+                analysis = engine.analyze(
+                    mtf,
+                    news=news_bundle,
+                    simulated_capital=req.simulated_capital or 100.0,
+                    risk_pct=req.risk_pct or 1.0,
+                    use_llm=False,
+                )
+                leverage = getattr(analysis.trade_plan, "leverage_suggested", 0) or 1
+                leverage = min(5, max(1, int(round(float(leverage)))))
+                reason = (analysis.key_reasons[:2] or [analysis.setup_name or ""])[0]
+                ranked_results.append(
+                    {
+                        "symbol": normalized_symbol,
+                        "exchange": ex_id,
+                        "primary_tf": primary_tf,
+                        "direction": analysis.direction,
+                        "bias": analysis.bias,
+                        "confidence": round(float(analysis.confidence), 1),
+                        "confluence_score": round(float(analysis.confluence_total), 3),
+                        "setup_name": analysis.setup_name,
+                        "leverage": leverage,
+                        "reason": reason,
+                        "price": analysis.meta.get("price") if analysis.meta else None,
+                        "support": analysis.key_levels[0].get("mid") if analysis.key_levels else None,
+                        "resistance": analysis.key_levels[1].get("mid") if len(analysis.key_levels) > 1 else None,
+                        "payload": {
+                            "bias": analysis.bias,
+                            "direction": analysis.direction,
+                            "confidence": analysis.confidence,
+                            "setup_name": analysis.setup_name,
+                            "confluence_total": analysis.confluence_total,
+                            "key_levels": analysis.key_levels[:4],
+                            "key_reasons": analysis.key_reasons[:3],
+                            "trade_plan": analysis.trade_plan.to_primary_setup() if analysis.trade_plan else None,
+                        },
+                    }
+                )
+            finally:
+                client.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Scan failed for {}: {}", symbol, exc)
+
+    ranked_results.sort(key=lambda item: item["confluence_score"], reverse=True)
+    return {
+        "ok": True,
+        "ranked_results": ranked_results[:10],
+        "count": len(ranked_results),
+        "timeframe": primary_tf,
+        "exchange": ex_id,
+    }
 
 
 def _apply_vision_conflict_warnings(

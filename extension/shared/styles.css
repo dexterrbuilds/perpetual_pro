@@ -352,6 +352,79 @@ select:focus {
   display: block;
 }
 
+/* Scan mode */
+.scan-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 8px 0 4px;
+}
+
+.scan-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px;
+  background: rgba(15, 23, 42, 0.78);
+}
+
+.scan-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.scan-symbol {
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.scan-meta {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.scan-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.scan-stats .label {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.scan-stats .value {
+  display: block;
+  font-size: 12px;
+  margin-top: 2px;
+  font-weight: 700;
+}
+
+.scan-reason {
+  margin-top: 8px;
+  color: #cbd5e1;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.scan-levels {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 /* Loading */
 .loading {
   display: none;

@@ -215,6 +215,58 @@ def test_analyze_from_image_prefers_client_hint_exchange(monkeypatch):
     assert captured["exchange_id"] == "mexc"
 
 
+def test_scan_symbols_ranks_results(monkeypatch):
+    from src.api import service as svc
+    from src.data.exchange import MarketSnapshot
+    from src.data.multi_tf import MultiTimeframeData
+    import pandas as pd
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            self.exchange_id = "binanceusdm"
+
+    class FakeNews:
+        def __init__(self, *a, **k):
+            pass
+
+        def analyze(self, symbol):
+            from src.data.news import NewsBundle
+
+            return NewsBundle(symbol=symbol, summary="test", bias="neutral", aggregate_sentiment=0.0)
+
+    def fake_fetch(client, symbol, primary_tf, higher_tfs=None, limit=500, include_snapshot=True, config=None):
+        n = 80
+        idx = pd.date_range("2025-01-01", periods=n, freq="15min", tz="UTC")
+        close = 1000.0 if symbol.startswith("BTC") else 200.0
+        df = pd.DataFrame(
+            {
+                "open": close + 1,
+                "high": close + 2,
+                "low": close - 2,
+                "close": close,
+                "volume": 100.0,
+            },
+            index=idx,
+        )
+        return MultiTimeframeData(
+            symbol=symbol,
+            exchange_id="binanceusdm",
+            primary_tf=primary_tf,
+            frames={primary_tf: df},
+            snapshot=MarketSnapshot(symbol=symbol, exchange_id="binanceusdm", last=float(close)),
+        )
+
+    monkeypatch.setattr(svc, "ExchangeClient", FakeClient)
+    monkeypatch.setattr(svc, "fetch_multi_timeframe", fake_fetch)
+    monkeypatch.setattr(svc, "NewsAnalyzer", FakeNews)
+
+    result = svc.scan_symbols(["BTC", "ETH"], request=svc.AnalyzeRequest(timeframe="15m", no_news=True), config=svc.load_config())
+
+    assert result["ok"] is True
+    assert len(result["ranked_results"]) >= 2
+    assert result["ranked_results"][0]["symbol"]
+
+
 def test_fastapi_analyze_endpoint(monkeypatch):
     fastapi = pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient

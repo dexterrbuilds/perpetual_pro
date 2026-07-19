@@ -4,7 +4,7 @@
 import { fuseHints, lightOcr } from "./shared/ocr.js";
 import { parseChartUrl } from "./shared/url_parse.js";
 import { lightVision } from "./shared/vision_light.js";
-import { renderResults } from "./shared/render.js";
+import { escapeHtml, renderResults } from "./shared/render.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -23,6 +23,7 @@ const els = {
   btnSettings: $("btnSettings"),
   btnCapture: $("btnCapture"),
   btnSelectArea: $("btnSelectArea"),
+  btnScanMode: $("btnScanMode"),
   btnSidePanel: $("btnSidePanel"),
   btnSaveSettings: $("btnSaveSettings"),
   btnRefresh: $("btnRefresh"),
@@ -72,6 +73,7 @@ async function init() {
 
   els.btnCapture.addEventListener("click", () => startCapture("visible"));
   els.btnSelectArea?.addEventListener("click", () => startCapture("select-area"));
+  els.btnScanMode?.addEventListener("click", runScanMode);
   els.btnSidePanel.addEventListener("click", openSidePanel);
 
   els.btnRefresh.addEventListener("click", onRefresh);
@@ -520,6 +522,86 @@ function normalizeTimeframe(raw) {
 function displayBase(sym) {
   if (!sym) return "—";
   return String(sym).split("/")[0].replace(/USDT$/i, "") || sym;
+}
+
+async function runScanMode() {
+  hideError();
+  hideSuccess();
+  setBusy(true, "Scanning watchlist…");
+  setStatusUI("analyzing", "Scanning watchlist…");
+  els.loadingSteps.textContent = "Ranking by confluence";
+
+  const symbols = [
+    "AAVE","ADA","AERO","ALGO","ARB","ATOM","AXS","BCH","BERA","BGB","BRETT","CAKE","BSV","CHZ","CRO","DASH","DOT","FIL","GRASS","HBAR","ICP","INJ","JUP","XLM","XMR","XTZ","ZEC","TIA","S","SEI","RAY","OP","NEAR","MNT","KAS","KAIA"
+  ];
+  let res;
+  try {
+    res = await chrome.runtime.sendMessage({
+      type: "SCAN_SYMBOLS",
+      symbols,
+      timeframe: els.timeframe.value.trim() || "15m",
+      exchange: els.exchange.value,
+      noNews: els.noNews.checked,
+    });
+  } catch (err) {
+    setBusy(false);
+    showError(err?.message || "Scan failed");
+    setStatusUI("error", err?.message || "Scan failed");
+    return;
+  }
+
+  setBusy(false);
+  if (!res?.ok) {
+    showError(res?.error || "Scan failed");
+    setStatusUI("error", res?.error || "Scan failed");
+    return;
+  }
+
+  renderScanResults(els.results, res);
+  setStatusUI("done", `Scan complete · ${res.count || 0} ranked`);
+  flashSuccess("Scan complete");
+}
+
+function renderScanResults(container, res) {
+  if (!container) return;
+  const rows = Array.isArray(res?.ranked_results) ? res.ranked_results : [];
+  if (!rows.length) {
+    container.innerHTML = `<div class="empty-state"><div class="empty-title">No scan results</div><div class="empty-sub">Try a different timeframe or exchange.</div></div>`;
+    return;
+  }
+  const list = rows
+    .slice(0, 10)
+    .map((row) => {
+      const sym = row.symbol || "—";
+      const conf = Number(row.confidence || 0).toFixed(1);
+      const score = Number(row.confluence_score || 0).toFixed(3);
+      const dir = String(row.direction || "flat").toUpperCase();
+      const biasClassName = dir === "LONG" ? "bull" : dir === "SHORT" ? "bear" : "neutral";
+      const price = row.price != null ? `$${Number(row.price).toFixed(2)}` : "—";
+      return `
+        <section class="scan-card">
+          <div class="scan-head">
+            <div>
+              <div class="scan-symbol">${escapeHtml(sym)}</div>
+              <div class="scan-meta">${escapeHtml(row.setup_name || "Setup")}</div>
+            </div>
+            <span class="bias-pill ${biasClassName}">${escapeHtml(dir)}</span>
+          </div>
+          <div class="scan-stats">
+            <div><span class="label">Conf</span><span class="value">${conf}%</span></div>
+            <div><span class="label">Confluence</span><span class="value">${score}</span></div>
+            <div><span class="label">Lev</span><span class="value">${row.leverage || "—"}x</span></div>
+            <div><span class="label">Price</span><span class="value">${escapeHtml(price)}</span></div>
+          </div>
+          <div class="scan-reason">${escapeHtml(row.reason || "—")}</div>
+          <div class="scan-levels">
+            <span>Support: ${row.support != null ? escapeHtml(Number(row.support).toFixed(2)) : "—"}</span>
+            <span>Resistance: ${row.resistance != null ? escapeHtml(Number(row.resistance).toFixed(2)) : "—"}</span>
+          </div>
+        </section>`;
+    })
+    .join("");
+  container.innerHTML = `<div class="scan-list">${list}</div>`;
 }
 
 function showThumb(dataUrl) {

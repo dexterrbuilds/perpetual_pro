@@ -27,7 +27,7 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 from src import __version__
-from src.api.service import AnalyzeRequest, analyze_from_image
+from src.api.service import AnalyzeRequest, analyze_from_image, scan_symbols
 from src.utils.config import load_config, setup_logging
 
 # ---------------------------------------------------------------------------
@@ -97,6 +97,38 @@ def health() -> Dict[str, Any]:
         "default_exchange": cfg.exchange.default,
         "default_timeframe": cfg.timeframes.primary,
     }
+
+
+@app.post("/scan")
+async def scan(
+    symbols: Optional[str] = Form(
+        None,
+        description="Comma-separated symbols to scan, e.g. BTC,ETH,SOL",
+    ),
+    timeframe: Optional[str] = Form(None, description="Primary timeframe, e.g. 15m"),
+    exchange: Optional[str] = Form(None, description="binanceusdm | bybit | okx | bitget"),
+    no_news: bool = Form(False, description="Skip news fetch"),
+    simulated_capital: Optional[float] = Form(None, description="Simulated capital"),
+    risk: Optional[float] = Form(None, description="Risk percent"),
+) -> JSONResponse:
+    cfg = get_config()
+    symbol_list = [x.strip() for x in (symbols or "").split(",") if x and x.strip()]
+    if not symbol_list:
+        return JSONResponse(status_code=422, content={"ok": False, "error": "no_symbols"})
+
+    req = AnalyzeRequest(
+        timeframe=timeframe.strip() if timeframe else None,
+        exchange=exchange.strip().lower() if exchange else None,
+        simulated_capital=simulated_capital,
+        risk_pct=risk,
+        no_news=bool(no_news),
+    )
+    try:
+        result = scan_symbols(symbol_list, request=req, config=cfg)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Scan failed: {}", exc)
+        raise HTTPException(status_code=500, detail=f"Scan failed: {exc}") from exc
+    return JSONResponse(content=result)
 
 
 @app.post("/analyze")
