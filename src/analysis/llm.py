@@ -97,11 +97,11 @@ class NarrativeLLM:
         # Updated prompt to request a professional trader-style trade card optimized
         # for high-leverage crypto perpetual day-trading and scalping.
         return (
-            "You are a senior crypto perpetual futures day trader / scalper. "
-            "Prioritize 5m, 15m, 1h (4h for confirmation). Hold time typically ≤12–24 hours. "
-            "Leverage should be aggressive (20x–100x) and dynamic based on volatility, confidence, and funding. "
-            "Signal styles: short-term mean reversion, breakout retests, and momentum scalps. "
-            "Entries must be tight zones; include alternative entries on retests. "
+            "You are a senior crypto perpetual futures day trader. "
+            "Prioritize 15m, 1h, and 4h (4h for confirmation). Hold time typically 30min–12 hours (max 24h). "
+            "Leverage should be aggressive but responsible (20x–100x); avoid extreme >150x except in rare, very high conviction micro-scalps. "
+            "Signal styles: short-term momentum, breakout retests, mean reversion, and intraday structure. "
+            "Entries must be tight zones with clear invalidation; include alternative entries on retests. "
             "Respond with ONLY valid JSON (no markdown) matching the schema below. Be concise, professional, non-hype, and risk-aware. Not financial advice.\n\n"
             "JSON_SCHEMA:\n"
             "{\n"
@@ -307,7 +307,7 @@ class NarrativeLLM:
             f"{setup}: {direction} bias {bias} ({conf:.0f}% conf). "
             f"Confluence from short-term momentum, volume, funding and micro-structure. "
             f"Suggested leverage ~{lev:.0f}x within 20x–100x band; tighten to ~20x if funding/ATR hostile. "
-            f"Hold typically ≤12–24h; scale out at TP1–TP4."
+            f"Hold typically 30min–12h (max 24h); scale out at TP1–TP4."
         )
         lev_reason = (
             f"Leverage chosen ~{lev:.0f}x based on confidence {conf:.0f}%, ATR {atr_pct:.2f}%, funding {funding}. "
@@ -329,7 +329,7 @@ class NarrativeLLM:
             card_lines.append(f"Stop: {stop['price']:.4f} — {stop['reason']}")
         for tp in (tps[:4] if tps else []):
             card_lines.append(f"{tp['label']}: {tp['price']:.4f} ({tp['note']})")
-        card_lines.append(f"Lev: ~{lev:.0f}x (20x–100x). Hold ≤12–24h")
+        card_lines.append(f"Lev: ~{lev:.0f}x (20x–100x). Hold ~30min–12h (max 24h)")
         trade_card = " | ".join(card_lines)
 
         return LLMNarrative(
