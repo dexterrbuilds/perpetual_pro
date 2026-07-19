@@ -1,7 +1,7 @@
 # perpetual_pro — crypto perpetuals day-trading / scalping configuration
 
 exchange:
-  default: binanceusdm
+  default: bybit
   api_key: ""
   api_secret: ""
   password: ""

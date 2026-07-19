@@ -197,6 +197,15 @@ def _split_tv_symbol(raw: str) -> tuple:
             "bybit": "bybit",
             "okx": "okx",
             "bitget": "bitget",
+            "mexc": "mexc",
+            "bingx": "bingx",
+            "bitfinex": "bitfinex",
+            "bitmart": "bitmart",
+            "gate": "gate",
+            "gateio": "gateio",
+            "huobi": "huobi",
+            "htx": "htx",
+            "weex": "weex",
             "coinbase": "coinbase",
         }
         exchange = mapping.get(ex, ex)

@@ -165,6 +165,56 @@ def test_analyze_from_image_full_pipeline_mocked(monkeypatch):
     assert result["symbol"]
 
 
+def test_analyze_from_image_prefers_client_hint_exchange(monkeypatch):
+    from src.api import service as svc
+    from src.vision.ocr import OCRResult
+    from src.vision.chart_detect import VisionChartResult
+
+    captured = {}
+
+    class FakeOCR:
+        def __init__(self, *a, **k):
+            pass
+
+        def extract(self, image, dark_theme=None):
+            return OCRResult(raw_text="BTCUSDT 15m", symbol="BTC/USDT:USDT", timeframe="15m", confidence=0.8, prices=[50000.0])
+
+    class FakeVision:
+        def __init__(self, *a, **k):
+            pass
+
+        def analyze(self, image, dark_theme=None):
+            return VisionChartResult(candles_detected=10, trend_guess="up", confidence=0.5, notes=["test"])
+
+    class FakeClient:
+        def __init__(self, exchange_id=None, config=None, exchange_cfg=None):
+            captured["exchange_id"] = exchange_id
+            self.exchange_id = exchange_id
+
+        def close(self):
+            pass
+
+    import pandas as pd
+
+    class DummyMTF:
+        def __init__(self):
+            self.primary = pd.DataFrame()
+
+    monkeypatch.setattr(svc, "OCREngine", FakeOCR)
+    monkeypatch.setattr(svc, "ChartVision", FakeVision)
+    monkeypatch.setattr(svc, "ExchangeClient", FakeClient)
+    monkeypatch.setattr(svc, "fetch_multi_timeframe", lambda *a, **k: DummyMTF())
+    monkeypatch.setattr(svc, "NewsAnalyzer", lambda *a, **k: None)
+
+    svc.analyze_from_image(
+        _fake_chart_png(),
+        request=svc.AnalyzeRequest(symbol="BTC", timeframe="15m", no_news=True, client_hints={"exchange": "mexc"}),
+        config=svc.load_config(),
+    )
+
+    assert captured["exchange_id"] == "mexc"
+
+
 def test_fastapi_analyze_endpoint(monkeypatch):
     fastapi = pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient

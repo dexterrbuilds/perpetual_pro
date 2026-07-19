@@ -197,7 +197,7 @@ async function loadSettingsIntoForm() {
   els.symbol.value = "";
   captureOverrideSymbol = "";
   els.timeframe.value = s.defaultTimeframe || "";
-  els.exchange.value = s.defaultExchange || "binanceusdm";
+  els.exchange.value = s.defaultExchange || "bybit";
   els.higher.value = s.higher || "5m,1h,4h,1d";
   els.noNews.checked = !!s.noNews;
 }
@@ -342,7 +342,8 @@ async function maybeProcessPending() {
   let timeframe = fused.timeframe;
   let exchange = fused.exchange || pending.exchange || els.exchange.value;
 
-  // Reflect detected TF (not sticky symbol from old charts)
+  // Prefer the detected exchange from the page, but keep the configured default as fallback.
+  if (!exchange) exchange = els.exchange.value;
   if (timeframe) els.timeframe.value = timeframe;
   if (exchange && els.exchange) {
     try {

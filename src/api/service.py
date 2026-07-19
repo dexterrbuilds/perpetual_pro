@@ -84,6 +84,7 @@ def analyze_from_image(
     url_hints = parse_chart_url(req.page_url)
     client_ocr = req.client_ocr or {}
     client_vision = req.client_vision or {}
+    client_hints = req.client_hints or {}
 
     # --- Server OCR: Tesseract + EasyOCR (full text) ---
     ocr_engine = OCREngine(config=cfg)
@@ -184,11 +185,19 @@ def analyze_from_image(
     )
     ex_id = (
         req.exchange
+        or (client_hints.get("exchange") if isinstance(client_hints.get("exchange"), str) else None)
+        or (client_hints.get("exchange_hint") if isinstance(client_hints.get("exchange_hint"), str) else None)
         or url_hints.exchange_hint
         or cfg.exchange.default
     )
     if isinstance(ex_id, str):
         ex_id = ex_id.lower()
+    if isinstance(ex_id, str):
+        ex_id = ex_id.replace("-", "").replace("_", "")
+    if isinstance(ex_id, str):
+        from src.data.exchange import EXCHANGE_MAP
+
+        ex_id = EXCHANGE_MAP.get(ex_id, ex_id)
     higher_tfs = _parse_higher(req.higher, cfg)
     sim_capital = (
         req.simulated_capital

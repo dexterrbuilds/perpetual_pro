@@ -106,6 +106,27 @@ export function parseChartUrl(url) {
       };
     }
   }
+  if (host.includes("mexc.")) {
+    return {
+      symbol: "",
+      timeframe: "",
+      exchange: "mexc",
+      source: "mexc_url",
+      raw: "",
+      confidence: 0.7,
+    };
+  }
+  if (host.includes("bingx.") || host.includes("bitfinex.") || host.includes("bitmart.") || host.includes("gate.io") || host.includes("gate.") || host.includes("huobi.") || host.includes("htx.com") || host.includes("weex.")) {
+    const hostExchange = host.includes("bingx") ? "bingx" : host.includes("bitfinex") ? "bitfinex" : host.includes("bitmart") ? "bitmart" : host.includes("gate") || host.includes("gate.io") ? "gate" : host.includes("huobi") || host.includes("htx") ? "htx" : "weex";
+    return {
+      symbol: "",
+      timeframe: "",
+      exchange: hostExchange,
+      source: "exchange_url",
+      raw: "",
+      confidence: 0.7,
+    };
+  }
 
   const gen = path.toUpperCase().match(/\b([A-Z]{2,12})[-_]?USDT\b/);
   if (gen) {
@@ -162,6 +183,15 @@ function parseTradingView(u, path) {
       BYBIT: "bybit",
       OKX: "okx",
       BITGET: "bitget",
+      MEXC: "mexc",
+      BINGX: "bingx",
+      BITFINEX: "bitfinex",
+      BITMART: "bitmart",
+      GATE: "gate",
+      GATEIO: "gate",
+      HUOBI: "htx",
+      HTX: "htx",
+      WEEX: "weex",
     };
     exchange = map[ex] || "";
   }

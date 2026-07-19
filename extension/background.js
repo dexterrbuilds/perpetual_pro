@@ -627,7 +627,7 @@ async function getSettings() {
   } = s;
   return {
     defaultTimeframe: "",
-    defaultExchange: "binanceusdm",
+    defaultExchange: "bybit",
     higher: "5m,1h,4h",
     noNews: false,
     darkTheme: true,

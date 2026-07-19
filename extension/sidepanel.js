@@ -228,6 +228,8 @@ async function claimPending() {
 
     let symbol = fused.symbol;
     let timeframe = fused.timeframe;
+    let exchange = fused.exchange || pending.exchange || "";
+    if (!exchange) exchange = "";
     if (timeframe) els.timeframe.value = timeframe;
     // Clear override field so it never sticks as "old symbol"
     captureOverrideSymbol = "";
@@ -255,7 +257,7 @@ async function claimPending() {
       dataUrl: pending.dataUrl,
       symbol,
       timeframe,
-      exchange: fused.exchange || pending.exchange,
+      exchange,
       pageUrl,
       clientOcr,
       clientVision,

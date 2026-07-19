@@ -19,7 +19,7 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 
 @dataclass
 class ExchangeConfig:
-    default: str = "binanceusdm"
+    default: str = "bybit"
     api_key: str = ""
     api_secret: str = ""
     password: str = ""

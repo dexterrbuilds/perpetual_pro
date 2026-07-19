@@ -33,6 +33,20 @@ def test_bybit_url():
     assert h.exchange_hint == "bybit"
 
 
+def test_tradingview_exchange_aliases():
+    for url, expected in [
+        ("https://www.tradingview.com/chart/?symbol=MEXC:BTCUSDT.P", "mexc"),
+        ("https://www.tradingview.com/chart/?symbol=BINGX:ETHUSDT.P", "bingx"),
+        ("https://www.tradingview.com/chart/?symbol=BITFINEX:SOLUSDT.P", "bitfinex"),
+        ("https://www.tradingview.com/chart/?symbol=BITGET:BTCUSDT.P", "bitget"),
+        ("https://www.tradingview.com/chart/?symbol=GATEIO:BTCUSDT.P", "gateio"),
+        ("https://www.tradingview.com/chart/?symbol=HUOBI:BTCUSDT.P", "huobi"),
+        ("https://www.tradingview.com/chart/?symbol=WEEX:BTCUSDT.P", "weex"),
+    ]:
+        h = parse_chart_url(url)
+        assert h.exchange_hint == expected
+
+
 def test_empty_url():
     h = parse_chart_url("")
     assert h.symbol is None
