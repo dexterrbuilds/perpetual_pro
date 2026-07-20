@@ -344,7 +344,8 @@ def scan_symbols(symbols: List[str], timeframe: str, exchange: str, no_news: boo
     return scan_backend(symbols, request=req, config=cfg)
 
 
-def render_scan_results(payload: Dict[str, Any]) -> None:
+def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") -> None:
+    """Render ranked scan table + detail cards. ``key_prefix`` keeps widget IDs unique."""
     rows = payload.get("ranked_results", [])
     if not rows:
         st.info("No ranked setups returned yet. Try a broader watchlist or a different exchange.")
@@ -374,17 +375,26 @@ def render_scan_results(payload: Dict[str, Any]) -> None:
         f"Display leverage capped at {payload.get('leverage_display_cap', SCAN_LEVERAGE_CAP)}x "
         f"(model may suggest higher). Exchange column shows venue actually used after fallback."
     )
-    st.dataframe(df[cols], use_container_width=True, hide_index=True)
+    st.dataframe(
+        df[cols],
+        use_container_width=True,
+        hide_index=True,
+        key=f"{key_prefix}_results_table",
+    )
 
-    # Expandable detail cards for top results
+    # Expandable detail cards for top results (unique titles avoid expander ID clashes)
     for i, row in enumerate(rows[:5]):
-        title = f"{row.get('symbol', '—')} · {str(row.get('direction', 'flat')).upper()} · lev {row.get('leverage', '—')}x"
+        sym = str(row.get("symbol") or f"row{i}")
+        title = (
+            f"#{i + 1} {sym} · {str(row.get('direction', 'flat')).upper()} · "
+            f"lev {row.get('leverage', '—')}x"
+        )
         with st.expander(title, expanded=(i == 0)):
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Confidence", f"{row.get('confidence', 0):.1f}%")
-            c2.metric("Confluence", f"{row.get('confluence_score', 0):.3f}")
-            c3.metric("Leverage (priority)", f"{row.get('leverage', '—')}x")
-            c4.metric("Exchange", row.get("exchange") or "—")
+            c1.metric(f"Confidence · {sym}", f"{row.get('confidence', 0):.1f}%")
+            c2.metric(f"Confluence · {sym}", f"{row.get('confluence_score', 0):.3f}")
+            c3.metric(f"Leverage (priority) · {sym}", f"{row.get('leverage', '—')}x")
+            c4.metric(f"Exchange · {sym}", row.get("exchange") or "—")
             if row.get("fallback_used"):
                 st.info(
                     f"Fallback used: requested {row.get('exchange_requested')} → {row.get('exchange')}"
@@ -447,6 +457,7 @@ def render_scan_results(payload: Dict[str, Any]) -> None:
             data=build_report_markdown(export_payload),
             file_name="scan_report.md",
             mime="text/markdown",
+            key=f"{key_prefix}_download_scan_report",
         )
 
 
@@ -617,11 +628,13 @@ def render_single_analysis(symbol: str, timeframe: str, exchange: str, no_news: 
             for w in payload["warnings"]:
                 st.write(f"- {w}")
 
+    safe_sym = symbol.replace("/", "_").replace(":", "_") or "symbol"
     st.download_button(
         label="Export full report",
         data=build_report_markdown(payload),
-        file_name=f"{symbol.replace('/', '_')}_report.md",
+        file_name=f"{safe_sym}_report.md",
         mime="text/markdown",
+        key=f"download_single_report_{safe_sym}",
     )
 
 
@@ -635,45 +648,65 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Inputs")
-        symbol = st.text_input("Symbol", value="BTC", placeholder="BTC or BTC/USDT:USDT")
-        timeframe = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h", "4h"], index=2)
+        symbol = st.text_input(
+            "Symbol",
+            value="BTC",
+            placeholder="BTC or BTC/USDT:USDT",
+            key="input_symbol",
+        )
+        timeframe = st.selectbox(
+            "Timeframe",
+            ["1m", "5m", "15m", "1h", "4h"],
+            index=2,
+            key="input_timeframe",
+        )
         try:
             default_ex = load_config().exchange.default or "bybit"
         except Exception:  # noqa: BLE001
             default_ex = "bybit"
         ex_index = EXCHANGE_OPTIONS.index(default_ex) if default_ex in EXCHANGE_OPTIONS else 0
-        exchange = st.selectbox("Preferred exchange", EXCHANGE_OPTIONS, index=ex_index)
+        exchange = st.selectbox(
+            "Preferred exchange",
+            EXCHANGE_OPTIONS,
+            index=ex_index,
+            key="input_exchange",
+        )
         st.caption("If the symbol is missing on the preferred venue, others are tried automatically.")
-        no_news = st.checkbox("Skip news", value=True)
+        no_news = st.checkbox("Skip news", value=True, key="input_no_news")
         st.caption(f"Backend: {BACKEND_URL}")
-        if st.button("Ping backend"):
+        if st.button("Ping backend", key="btn_ping_backend"):
             result = call_backend("/health")
             st.json(result)
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Run single analysis", type="primary"):
-            render_single_analysis(symbol, timeframe, exchange, no_news)
+        run_single = st.button("Run single analysis", type="primary", key="btn_run_single")
     with col2:
         watchlist = st.text_area(
             "Symbols (comma-separated)",
             value=DEFAULT_WATCHLIST,
             height=100,
+            key="input_watchlist",
         )
-        if st.button("Scan watchlist"):
-            symbols = normalize_symbol_list(watchlist)
-            if not symbols:
-                st.warning("Add at least one symbol to scan.")
-            else:
-                with st.spinner(f"Scanning {len(symbols)} symbols…"):
-                    payload = scan_symbols(symbols, timeframe, exchange, no_news)
-                st.session_state["last_scan"] = payload
-                render_scan_results(payload)
+        run_scan = st.button("Scan watchlist", key="btn_scan_watchlist")
+
+    if run_single:
+        render_single_analysis(symbol, timeframe, exchange, no_news)
+
+    if run_scan:
+        symbols = normalize_symbol_list(watchlist)
+        if not symbols:
+            st.warning("Add at least one symbol to scan.")
+        else:
+            with st.spinner(f"Scanning {len(symbols)} symbols…"):
+                payload = scan_symbols(symbols, timeframe, exchange, no_news)
+            st.session_state["last_scan"] = payload
 
     st.divider()
     st.subheader("Ranked signals")
+    # Render scan results only once (from session state) so widget IDs stay unique
     if st.session_state.get("last_scan"):
-        render_scan_results(st.session_state["last_scan"])
+        render_scan_results(st.session_state["last_scan"], key_prefix="scan")
     else:
         st.caption("Run a watchlist scan to populate ranked signals.")
 
