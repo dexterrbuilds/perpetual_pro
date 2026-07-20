@@ -19,6 +19,10 @@ def test_build_report_markdown_contains_key_sections():
         "symbol": "BTC/USDT:USDT",
         "direction": "long",
         "confidence": 81.2,
+        "technical_confidence": 70.0,
+        "llm_confidence": 78.0,
+        "llm_confidence_reason": "Strong MTF alignment with expanding volume.",
+        "rank_score": 74.5,
         "setup_name": "Breakout",
         "exchange": "bybit",
         "display_leverage": 5,
@@ -59,3 +63,6 @@ def test_build_report_markdown_contains_key_sections():
     assert "Simulation example" in report
     assert "$100" in report or "100" in report
     assert "Hold" in report
+    assert "LLM Confidence" in report
+    assert "78" in report
+    assert "Strong MTF alignment" in report

@@ -544,17 +544,24 @@ def scan_symbols(
     request: Optional[AnalyzeRequest] = None,
     config: Optional[AppConfig] = None,
 ) -> Dict[str, Any]:
-    """Run a fast multi-symbol scan and rank setups by confluence score."""
+    """
+    Multi-symbol scan ranked by LLM confidence + technical confluence.
+
+    Flat/neutral setups are excluded from the leaderboard (low priority).
+    """
     req = request or AnalyzeRequest()
     cfg = config or load_config()
     symbol_list = [s.strip() for s in (symbols or []) if s and s.strip()]
     if not symbol_list:
-        return {"ok": False, "error": "no_symbols", "ranked_results": []}
+        return {"ok": False, "error": "no_symbols", "ranked_results": [], "skipped_flat": []}
 
     primary_tf = req.timeframe or cfg.timeframes.primary
     ex_id = _resolve_exchange_id(req.exchange, cfg)
+    # Prefer LLM scoring for ranking; still works via heuristic fallback without keys
+    use_llm = bool(getattr(req, "use_llm", True))
 
     ranked_results: List[Dict[str, Any]] = []
+    skipped_flat: List[Dict[str, Any]] = []
     for symbol in symbol_list[:40]:
         try:
             normalized_symbol = normalize_symbol(symbol)
@@ -591,67 +598,113 @@ def scan_symbols(
                     news=news_bundle,
                     simulated_capital=req.simulated_capital or 100.0,
                     risk_pct=req.risk_pct or 1.0,
-                    use_llm=False,
+                    use_llm=use_llm,
                 )
                 model_lev = getattr(analysis.trade_plan, "leverage_suggested", 0) or 1
                 leverage = _cap_display_leverage(model_lev, SCAN_LEVERAGE_CAP)
-                reason = (analysis.key_reasons[:2] or [analysis.setup_name or ""])[0]
+                llm_reason = (
+                    analysis.llm_confidence_reason
+                    or (analysis.key_reasons[:1] or [analysis.setup_name or ""])[0]
+                )
+                reason = llm_reason
                 primary = (
                     analysis.trade_plan.to_primary_setup() if analysis.trade_plan else None
                 )
-                ranked_results.append(
-                    {
-                        "symbol": normalized_symbol,
-                        "exchange": fetch.exchange_used,
-                        "exchange_requested": fetch.requested_exchange,
-                        "fallback_used": fetch.fallback_used,
-                        "primary_tf": primary_tf,
-                        "direction": analysis.direction,
+                row = {
+                    "symbol": normalized_symbol,
+                    "exchange": fetch.exchange_used,
+                    "exchange_requested": fetch.requested_exchange,
+                    "fallback_used": fetch.fallback_used,
+                    "primary_tf": primary_tf,
+                    "direction": analysis.direction,
+                    "bias": analysis.bias,
+                    "confidence": round(float(analysis.confidence), 1),
+                    "technical_confidence": round(float(analysis.technical_confidence), 1),
+                    "llm_confidence": round(float(analysis.llm_confidence), 1),
+                    "llm_confidence_reason": analysis.llm_confidence_reason,
+                    "rank_score": round(float(analysis.rank_score), 2),
+                    "confluence_score": round(float(analysis.confluence_total), 3),
+                    "setup_name": analysis.setup_name,
+                    "leverage": leverage,
+                    "model_leverage": int(round(float(model_lev))),
+                    "reason": reason,
+                    "price": analysis.meta.get("price") if analysis.meta else None,
+                    "support": analysis.key_levels[0].get("mid") if analysis.key_levels else None,
+                    "resistance": analysis.key_levels[1].get("mid") if len(analysis.key_levels) > 1 else None,
+                    "entry_low": getattr(analysis.trade_plan, "entry_low", None) if analysis.trade_plan else None,
+                    "entry_high": getattr(analysis.trade_plan, "entry_high", None) if analysis.trade_plan else None,
+                    "stop_loss": getattr(analysis.trade_plan, "stop_loss", None) if analysis.trade_plan else None,
+                    "hold_label": getattr(analysis.trade_plan, "hold_label", "") if analysis.trade_plan else "",
+                    "payload": {
                         "bias": analysis.bias,
-                        "confidence": round(float(analysis.confidence), 1),
-                        "confluence_score": round(float(analysis.confluence_total), 3),
+                        "direction": analysis.direction,
+                        "confidence": analysis.confidence,
+                        "technical_confidence": analysis.technical_confidence,
+                        "llm_confidence": analysis.llm_confidence,
+                        "llm_confidence_reason": analysis.llm_confidence_reason,
+                        "rank_score": analysis.rank_score,
                         "setup_name": analysis.setup_name,
-                        "leverage": leverage,
-                        "model_leverage": int(round(float(model_lev))),
-                        "reason": reason,
-                        "price": analysis.meta.get("price") if analysis.meta else None,
-                        "support": analysis.key_levels[0].get("mid") if analysis.key_levels else None,
-                        "resistance": analysis.key_levels[1].get("mid") if len(analysis.key_levels) > 1 else None,
-                        "entry_low": getattr(analysis.trade_plan, "entry_low", None) if analysis.trade_plan else None,
-                        "entry_high": getattr(analysis.trade_plan, "entry_high", None) if analysis.trade_plan else None,
-                        "stop_loss": getattr(analysis.trade_plan, "stop_loss", None) if analysis.trade_plan else None,
-                        "hold_label": getattr(analysis.trade_plan, "hold_label", "") if analysis.trade_plan else "",
-                        "payload": {
-                            "bias": analysis.bias,
+                        "confluence_total": analysis.confluence_total,
+                        "key_levels": analysis.key_levels[:4],
+                        "key_reasons": analysis.key_reasons[:3],
+                        "trade_plan": primary,
+                        "primary_setup": primary,
+                        "position_simulation": (
+                            analysis.trade_plan.to_position_simulation()
+                            if analysis.trade_plan
+                            else None
+                        ),
+                    },
+                }
+
+                direction = (analysis.direction or "flat").lower()
+                if direction not in ("long", "short"):
+                    # Flat / neutral: do not rank on the leaderboard
+                    skipped_flat.append(
+                        {
+                            "symbol": normalized_symbol,
                             "direction": analysis.direction,
-                            "confidence": analysis.confidence,
-                            "setup_name": analysis.setup_name,
-                            "confluence_total": analysis.confluence_total,
-                            "key_levels": analysis.key_levels[:4],
-                            "key_reasons": analysis.key_reasons[:3],
-                            "trade_plan": primary,
-                            "primary_setup": primary,
-                            "position_simulation": (
-                                analysis.trade_plan.to_position_simulation()
-                                if analysis.trade_plan
-                                else None
-                            ),
-                        },
-                    }
-                )
+                            "bias": analysis.bias,
+                            "llm_confidence": row["llm_confidence"],
+                            "technical_confidence": row["technical_confidence"],
+                            "confluence_score": row["confluence_score"],
+                            "reason": analysis.llm_confidence_reason
+                            or "Flat/neutral — not ranked",
+                        }
+                    )
+                    logger.info(
+                        "Scan deprioritize {}: direction={} llm={:.0f}%",
+                        normalized_symbol,
+                        analysis.direction,
+                        analysis.llm_confidence,
+                    )
+                    continue
+
+                ranked_results.append(row)
             finally:
                 client.close()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Scan failed for {}: {}", symbol, exc)
 
-    ranked_results.sort(key=lambda item: item["confluence_score"], reverse=True)
+    # Rank directional only: LLM confidence primary, then rank_score, then confluence
+    ranked_results.sort(
+        key=lambda item: (
+            float(item.get("rank_score") or 0),
+            float(item.get("llm_confidence") or 0),
+            abs(float(item.get("confluence_score") or 0)),
+        ),
+        reverse=True,
+    )
     return {
         "ok": True,
         "ranked_results": ranked_results[:10],
+        "skipped_flat": skipped_flat[:20],
         "count": len(ranked_results),
+        "flat_count": len(skipped_flat),
         "timeframe": primary_tf,
         "exchange": ex_id,
         "leverage_display_cap": SCAN_LEVERAGE_CAP,
+        "ranking": "llm_confidence + technical confluence (flat excluded)",
     }
 
 

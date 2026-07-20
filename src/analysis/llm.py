@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from loguru import logger
@@ -29,6 +29,9 @@ class LLMNarrative:
     leverage_reasoning: str = ""
     funding_impact: str = ""
     volume_confidence: float = 0.0
+    # Play-out likelihood for the proposed signal (0–100)
+    llm_confidence: float = 0.0
+    confidence_reason: str = ""
 
     # Reasons / risks / scenarios
     key_reasons: List[str] = field(default_factory=list)
@@ -102,10 +105,15 @@ class NarrativeLLM:
             "Leverage should be aggressive but responsible (20x–100x); avoid extreme >150x except in rare, very high conviction micro-scalps. "
             "Signal styles: short-term momentum, breakout retests, mean reversion, and intraday structure. "
             "Entries must be tight zones with clear invalidation; include alternative entries on retests. "
+            "CRITICAL: Score llm_confidence (0-100) as how likely THIS directional signal will play out "
+            "over the suggested hold window. Flat/no-trade → llm_confidence ≤ 25. "
+            "Do not inflate confidence; be skeptical of weak confluence or conflicting factors. "
             "Respond with ONLY valid JSON (no markdown) matching the schema below. Be concise, professional, non-hype, and risk-aware. Not financial advice.\n\n"
             "JSON_SCHEMA:\n"
             "{\n"
             '  "direction": "long|short|flat",\n'
+            '  "llm_confidence": <0-100 integer>,  /* play-out likelihood for this signal */\n'
+            '  "confidence_reason": "one short sentence justifying llm_confidence",\n'
             '  "signal_narrative": "3-5 concise sentences explaining the trade",\n'
             '  "entry_zones": [{"low": <num>, "high": <num>, "note": "tight|retention"}],\n'
             '  "alternative_entries": [{"low": <num>, "high": <num>, "note": "retest/alt"}],\n'
@@ -202,10 +210,29 @@ class NarrativeLLM:
         alt_z = parsed.get("alternative_entries") or []
         stop = parsed.get("stop_loss") or {}
         tps = parsed.get("tps") or []
+        llm_conf = _clamp_confidence(
+            parsed.get("llm_confidence")
+            if parsed.get("llm_confidence") is not None
+            else parsed.get("confidence")
+        )
+        conf_reason = str(
+            parsed.get("confidence_reason")
+            or parsed.get("llm_confidence_reason")
+            or ""
+        ).strip()
+        if not conf_reason and llm_conf is not None:
+            conf_reason = f"Model play-out score {llm_conf:.0f}% for proposed direction."
+
+        direction = str(parsed.get("direction") or "").strip().lower()
+        # Flat / no-trade should not look high-conviction
+        if direction in ("flat", "neutral", "none", "") and llm_conf is not None and llm_conf > 35:
+            llm_conf = min(llm_conf, 25.0)
+            if "flat" not in conf_reason.lower() and "no trade" not in conf_reason.lower():
+                conf_reason = (conf_reason + " " if conf_reason else "") + "Capped: flat / no-trade setup."
 
         return LLMNarrative(
             signal_narrative=str(parsed.get("signal_narrative") or ""),
-            direction=str(parsed.get("direction") or ""),
+            direction=direction,
             entry_zones=[{
                 "low": _safe_num(e.get("low"), None) if isinstance(e, dict) else None,
                 "high": _safe_num(e.get("high"), None) if isinstance(e, dict) else None,
@@ -232,6 +259,8 @@ class NarrativeLLM:
             leverage_reasoning=str(parsed.get("leverage_reasoning") or ""),
             funding_impact=str(parsed.get("funding_impact") or ""),
             volume_confidence=_safe_num(parsed.get("volume_confidence"), 0.0) or 0.0,
+            llm_confidence=float(llm_conf if llm_conf is not None else 0.0),
+            confidence_reason=conf_reason[:280],
             key_reasons=[str(x) for x in (parsed.get("key_reasons") or [])][:8],
             key_risks=[str(x) for x in (parsed.get("key_risks") or [])][:8],
             scenarios={
@@ -247,14 +276,24 @@ class NarrativeLLM:
 
     def _fallback(self, ctx: Dict[str, Any], provider: str = "local_fallback") -> LLMNarrative:
         bias = ctx.get("bias", "neutral")
-        conf = ctx.get("confidence", 0)
+        conf = float(ctx.get("confidence") or 0)
         setup = ctx.get("setup_name", "Setup")
         lev = float(ctx.get("leverage_suggested") or 20)
         atr_pct = float(ctx.get("atr_pct") or 0)
         funding = ctx.get("funding_rate_pct")
         factors = ctx.get("top_factors") or []
-        direction = ctx.get("direction", "flat")
+        direction = str(ctx.get("direction") or "flat").lower()
         price = ctx.get("price") or None
+        confluence = float(ctx.get("confluence_total") or 0)
+
+        # Heuristic play-out score when Groq/Gemini unavailable
+        llm_conf, conf_reason = heuristic_llm_confidence(
+            direction=direction,
+            technical_confidence=conf,
+            confluence_total=confluence,
+            atr_pct=atr_pct,
+            funding_rate_pct=float(funding) if funding is not None else None,
+        )
 
         # Build compact reasons from top factors
         reasons = []
@@ -345,6 +384,8 @@ class NarrativeLLM:
             leverage_reasoning=lev_reason,
             funding_impact=(f"Funding {funding}%" if funding is not None else "n/a"),
             volume_confidence=float(ctx.get("volume_confidence") or 0.0),
+            llm_confidence=llm_conf,
+            confidence_reason=conf_reason,
             key_reasons=reasons,
             key_risks=risks,
             scenarios=scenarios,
@@ -354,3 +395,87 @@ class NarrativeLLM:
             error="No LLM keys or provider failed — used local narrative engine.",
             trade_card=trade_card,
         )
+
+
+def _clamp_confidence(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        conf = float(value)
+    except (TypeError, ValueError):
+        return None
+    # Allow 0–1 fraction inputs
+    if 0.0 <= conf <= 1.0:
+        conf *= 100.0
+    return max(0.0, min(100.0, conf))
+
+
+def heuristic_llm_confidence(
+    *,
+    direction: str,
+    technical_confidence: float,
+    confluence_total: float = 0.0,
+    atr_pct: float = 0.0,
+    funding_rate_pct: Optional[float] = None,
+) -> Tuple[float, str]:
+    """
+    Deterministic play-out score when remote LLM is unavailable.
+
+    Returns (llm_confidence 0–100, short reason).
+    """
+    direction = (direction or "flat").lower()
+    tech = max(0.0, min(100.0, float(technical_confidence or 0.0)))
+    conf_mag = abs(float(confluence_total or 0.0))  # 0..1
+    conf_score = conf_mag * 100.0
+
+    if direction in ("flat", "neutral", ""):
+        score = min(25.0, tech * 0.35 + conf_score * 0.15)
+        reason = (
+            f"Flat/neutral bias — low play-out priority "
+            f"(tech {tech:.0f}%, confluence {confluence_total:+.3f})."
+        )
+        return round(score, 1), reason
+
+    # Directional: blend technical confidence with |confluence|
+    score = 0.55 * tech + 0.45 * conf_score
+
+    # Soft penalties
+    if atr_pct and atr_pct > 3.5:
+        score *= 0.9
+    if funding_rate_pct is not None:
+        fr = float(funding_rate_pct)
+        # Funding against long (positive) or against short (negative)
+        if direction == "long" and fr > 0.05:
+            score *= 0.92
+        elif direction == "short" and fr < -0.05:
+            score *= 0.92
+
+    score = max(15.0, min(92.0, score))
+    reason = (
+        f"Heuristic play-out from technical {tech:.0f}% and "
+        f"|confluence| {conf_mag:.3f} for {direction.upper()}."
+    )
+    return round(score, 1), reason
+
+
+def combined_rank_score(
+    *,
+    direction: str,
+    llm_confidence: float,
+    technical_confidence: float,
+    confluence_total: float = 0.0,
+) -> float:
+    """
+    Rank score for directional setups only.
+
+    Flat/neutral → 0 (excluded from leaderboard).
+    Else: 60% LLM confidence + 40% technical (conf + |confluence|).
+    """
+    direction = (direction or "flat").lower()
+    if direction not in ("long", "short"):
+        return 0.0
+    llm_c = max(0.0, min(100.0, float(llm_confidence or 0.0)))
+    tech_c = max(0.0, min(100.0, float(technical_confidence or 0.0)))
+    conf_boost = abs(float(confluence_total or 0.0)) * 100.0
+    technical_blend = 0.7 * tech_c + 0.3 * conf_boost
+    return round(0.6 * llm_c + 0.4 * technical_blend, 3)

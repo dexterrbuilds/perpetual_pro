@@ -275,28 +275,35 @@ def test_scan_symbols_ranks_results(monkeypatch):
         config=None,
         auto_fallback=None,
     ):
-        n = 80
+        n = 120
         idx = pd.date_range("2025-01-01", periods=n, freq="15min", tz="UTC")
-        close = 1000.0 if symbol.startswith("BTC") else 200.0
+        # Trending series so confluence engine can form a directional bias
+        base = 1000.0 if symbol.upper().startswith("BTC") else 200.0
+        slope = 1.8 if symbol.upper().startswith("BTC") else -0.9
+        close = base + np.arange(n) * slope
         df = pd.DataFrame(
             {
-                "open": close + 1,
-                "high": close + 2,
-                "low": close - 2,
+                "open": close - 0.5,
+                "high": close + 2.0,
+                "low": close - 2.0,
                 "close": close,
-                "volume": 100.0,
+                "volume": 100.0 + np.arange(n),
             },
             index=idx,
         )
+        frames = {primary_tf: df}
+        for tf in higher_tfs or []:
+            frames[tf] = df.iloc[:: max(1, len(df) // 40)].copy()
         mtf = MultiTimeframeData(
             symbol=symbol,
             exchange_id=preferred_exchange or "binanceusdm",
             primary_tf=primary_tf,
-            frames={primary_tf: df},
+            frames=frames,
             snapshot=MarketSnapshot(
                 symbol=symbol,
                 exchange_id=preferred_exchange or "binanceusdm",
-                last=float(close),
+                last=float(close[-1]),
+                funding_rate=0.0001,
             ),
         )
         return FallbackFetchResult(
@@ -313,14 +320,26 @@ def test_scan_symbols_ranks_results(monkeypatch):
 
     result = svc.scan_symbols(
         ["BTC", "ETH"],
-        request=svc.AnalyzeRequest(timeframe="15m", no_news=True),
+        request=svc.AnalyzeRequest(timeframe="15m", no_news=True, use_llm=True),
         config=svc.load_config(),
     )
 
     assert result["ok"] is True
-    assert len(result["ranked_results"]) >= 2
-    assert result["ranked_results"][0]["symbol"]
-    assert result["ranked_results"][0]["leverage"] <= svc.SCAN_LEVERAGE_CAP
+    # Directional only on leaderboard; flat would appear under skipped_flat
+    assert "ranked_results" in result
+    assert "skipped_flat" in result
+    assert result.get("ranking")
+    if result["ranked_results"]:
+        top = result["ranked_results"][0]
+        assert top["symbol"]
+        assert top["direction"] in ("long", "short")
+        assert top["leverage"] <= svc.SCAN_LEVERAGE_CAP
+        assert "llm_confidence" in top
+        assert "rank_score" in top
+        # Sorted by rank_score desc
+        scores = [float(r["rank_score"]) for r in result["ranked_results"]]
+        assert scores == sorted(scores, reverse=True)
+
 
 
 

@@ -242,6 +242,10 @@ class ReportGenerator:
                 "bias": analysis.bias,
                 "direction": analysis.direction,
                 "confidence_pct": analysis.confidence,
+                "technical_confidence": getattr(analysis, "technical_confidence", analysis.confidence),
+                "llm_confidence": getattr(analysis, "llm_confidence", 0.0),
+                "llm_confidence_reason": getattr(analysis, "llm_confidence_reason", ""),
+                "rank_score": getattr(analysis, "rank_score", 0.0),
                 "setup_name": analysis.setup_name,
                 "strategy_tags": analysis.strategy_tags,
                 "confluence_score": analysis.confluence_total,
@@ -249,6 +253,10 @@ class ReportGenerator:
             "bias": analysis.bias,
             "direction": analysis.direction,
             "confidence": analysis.confidence,
+            "technical_confidence": getattr(analysis, "technical_confidence", analysis.confidence),
+            "llm_confidence": getattr(analysis, "llm_confidence", 0.0),
+            "llm_confidence_reason": getattr(analysis, "llm_confidence_reason", ""),
+            "rank_score": getattr(analysis, "rank_score", 0.0),
             "setup_name": analysis.setup_name,
             "strategy_tags": analysis.strategy_tags,
             "confluence_total": analysis.confluence_total,
@@ -318,12 +326,22 @@ class ReportGenerator:
             llm = analysis.llm
             data["llm_narrative"] = {
                 "signal_narrative": llm.signal_narrative,
+                "llm_confidence": getattr(llm, "llm_confidence", analysis.llm_confidence),
+                "confidence_reason": getattr(llm, "confidence_reason", analysis.llm_confidence_reason),
                 "leverage_reasoning": llm.leverage_reasoning,
                 "key_reasons": llm.key_reasons,
                 "key_risks": llm.key_risks,
                 "scenarios": llm.scenarios,
                 "provider": llm.provider,
                 "model": llm.model,
+            }
+        else:
+            # Still surface LLM confidence fields even when narrative object missing
+            data["llm_narrative"] = {
+                "llm_confidence": getattr(analysis, "llm_confidence", 0.0),
+                "confidence_reason": getattr(analysis, "llm_confidence_reason", ""),
+                "provider": "heuristic" if getattr(analysis, "llm_confidence", 0) else "none",
+                "model": "",
             }
         if analysis.patterns:
             data["patterns"] = [
@@ -406,6 +424,10 @@ class ReportGenerator:
             f"- **Exchange:** {analysis.exchange_id}",
             f"- **Timeframe:** {analysis.primary_tf}",
             f"- **Bias:** {analysis.bias.upper()} ({analysis.confidence:.1f}% confidence)",
+            f"- **LLM Confidence:** {getattr(analysis, 'llm_confidence', 0):.0f}%",
+            f"- **LLM reason:** {getattr(analysis, 'llm_confidence_reason', '') or '—'}",
+            f"- **Technical confidence:** {getattr(analysis, 'technical_confidence', analysis.confidence):.1f}%",
+            f"- **Rank score:** {getattr(analysis, 'rank_score', 0):.1f}",
             f"- **Setup:** {analysis.setup_name}",
             f"- **Tags:** {', '.join(analysis.strategy_tags)}",
             f"- **Confluence:** {analysis.confluence_total:+.3f}",

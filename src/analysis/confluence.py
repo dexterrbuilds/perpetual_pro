@@ -10,7 +10,12 @@ import pandas as pd
 from loguru import logger
 
 from src.analysis.indicators import IndicatorSuite, compute_indicators
-from src.analysis.llm import LLMNarrative, NarrativeLLM
+from src.analysis.llm import (
+    LLMNarrative,
+    NarrativeLLM,
+    combined_rank_score,
+    heuristic_llm_confidence,
+)
 from src.analysis.market_structure import MarketStructureAnalyzer, StructureReport
 from src.analysis.patterns import PatternDetector, PatternReport
 from src.analysis.risk import RiskManager, ScenarioSet, TradePlan
@@ -43,7 +48,11 @@ class FullAnalysis:
     # Core outputs
     bias: str = "neutral"  # bullish | bearish | neutral
     direction: str = "flat"  # long | short | flat
-    confidence: float = 0.0  # 0-100
+    confidence: float = 0.0  # 0-100 (technical, pre-LLM blend)
+    technical_confidence: float = 0.0  # pure technical score
+    llm_confidence: float = 0.0  # 0-100 play-out likelihood from LLM
+    llm_confidence_reason: str = ""
+    rank_score: float = 0.0  # combined LLM + technical ranking score
     setup_name: str = ""
     strategy_tags: List[str] = field(default_factory=list)
 
@@ -216,6 +225,7 @@ class ConfluenceEngine:
         )
         result.bias = bias
         result.direction = direction
+        result.technical_confidence = conf
         result.confidence = conf
 
         # Strategy tags (prop-style playbook)
@@ -253,7 +263,9 @@ class ConfluenceEngine:
         result.key_reasons = self._key_reasons(result, ind, struct, pat)
         result.key_risks = self._key_risks(result, atr, price, funding)
 
-        # LLM narrative (Groq / Gemini / local fallback)
+        funding_pct = (funding * 100.0) if funding is not None else None
+
+        # LLM narrative (Groq / Gemini / local fallback) — includes play-out confidence
         if use_llm:
             try:
                 llm_ctx = {
@@ -263,6 +275,7 @@ class ConfluenceEngine:
                     "bias": bias,
                     "direction": direction,
                     "confidence": conf,
+                    "price": price,
                     "setup_name": result.setup_name,
                     "confluence_total": result.confluence_total,
                     "top_factors": result.factor_breakdown(),
@@ -273,7 +286,7 @@ class ConfluenceEngine:
                     "leverage_suggested": plan.leverage_suggested,
                     "leverage_engine": plan.leverage_reasoning,
                     "atr_pct": plan.atr_pct,
-                    "funding_rate_pct": (funding * 100.0) if funding is not None else None,
+                    "funding_rate_pct": funding_pct,
                     "primary_setup": plan.to_primary_setup(),
                     "position_simulation": plan.to_position_simulation(),
                 }
@@ -299,11 +312,56 @@ class ConfluenceEngine:
                     plan.leverage_reasoning = (
                         f"{plan.leverage_reasoning} LLM: {narrative.leverage_reasoning}"
                     )
+                # LLM play-out confidence
+                result.llm_confidence = float(narrative.llm_confidence or 0.0)
+                result.llm_confidence_reason = (narrative.confidence_reason or "").strip()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LLM narrative layer failed: {}", exc)
                 result.trader_commentary = self._commentary(result)
+                result.llm_confidence, result.llm_confidence_reason = heuristic_llm_confidence(
+                    direction=direction,
+                    technical_confidence=conf,
+                    confluence_total=result.confluence_total,
+                    atr_pct=plan.atr_pct,
+                    funding_rate_pct=funding_pct,
+                )
         else:
             result.trader_commentary = self._commentary(result)
+            result.llm_confidence, result.llm_confidence_reason = heuristic_llm_confidence(
+                direction=direction,
+                technical_confidence=conf,
+                confluence_total=result.confluence_total,
+                atr_pct=plan.atr_pct,
+                funding_rate_pct=funding_pct,
+            )
+
+        if not result.llm_confidence_reason:
+            result.llm_confidence_reason = (
+                f"Play-out score {result.llm_confidence:.0f}% for {direction}."
+            )
+
+        # Flat/neutral: keep low priority; directional: blend display confidence
+        if direction in ("long", "short"):
+            if result.llm_confidence > 0:
+                # Primary confidence leans on LLM play-out, anchored by technical
+                result.confidence = float(
+                    clamp(
+                        0.55 * result.llm_confidence + 0.45 * conf,
+                        self.config.analysis.min_confidence,
+                        self.config.analysis.max_confidence,
+                    )
+                )
+        else:
+            # Do not present flat setups as high-confidence trades
+            result.llm_confidence = min(float(result.llm_confidence or 0.0), 25.0)
+            result.confidence = min(conf, 30.0)
+
+        result.rank_score = combined_rank_score(
+            direction=direction,
+            llm_confidence=result.llm_confidence,
+            technical_confidence=result.technical_confidence,
+            confluence_total=result.confluence_total,
+        )
 
         result.meta = {
             "price": price,
@@ -322,13 +380,19 @@ class ConfluenceEngine:
             "long_short_ratio": mtf.snapshot.long_short_ratio if mtf.snapshot else None,
             "simulated_capital": plan.simulated_capital,
             "is_simulation": True,
+            "technical_confidence": result.technical_confidence,
+            "llm_confidence": result.llm_confidence,
+            "llm_confidence_reason": result.llm_confidence_reason,
+            "rank_score": result.rank_score,
         }
         logger.info(
-            "Analysis {} {} bias={} conf={:.1f}% score={:.3f} lev={:.1f}x",
+            "Analysis {} {} bias={} tech={:.1f}% llm={:.1f}% rank={:.1f} score={:.3f} lev={:.1f}x",
             result.symbol,
             result.primary_tf,
             result.bias,
-            result.confidence,
+            result.technical_confidence,
+            result.llm_confidence,
+            result.rank_score,
             result.confluence_total,
             plan.leverage_suggested,
         )

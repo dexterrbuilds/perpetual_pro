@@ -219,11 +219,31 @@ def build_report_markdown(payload: Dict[str, Any]) -> str:
             return "—"
         return format_price(_safe_float(v), ref if ref else None)
 
+    llm_conf = payload.get("llm_confidence")
+    if llm_conf is None and isinstance(payload.get("signal"), dict):
+        llm_conf = payload["signal"].get("llm_confidence")
+    llm_reason = (
+        payload.get("llm_confidence_reason")
+        or (payload.get("llm_narrative") or {}).get("confidence_reason")
+        or (payload.get("signal") or {}).get("llm_confidence_reason")
+        or ""
+    )
+    tech_conf = payload.get("technical_confidence")
+    if tech_conf is None and isinstance(payload.get("signal"), dict):
+        tech_conf = payload["signal"].get("technical_confidence")
+    rank_score = payload.get("rank_score")
+    if rank_score is None and isinstance(payload.get("signal"), dict):
+        rank_score = payload["signal"].get("rank_score")
+
     lines = [
         f"# {symbol}",
         "",
         f"- **Direction:** {str(direction).upper()}",
         f"- **Confidence:** {confidence}",
+        f"- **LLM Confidence:** {llm_conf if llm_conf is not None else '—'}%",
+        f"- **LLM reason:** {llm_reason or '—'}",
+        f"- **Technical confidence:** {tech_conf if tech_conf is not None else '—'}",
+        f"- **Rank score:** {rank_score if rank_score is not None else '—'}",
         f"- **Setup:** {setup}",
         f"- **Confluence:** {score}",
         f"- **Exchange used:** {exchange}",
@@ -321,7 +341,7 @@ def analyze_symbol(symbol: str, timeframe: str, exchange: str, no_news: bool) ->
         no_news=no_news,
         simulated_capital=SIM_BASE_USD,
         risk_pct=1.0,
-        use_llm=False,
+        use_llm=True,
     )
     cfg = load_config()
     return analyze_market_data(symbol, request=req, config=cfg)
@@ -337,6 +357,7 @@ def scan_symbols(symbols: List[str], timeframe: str, exchange: str, no_news: boo
         no_news=no_news,
         simulated_capital=SIM_BASE_USD,
         risk_pct=1.0,
+        use_llm=True,
     )
     cfg = load_config()
     return scan_backend(symbols, request=req, config=cfg)
@@ -354,7 +375,10 @@ def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") ->
         for c in [
             "symbol",
             "direction",
+            "llm_confidence",
+            "rank_score",
             "confidence",
+            "technical_confidence",
             "confluence_score",
             "setup_name",
             "leverage",
@@ -370,8 +394,15 @@ def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") ->
     ]
     df = pd.DataFrame(rows)
     st.caption(
-        f"Display leverage capped at {payload.get('leverage_display_cap', SCAN_LEVERAGE_CAP)}x "
-        f"(model may suggest higher). Exchange column shows venue actually used after fallback."
+        f"Ranked by LLM confidence + technical confluence "
+        f"({payload.get('ranking') or 'directional only'}). "
+        f"Flat/neutral excluded"
+        + (
+            f" ({payload.get('flat_count', 0)} skipped)."
+            if payload.get("flat_count")
+            else "."
+        )
+        + f" Display leverage capped at {payload.get('leverage_display_cap', SCAN_LEVERAGE_CAP)}x."
     )
     st.dataframe(
         df[cols],
@@ -380,21 +411,34 @@ def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") ->
         key=f"{key_prefix}_results_table",
     )
 
+    skipped = payload.get("skipped_flat") or []
+    if skipped:
+        with st.expander(f"Skipped flat/neutral ({len(skipped)})", expanded=False):
+            st.dataframe(pd.DataFrame(skipped), use_container_width=True, hide_index=True)
+
     # Expandable detail cards for top results (unique titles avoid expander ID clashes)
     for i, row in enumerate(rows[:5]):
         sym = str(row.get("symbol") or f"row{i}")
+        llm_c = row.get("llm_confidence")
         title = (
             f"#{i + 1} {sym} · {str(row.get('direction', 'flat')).upper()} · "
-            f"lev {row.get('leverage', '—')}x"
+            f"LLM {llm_c if llm_c is not None else '—'}% · lev {row.get('leverage', '—')}x"
         )
         with st.expander(title, expanded=(i == 0)):
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric(f"Confidence · {sym}", f"{row.get('confidence', 0):.1f}%")
-            c2.metric(f"Confluence · {sym}", f"{row.get('confluence_score', 0):.3f}")
-            c3.metric(f"Leverage (priority) · {sym}", f"{row.get('leverage', '—')}x")
-            c4.metric(f"Exchange · {sym}", row.get("exchange") or "—")
+            c1.metric(
+                f"LLM Confidence · {sym}",
+                f"{_safe_float(llm_c):.0f}%" if llm_c is not None else "—",
+            )
+            c2.metric(f"Rank score · {sym}", f"{_safe_float(row.get('rank_score')):.1f}")
+            c3.metric(f"Confluence · {sym}", f"{row.get('confluence_score', 0):.3f}")
+            c4.metric(f"Leverage (priority) · {sym}", f"{row.get('leverage', '—')}x")
+            if row.get("llm_confidence_reason"):
+                st.info(f"**LLM Confidence:** {_safe_float(llm_c):.0f}% — {row['llm_confidence_reason']}")
+            elif row.get("reason"):
+                st.caption(f"Why: {row['reason']}")
             if row.get("fallback_used"):
-                st.info(
+                st.caption(
                     f"Fallback used: requested {row.get('exchange_requested')} → {row.get('exchange')}"
                 )
             plan = (row.get("payload") or {}).get("trade_plan") or {}
@@ -414,14 +458,16 @@ def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") ->
                         tp_bits.append(f"TP{n}: {tp}{rr_s}")
                 if tp_bits:
                     st.write(" · ".join(tp_bits))
-            if row.get("reason"):
-                st.caption(f"Why: {row['reason']}")
 
     if rows:
         export_payload = {
             "symbol": rows[0].get("symbol"),
             "direction": rows[0].get("direction"),
             "confidence": rows[0].get("confidence"),
+            "technical_confidence": rows[0].get("technical_confidence"),
+            "llm_confidence": rows[0].get("llm_confidence"),
+            "llm_confidence_reason": rows[0].get("llm_confidence_reason"),
+            "rank_score": rows[0].get("rank_score"),
             "setup_name": rows[0].get("setup_name"),
             "confluence_total": rows[0].get("confluence_score"),
             "exchange": rows[0].get("exchange"),
@@ -581,13 +627,41 @@ def render_single_analysis(symbol: str, timeframe: str, exchange: str, no_news: 
 
     h1, h2, h3, h4 = st.columns(4)
     h1.metric("Bias", str(payload.get("bias") or payload.get("direction") or "flat").upper())
-    h2.metric("Confidence", f"{_safe_float(payload.get('confidence')):.1f}%")
+    llm_c = payload.get("llm_confidence")
+    if llm_c is None:
+        llm_c = (payload.get("signal") or {}).get("llm_confidence")
+    h2.metric(
+        "LLM Confidence",
+        f"{_safe_float(llm_c):.0f}%" if llm_c is not None else "—",
+    )
     h3.metric("Setup", payload.get("setup_name") or "—")
     h4.metric("Exchange", payload.get("exchange") or exchange)
 
+    llm_reason = (
+        payload.get("llm_confidence_reason")
+        or (payload.get("llm_narrative") or {}).get("confidence_reason")
+        or ""
+    )
+    if llm_c is not None or llm_reason:
+        st.info(
+            f"**LLM Confidence: {_safe_float(llm_c):.0f}%**"
+            + (f" — {llm_reason}" if llm_reason else "")
+        )
+
     conf_total = payload.get("confluence_total")
+    tech_c = payload.get("technical_confidence")
+    rank_s = payload.get("rank_score")
+    meta_bits = []
     if conf_total is not None:
-        st.caption(f"Confluence score: {float(conf_total):+.3f}")
+        meta_bits.append(f"Confluence {float(conf_total):+.3f}")
+    if tech_c is not None:
+        meta_bits.append(f"Technical conf {_safe_float(tech_c):.1f}%")
+    if rank_s is not None:
+        meta_bits.append(f"Rank score {_safe_float(rank_s):.1f}")
+    if payload.get("confidence") is not None:
+        meta_bits.append(f"Blended conf {_safe_float(payload.get('confidence')):.1f}%")
+    if meta_bits:
+        st.caption(" · ".join(meta_bits))
 
     render_trade_setup_card(payload)
     st.divider()
