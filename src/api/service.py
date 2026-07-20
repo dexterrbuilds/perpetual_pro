@@ -16,8 +16,8 @@ from PIL import Image
 
 from src.analysis.confluence import ConfluenceEngine, FullAnalysis
 from src.analysis.risk import RiskManager
-from src.data.exchange import ExchangeClient
-from src.data.multi_tf import fetch_multi_timeframe
+from src.data.exchange import EXCHANGE_MAP, normalize_exchange_id
+from src.data.multi_tf import fetch_multi_timeframe_with_fallback
 from src.data.news import NewsAnalyzer
 from src.report.generator import ReportGenerator
 from src.utils.config import AppConfig, load_config
@@ -25,6 +25,9 @@ from src.utils.helpers import normalize_symbol
 from src.vision.chart_detect import ChartVision
 from src.vision.ocr import OCREngine
 from src.vision.url_symbol import parse_chart_url
+
+# Web / scan UI prioritizes conservative display leverage (model may suggest higher)
+SCAN_LEVERAGE_CAP = 5
 
 
 @dataclass
@@ -54,6 +57,36 @@ def _parse_higher(higher: Optional[Union[str, List[str]]], config: AppConfig) ->
     if isinstance(higher, str):
         return [x.strip() for x in higher.split(",") if x.strip()]
     return list(higher)
+
+
+def _resolve_exchange_id(
+    raw: Optional[str],
+    config: AppConfig,
+    extra_hints: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Normalize exchange id from request / hints / config default."""
+    ex_id: Optional[str] = raw
+    hints = extra_hints or {}
+    if not ex_id:
+        for key in ("exchange", "exchange_hint"):
+            val = hints.get(key)
+            if isinstance(val, str) and val.strip():
+                ex_id = val
+                break
+    if not ex_id:
+        ex_id = config.exchange.default
+    if isinstance(ex_id, str):
+        cleaned = ex_id.lower().replace("-", "").replace("_", "")
+        ex_id = EXCHANGE_MAP.get(cleaned, cleaned)
+    return normalize_exchange_id(str(ex_id))
+
+
+def _cap_display_leverage(raw: Any, cap: int = SCAN_LEVERAGE_CAP) -> int:
+    try:
+        lev = int(round(float(raw or 1)))
+    except (TypeError, ValueError):
+        lev = 1
+    return min(cap, max(1, lev))
 
 
 def _load_image(image: Union[Image.Image, bytes, BytesIO]) -> Image.Image:
@@ -269,21 +302,11 @@ def analyze_from_image(
         or (client_ocr.get("timeframe") if client_ocr else None)
         or cfg.timeframes.primary
     )
-    ex_id = (
-        req.exchange
-        or (client_hints.get("exchange") if isinstance(client_hints.get("exchange"), str) else None)
-        or (client_hints.get("exchange_hint") if isinstance(client_hints.get("exchange_hint"), str) else None)
-        or url_hints.exchange_hint
-        or cfg.exchange.default
+    ex_id = _resolve_exchange_id(
+        req.exchange or url_hints.exchange_hint,
+        cfg,
+        extra_hints=client_hints if isinstance(client_hints, dict) else None,
     )
-    if isinstance(ex_id, str):
-        ex_id = ex_id.lower()
-    if isinstance(ex_id, str):
-        ex_id = ex_id.replace("-", "").replace("_", "")
-    if isinstance(ex_id, str):
-        from src.data.exchange import EXCHANGE_MAP
-
-        ex_id = EXCHANGE_MAP.get(ex_id, ex_id)
     higher_tfs = _parse_higher(req.higher, cfg)
     sim_capital = (
         req.simulated_capital
@@ -350,22 +373,28 @@ def analyze_from_image(
         "exchange": ex_id,
     }
 
-    client = ExchangeClient(exchange_id=ex_id, config=cfg)
+    fetch = fetch_multi_timeframe_with_fallback(
+        symbol=resolved_symbol,
+        primary_tf=primary_tf,
+        preferred_exchange=ex_id,
+        higher_tfs=higher_tfs,
+        limit=cfg.timeframes.ohlcv_limit,
+        include_snapshot=True,
+        config=cfg,
+    )
+    client = fetch.client
     try:
-        mtf = fetch_multi_timeframe(
-            client,
-            symbol=resolved_symbol,
-            primary_tf=primary_tf,
-            higher_tfs=higher_tfs,
-            limit=cfg.timeframes.ohlcv_limit,
-            include_snapshot=True,
-            config=cfg,
-        )
+        mtf = fetch.mtf
+        exchange_used = fetch.exchange_used
+        vision_payload["exchange"] = exchange_used
+        vision_payload["exchange_requested"] = fetch.requested_exchange
+        vision_payload["fallback_used"] = fetch.fallback_used
+        vision_payload["attempted_exchanges"] = list(fetch.attempted_exchanges)
 
         if mtf.primary.empty:
             analysis = _vision_only_analysis(
                 resolved_symbol=resolved_symbol,
-                exchange_id=ex_id,
+                exchange_id=exchange_used,
                 primary_tf=primary_tf,
                 vis_trend=vis.trend_guess,
                 vis_conf=vis.confidence,
@@ -400,7 +429,110 @@ def analyze_from_image(
         payload["ok"] = True
         payload["data_mode"] = data_mode
         payload["vision"] = vision_payload
+        payload["exchange"] = exchange_used
+        payload["exchange_requested"] = fetch.requested_exchange
+        payload["fallback_used"] = fetch.fallback_used
+        payload["attempted_exchanges"] = list(fetch.attempted_exchanges)
+        if fetch.fallback_used:
+            payload.setdefault("warnings", [])
+            if isinstance(payload["warnings"], list):
+                payload["warnings"].append(
+                    f"Data from {exchange_used} (requested {fetch.requested_exchange}; "
+                    f"auto-fallback)"
+                )
         # Keep response clean: drop huge raw blobs if any slipped in
+        payload.pop("extra", None)
+        return payload
+    finally:
+        client.close()
+
+
+def analyze_market_data(
+    symbol: str,
+    request: Optional[AnalyzeRequest] = None,
+    config: Optional[AppConfig] = None,
+) -> Dict[str, Any]:
+    """
+    Data-only analysis (no chart image) with multi-exchange fallback.
+
+    Used by the Streamlit web app and any symbol-first workflow.
+    """
+    req = request or AnalyzeRequest()
+    cfg = config or load_config()
+    try:
+        resolved_symbol = normalize_symbol(symbol or req.symbol or "")
+    except ValueError as exc:
+        return {"ok": False, "error": "invalid_symbol", "message": str(exc)}
+
+    primary_tf = req.timeframe or cfg.timeframes.primary
+    ex_id = _resolve_exchange_id(req.exchange, cfg)
+    higher_tfs = _parse_higher(req.higher, cfg)
+    sim_capital = (
+        req.simulated_capital
+        if req.simulated_capital is not None
+        else (req.account_balance if req.account_balance is not None else 100.0)
+    )
+    risk_pct = req.risk_pct if req.risk_pct is not None else 1.0
+
+    fetch = fetch_multi_timeframe_with_fallback(
+        symbol=resolved_symbol,
+        primary_tf=primary_tf,
+        preferred_exchange=ex_id,
+        higher_tfs=higher_tfs,
+        limit=cfg.timeframes.ohlcv_limit,
+        include_snapshot=True,
+        config=cfg,
+    )
+    client = fetch.client
+    try:
+        mtf = fetch.mtf
+        if mtf.primary.empty:
+            return {
+                "ok": False,
+                "error": "no_market_data",
+                "message": (
+                    f"No OHLCV for {resolved_symbol} after trying: "
+                    f"{', '.join(fetch.attempted_exchanges) or ex_id}"
+                ),
+                "exchange_requested": fetch.requested_exchange,
+                "attempted_exchanges": list(fetch.attempted_exchanges),
+            }
+
+        news_bundle = None
+        if not req.no_news and cfg.news.enabled:
+            try:
+                news_bundle = NewsAnalyzer(config=cfg).analyze(resolved_symbol)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("News fetch failed in analyze_market_data: {}", exc)
+
+        engine = ConfluenceEngine(cfg)
+        analysis = engine.analyze(
+            mtf,
+            news=news_bundle,
+            simulated_capital=sim_capital,
+            risk_pct=risk_pct,
+            use_llm=req.use_llm,
+        )
+        reporter = ReportGenerator(cfg)
+        payload = reporter.to_dict(analysis)
+        payload["ok"] = True
+        payload["data_mode"] = "full"
+        payload["exchange"] = fetch.exchange_used
+        payload["exchange_requested"] = fetch.requested_exchange
+        payload["fallback_used"] = fetch.fallback_used
+        payload["attempted_exchanges"] = list(fetch.attempted_exchanges)
+        if fetch.fallback_used:
+            payload.setdefault("warnings", [])
+            if isinstance(payload["warnings"], list):
+                payload["warnings"].append(
+                    f"Data from {fetch.exchange_used} "
+                    f"(requested {fetch.requested_exchange}; auto-fallback)"
+                )
+        # Practical web display: prioritize 5x for sim example alongside model lev
+        plan = analysis.trade_plan
+        model_lev = float(getattr(plan, "leverage_suggested", 20) or 20) if plan else 20.0
+        payload["display_leverage"] = _cap_display_leverage(model_lev, SCAN_LEVERAGE_CAP)
+        payload["model_leverage"] = int(round(model_lev))
         payload.pop("extra", None)
         return payload
     finally:
@@ -420,30 +552,30 @@ def scan_symbols(
         return {"ok": False, "error": "no_symbols", "ranked_results": []}
 
     primary_tf = req.timeframe or cfg.timeframes.primary
-    ex_id = req.exchange or cfg.exchange.default
-    if isinstance(ex_id, str):
-        ex_id = ex_id.lower().replace("-", "").replace("_", "")
-    if isinstance(ex_id, str):
-        from src.data.exchange import EXCHANGE_MAP
-
-        ex_id = EXCHANGE_MAP.get(ex_id, ex_id)
+    ex_id = _resolve_exchange_id(req.exchange, cfg)
 
     ranked_results: List[Dict[str, Any]] = []
     for symbol in symbol_list[:40]:
         try:
             normalized_symbol = normalize_symbol(symbol)
-            client = ExchangeClient(exchange_id=ex_id, config=cfg)
+            fetch = fetch_multi_timeframe_with_fallback(
+                symbol=normalized_symbol,
+                primary_tf=primary_tf,
+                preferred_exchange=ex_id,
+                higher_tfs=["1h", "4h"],
+                limit=120,
+                include_snapshot=True,
+                config=cfg,
+            )
+            client = fetch.client
             try:
-                mtf = fetch_multi_timeframe(
-                    client,
-                    symbol=normalized_symbol,
-                    primary_tf=primary_tf,
-                    higher_tfs=["1h", "4h"],
-                    limit=120,
-                    include_snapshot=True,
-                    config=cfg,
-                )
+                mtf = fetch.mtf
                 if mtf.primary.empty:
+                    logger.info(
+                        "Scan skip {}: empty OHLCV after {}",
+                        normalized_symbol,
+                        " → ".join(fetch.attempted_exchanges),
+                    )
                     continue
 
                 news_bundle = None
@@ -461,13 +593,18 @@ def scan_symbols(
                     risk_pct=req.risk_pct or 1.0,
                     use_llm=False,
                 )
-                leverage = getattr(analysis.trade_plan, "leverage_suggested", 0) or 1
-                leverage = min(5, max(1, int(round(float(leverage)))))
+                model_lev = getattr(analysis.trade_plan, "leverage_suggested", 0) or 1
+                leverage = _cap_display_leverage(model_lev, SCAN_LEVERAGE_CAP)
                 reason = (analysis.key_reasons[:2] or [analysis.setup_name or ""])[0]
+                primary = (
+                    analysis.trade_plan.to_primary_setup() if analysis.trade_plan else None
+                )
                 ranked_results.append(
                     {
                         "symbol": normalized_symbol,
-                        "exchange": ex_id,
+                        "exchange": fetch.exchange_used,
+                        "exchange_requested": fetch.requested_exchange,
+                        "fallback_used": fetch.fallback_used,
                         "primary_tf": primary_tf,
                         "direction": analysis.direction,
                         "bias": analysis.bias,
@@ -475,10 +612,15 @@ def scan_symbols(
                         "confluence_score": round(float(analysis.confluence_total), 3),
                         "setup_name": analysis.setup_name,
                         "leverage": leverage,
+                        "model_leverage": int(round(float(model_lev))),
                         "reason": reason,
                         "price": analysis.meta.get("price") if analysis.meta else None,
                         "support": analysis.key_levels[0].get("mid") if analysis.key_levels else None,
                         "resistance": analysis.key_levels[1].get("mid") if len(analysis.key_levels) > 1 else None,
+                        "entry_low": getattr(analysis.trade_plan, "entry_low", None) if analysis.trade_plan else None,
+                        "entry_high": getattr(analysis.trade_plan, "entry_high", None) if analysis.trade_plan else None,
+                        "stop_loss": getattr(analysis.trade_plan, "stop_loss", None) if analysis.trade_plan else None,
+                        "hold_label": getattr(analysis.trade_plan, "hold_label", "") if analysis.trade_plan else "",
                         "payload": {
                             "bias": analysis.bias,
                             "direction": analysis.direction,
@@ -487,7 +629,13 @@ def scan_symbols(
                             "confluence_total": analysis.confluence_total,
                             "key_levels": analysis.key_levels[:4],
                             "key_reasons": analysis.key_reasons[:3],
-                            "trade_plan": analysis.trade_plan.to_primary_setup() if analysis.trade_plan else None,
+                            "trade_plan": primary,
+                            "primary_setup": primary,
+                            "position_simulation": (
+                                analysis.trade_plan.to_position_simulation()
+                                if analysis.trade_plan
+                                else None
+                            ),
                         },
                     }
                 )
@@ -503,6 +651,7 @@ def scan_symbols(
         "count": len(ranked_results),
         "timeframe": primary_tf,
         "exchange": ex_id,
+        "leverage_display_cap": SCAN_LEVERAGE_CAP,
     }
 
 

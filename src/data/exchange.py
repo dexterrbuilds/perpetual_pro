@@ -37,6 +37,66 @@ EXCHANGE_MAP: Dict[str, str] = {
     "weex": "weex",
 }
 
+# Default order when auto-fallback tries other venues
+DEFAULT_FALLBACK_EXCHANGES: List[str] = [
+    "bybit",
+    "binanceusdm",
+    "okx",
+    "bitget",
+    "mexc",
+    "bingx",
+    "bitmart",
+    "gate",
+    "htx",
+    "weex",
+]
+
+
+def normalize_exchange_id(exchange_id: str) -> str:
+    """Normalize friendly / alias exchange names to ccxt ids."""
+    if not exchange_id:
+        return "bybit"
+    raw = exchange_id.strip().lower().replace("-", "").replace("_", "")
+    if raw in {"binanceusdm", "binanceus"}:
+        return "binanceusdm"
+    if raw in {"gateio", "gate"}:
+        return "gate"
+    if raw in {"huobi", "htx"}:
+        return "htx"
+    return EXCHANGE_MAP.get(raw, raw)
+
+
+def build_exchange_attempt_order(
+    preferred: str,
+    config: Optional[AppConfig] = None,
+    *,
+    auto_fallback: Optional[bool] = None,
+) -> List[str]:
+    """Build ordered exchange list: preferred first, then configured fallbacks."""
+    preferred_norm = normalize_exchange_id(preferred or "bybit")
+    use_fallback = (
+        config.exchange.auto_fallback
+        if auto_fallback is None and config
+        else (auto_fallback if auto_fallback is not None else True)
+    )
+    if not use_fallback:
+        return [preferred_norm]
+
+    fallbacks = (
+        list(config.exchange.fallback_exchanges)
+        if config and config.exchange.fallback_exchanges
+        else list(DEFAULT_FALLBACK_EXCHANGES)
+    )
+    ordered: List[str] = []
+    for ex in [preferred_norm, *fallbacks]:
+        norm = normalize_exchange_id(ex)
+        if norm not in ordered and hasattr(ccxt, norm):
+            ordered.append(norm)
+    for ex in list_supported_exchanges():
+        if ex not in ordered:
+            ordered.append(ex)
+    return ordered
+
 
 @dataclass
 class MarketSnapshot:
@@ -80,24 +140,13 @@ class ExchangeClient:
     ) -> None:
         self.config = config
         self.exchange_cfg = exchange_cfg or (config.exchange if config else ExchangeConfig())
-        raw_id = (exchange_id or self.exchange_cfg.default or "binanceusdm").lower()
-        self.exchange_id = self._normalize_exchange_id(raw_id)
+        raw_id = (exchange_id or self.exchange_cfg.default or "bybit").lower()
+        self.exchange_id = normalize_exchange_id(raw_id)
         self._exchange = self._build_exchange()
         self._markets_loaded = False
 
     def _normalize_exchange_id(self, exchange_id: str) -> str:
-        if not exchange_id:
-            return "binanceusdm"
-        raw = exchange_id.strip().lower().replace("-", "").replace("_", "")
-        if raw in {"binanceusdm", "binanceus"}:
-            return "binanceusdm"
-        if raw in {"gateio", "gate"}:
-            return "gate"
-        if raw in {"huobi", "htx"}:
-            return "htx"
-        if raw == "gateio":
-            return "gateio"
-        return EXCHANGE_MAP.get(raw, raw)
+        return normalize_exchange_id(exchange_id)
 
     def _build_exchange(self) -> ccxt.Exchange:
         if not hasattr(ccxt, self.exchange_id):

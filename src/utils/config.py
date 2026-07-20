@@ -20,6 +20,21 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 @dataclass
 class ExchangeConfig:
     default: str = "bybit"
+    auto_fallback: bool = True
+    fallback_exchanges: List[str] = field(
+        default_factory=lambda: [
+            "bybit",
+            "binanceusdm",
+            "okx",
+            "bitget",
+            "mexc",
+            "bingx",
+            "bitmart",
+            "gate",
+            "htx",
+            "weex",
+        ]
+    )
     api_key: str = ""
     api_secret: str = ""
     password: str = ""
@@ -197,7 +212,25 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
     sim_cap = risk.get("simulated_capital", risk.get("account_balance", 1000.0))
     return AppConfig(
         exchange=ExchangeConfig(
-            default=str(ex.get("default", "binanceusdm")),
+            default=str(ex.get("default", "bybit")),
+            auto_fallback=bool(ex.get("auto_fallback", True)),
+            fallback_exchanges=list(
+                ex.get(
+                    "fallback_exchanges",
+                    [
+                        "bybit",
+                        "binanceusdm",
+                        "okx",
+                        "bitget",
+                        "mexc",
+                        "bingx",
+                        "bitmart",
+                        "gate",
+                        "htx",
+                        "weex",
+                    ],
+                )
+            ),
             api_key=str(ex.get("api_key", "") or ""),
             api_secret=str(ex.get("api_secret", "") or ""),
             password=str(ex.get("password", "") or ""),

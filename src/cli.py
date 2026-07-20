@@ -11,8 +11,8 @@ from rich.console import Console
 from rich.panel import Panel
 
 from src.analysis.confluence import ConfluenceEngine, FullAnalysis
-from src.data.exchange import ExchangeClient, list_supported_exchanges
-from src.data.multi_tf import fetch_multi_timeframe
+from src.data.exchange import list_supported_exchanges
+from src.data.multi_tf import fetch_multi_timeframe_with_fallback
 from src.data.news import NewsAnalyzer
 from src.report.generator import ReportGenerator
 from src.utils.config import AppConfig, load_config, setup_logging
@@ -64,21 +64,31 @@ def run_data_mode(
         )
     )
 
-    client = ExchangeClient(exchange_id=ex_id, config=config)
+    fetch = fetch_multi_timeframe_with_fallback(
+        symbol=sym,
+        primary_tf=primary_tf,
+        preferred_exchange=ex_id,
+        higher_tfs=higher_tfs,
+        limit=config.timeframes.ohlcv_limit,
+        include_snapshot=True,
+        config=config,
+    )
+    client = fetch.client
     try:
-        mtf = fetch_multi_timeframe(
-            client,
-            symbol=sym,
-            primary_tf=primary_tf,
-            higher_tfs=higher_tfs,
-            limit=config.timeframes.ohlcv_limit,
-            include_snapshot=True,
-            config=config,
-        )
+        mtf = fetch.mtf
+        if fetch.fallback_used:
+            console.print(
+                f"[yellow]Fallback:[/] requested [cyan]{fetch.requested_exchange}[/] "
+                f"→ using [cyan]{fetch.exchange_used}[/] "
+                f"(tried: {', '.join(fetch.attempted_exchanges)})"
+            )
+        else:
+            console.print(f"[dim]Exchange data: {fetch.exchange_used}[/]")
         if mtf.primary.empty:
             raise RuntimeError(
-                f"No OHLCV data for {sym} on {ex_id}. "
-                f"Check symbol format (e.g. BTC/USDT:USDT) and exchange."
+                f"No OHLCV data for {sym} after trying: "
+                f"{', '.join(fetch.attempted_exchanges) or ex_id}. "
+                f"Check symbol format (e.g. BTC/USDT:USDT) and exchange list."
             )
 
         news_bundle = None
@@ -196,23 +206,30 @@ def run_screen_mode(
 
     console.print(Panel(vision_notes, title="Vision / OCR Result", border_style="white"))
 
-    # Full data analysis fallback (always preferred for accuracy)
-    client = ExchangeClient(exchange_id=ex_id, config=config)
+    # Full data analysis with multi-exchange fallback (always preferred for accuracy)
+    fetch = fetch_multi_timeframe_with_fallback(
+        symbol=resolved_symbol,
+        primary_tf=primary_tf,
+        preferred_exchange=ex_id,
+        higher_tfs=higher_tfs,
+        limit=config.timeframes.ohlcv_limit,
+        include_snapshot=True,
+        config=config,
+    )
+    client = fetch.client
     try:
         with console.status(f"[bold green]Fetching live data for {resolved_symbol}..."):
-            mtf = fetch_multi_timeframe(
-                client,
-                symbol=resolved_symbol,
-                primary_tf=primary_tf,
-                higher_tfs=higher_tfs,
-                limit=config.timeframes.ohlcv_limit,
-                include_snapshot=True,
-                config=config,
+            mtf = fetch.mtf
+        if fetch.fallback_used:
+            console.print(
+                f"[yellow]Fallback:[/] requested [cyan]{fetch.requested_exchange}[/] "
+                f"→ using [cyan]{fetch.exchange_used}[/]"
             )
+            ex_id = fetch.exchange_used
 
         if mtf.primary.empty:
             console.print(
-                "[yellow]Live data failed — report will rely more on vision/OCR only.[/]"
+                "[yellow]Live data failed on all exchanges — report will rely more on vision/OCR only.[/]"
             )
             # Minimal synthetic analysis shell
             from src.analysis.confluence import FullAnalysis

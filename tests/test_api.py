@@ -98,7 +98,18 @@ def test_analyze_from_image_full_pipeline_mocked(monkeypatch):
                 notes=["test"],
             )
 
-    def fake_fetch(client, symbol, primary_tf, higher_tfs=None, limit=500, include_snapshot=True, config=None):
+    def fake_fetch_fallback(
+        symbol,
+        primary_tf,
+        preferred_exchange,
+        higher_tfs=None,
+        limit=500,
+        include_snapshot=True,
+        config=None,
+        auto_fallback=None,
+    ):
+        from src.data.multi_tf import FallbackFetchResult
+
         n = 200
         idx = pd.date_range("2025-01-01", periods=n, freq="15min", tz="UTC")
         rng = np.random.default_rng(1)
@@ -113,25 +124,32 @@ def test_analyze_from_image_full_pipeline_mocked(monkeypatch):
             },
             index=idx,
         )
-        return MultiTimeframeData(
+        mtf = MultiTimeframeData(
             symbol=symbol,
-            exchange_id=getattr(client, "exchange_id", "binanceusdm"),
+            exchange_id=preferred_exchange or "binanceusdm",
             primary_tf=primary_tf,
             frames={primary_tf: df, "1h": df.iloc[::4].copy()},
             snapshot=MarketSnapshot(
                 symbol=symbol,
-                exchange_id="binanceusdm",
+                exchange_id=preferred_exchange or "binanceusdm",
                 last=float(close[-1]),
                 funding_rate=0.0001,
                 open_interest=1e6,
             ),
         )
+        client = FakeClient(exchange_id=preferred_exchange)
+        return FallbackFetchResult(
+            mtf=mtf,
+            client=client,
+            requested_exchange=preferred_exchange or "binanceusdm",
+            exchange_used=preferred_exchange or "binanceusdm",
+            fallback_used=False,
+            attempted_exchanges=[preferred_exchange or "binanceusdm"],
+        )
 
     class FakeClient:
-        exchange_id = "binanceusdm"
-
         def __init__(self, *a, **k):
-            pass
+            self.exchange_id = k.get("exchange_id") or (a[0] if a else "binanceusdm")
 
         def close(self):
             pass
@@ -147,8 +165,7 @@ def test_analyze_from_image_full_pipeline_mocked(monkeypatch):
 
     monkeypatch.setattr(svc, "OCREngine", FakeOCR)
     monkeypatch.setattr(svc, "ChartVision", FakeVision)
-    monkeypatch.setattr(svc, "ExchangeClient", FakeClient)
-    monkeypatch.setattr(svc, "fetch_multi_timeframe", fake_fetch)
+    monkeypatch.setattr(svc, "fetch_multi_timeframe_with_fallback", fake_fetch_fallback)
     monkeypatch.setattr(svc, "NewsAnalyzer", FakeNews)
 
     result = svc.analyze_from_image(
@@ -169,6 +186,8 @@ def test_analyze_from_image_prefers_client_hint_exchange(monkeypatch):
     from src.api import service as svc
     from src.vision.ocr import OCRResult
     from src.vision.chart_detect import VisionChartResult
+    from src.data.multi_tf import FallbackFetchResult, MultiTimeframeData
+    import pandas as pd
 
     captured = {}
 
@@ -188,22 +207,31 @@ def test_analyze_from_image_prefers_client_hint_exchange(monkeypatch):
 
     class FakeClient:
         def __init__(self, exchange_id=None, config=None, exchange_cfg=None):
-            captured["exchange_id"] = exchange_id
-            self.exchange_id = exchange_id
+            self.exchange_id = exchange_id or "mexc"
 
         def close(self):
             pass
 
-    import pandas as pd
-
-    class DummyMTF:
-        def __init__(self):
-            self.primary = pd.DataFrame()
+    def fake_fallback(symbol, primary_tf, preferred_exchange, **kwargs):
+        captured["preferred_exchange"] = preferred_exchange
+        mtf = MultiTimeframeData(
+            symbol=symbol,
+            exchange_id=preferred_exchange,
+            primary_tf=primary_tf,
+            frames={primary_tf: pd.DataFrame()},
+        )
+        return FallbackFetchResult(
+            mtf=mtf,
+            client=FakeClient(exchange_id=preferred_exchange),
+            requested_exchange=preferred_exchange,
+            exchange_used=preferred_exchange,
+            fallback_used=False,
+            attempted_exchanges=[preferred_exchange],
+        )
 
     monkeypatch.setattr(svc, "OCREngine", FakeOCR)
     monkeypatch.setattr(svc, "ChartVision", FakeVision)
-    monkeypatch.setattr(svc, "ExchangeClient", FakeClient)
-    monkeypatch.setattr(svc, "fetch_multi_timeframe", lambda *a, **k: DummyMTF())
+    monkeypatch.setattr(svc, "fetch_multi_timeframe_with_fallback", fake_fallback)
     monkeypatch.setattr(svc, "NewsAnalyzer", lambda *a, **k: None)
 
     svc.analyze_from_image(
@@ -212,18 +240,21 @@ def test_analyze_from_image_prefers_client_hint_exchange(monkeypatch):
         config=svc.load_config(),
     )
 
-    assert captured["exchange_id"] == "mexc"
+    assert captured["preferred_exchange"] == "mexc"
 
 
 def test_scan_symbols_ranks_results(monkeypatch):
     from src.api import service as svc
     from src.data.exchange import MarketSnapshot
-    from src.data.multi_tf import MultiTimeframeData
+    from src.data.multi_tf import FallbackFetchResult, MultiTimeframeData
     import pandas as pd
 
     class FakeClient:
         def __init__(self, *a, **k):
-            self.exchange_id = "binanceusdm"
+            self.exchange_id = k.get("exchange_id") or "binanceusdm"
+
+        def close(self):
+            pass
 
     class FakeNews:
         def __init__(self, *a, **k):
@@ -234,7 +265,16 @@ def test_scan_symbols_ranks_results(monkeypatch):
 
             return NewsBundle(symbol=symbol, summary="test", bias="neutral", aggregate_sentiment=0.0)
 
-    def fake_fetch(client, symbol, primary_tf, higher_tfs=None, limit=500, include_snapshot=True, config=None):
+    def fake_fetch_fallback(
+        symbol,
+        primary_tf,
+        preferred_exchange,
+        higher_tfs=None,
+        limit=500,
+        include_snapshot=True,
+        config=None,
+        auto_fallback=None,
+    ):
         n = 80
         idx = pd.date_range("2025-01-01", periods=n, freq="15min", tz="UTC")
         close = 1000.0 if symbol.startswith("BTC") else 200.0
@@ -248,23 +288,40 @@ def test_scan_symbols_ranks_results(monkeypatch):
             },
             index=idx,
         )
-        return MultiTimeframeData(
+        mtf = MultiTimeframeData(
             symbol=symbol,
-            exchange_id="binanceusdm",
+            exchange_id=preferred_exchange or "binanceusdm",
             primary_tf=primary_tf,
             frames={primary_tf: df},
-            snapshot=MarketSnapshot(symbol=symbol, exchange_id="binanceusdm", last=float(close)),
+            snapshot=MarketSnapshot(
+                symbol=symbol,
+                exchange_id=preferred_exchange or "binanceusdm",
+                last=float(close),
+            ),
+        )
+        return FallbackFetchResult(
+            mtf=mtf,
+            client=FakeClient(exchange_id=preferred_exchange),
+            requested_exchange=preferred_exchange or "binanceusdm",
+            exchange_used=preferred_exchange or "binanceusdm",
+            fallback_used=False,
+            attempted_exchanges=[preferred_exchange or "binanceusdm"],
         )
 
-    monkeypatch.setattr(svc, "ExchangeClient", FakeClient)
-    monkeypatch.setattr(svc, "fetch_multi_timeframe", fake_fetch)
+    monkeypatch.setattr(svc, "fetch_multi_timeframe_with_fallback", fake_fetch_fallback)
     monkeypatch.setattr(svc, "NewsAnalyzer", FakeNews)
 
-    result = svc.scan_symbols(["BTC", "ETH"], request=svc.AnalyzeRequest(timeframe="15m", no_news=True), config=svc.load_config())
+    result = svc.scan_symbols(
+        ["BTC", "ETH"],
+        request=svc.AnalyzeRequest(timeframe="15m", no_news=True),
+        config=svc.load_config(),
+    )
 
     assert result["ok"] is True
     assert len(result["ranked_results"]) >= 2
     assert result["ranked_results"][0]["symbol"]
+    assert result["ranked_results"][0]["leverage"] <= svc.SCAN_LEVERAGE_CAP
+
 
 
 def test_fastapi_analyze_endpoint(monkeypatch):

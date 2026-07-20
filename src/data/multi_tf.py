@@ -8,7 +8,12 @@ from typing import Dict, List, Optional
 import pandas as pd
 from loguru import logger
 
-from src.data.exchange import ExchangeClient, MarketSnapshot
+from src.data.exchange import (
+    ExchangeClient,
+    MarketSnapshot,
+    build_exchange_attempt_order,
+    normalize_exchange_id,
+)
 from src.utils.config import AppConfig
 from src.utils.helpers import timeframe_to_minutes
 
@@ -102,3 +107,152 @@ def fetch_multi_timeframe(
             logger.warning("Market snapshot failed: {}", exc)
 
     return result
+
+
+@dataclass
+class FallbackFetchResult:
+    """Result of multi-exchange OHLCV fetch with automatic venue fallback."""
+
+    mtf: MultiTimeframeData
+    client: ExchangeClient
+    requested_exchange: str
+    exchange_used: str
+    fallback_used: bool
+    attempted_exchanges: List[str] = field(default_factory=list)
+
+
+def fetch_multi_timeframe_with_fallback(
+    symbol: str,
+    primary_tf: str,
+    preferred_exchange: str,
+    higher_tfs: Optional[List[str]] = None,
+    limit: int = 500,
+    include_snapshot: bool = True,
+    config: Optional[AppConfig] = None,
+    auto_fallback: Optional[bool] = None,
+) -> FallbackFetchResult:
+    """
+    Try preferred exchange first; on missing symbol/OHLCV, iterate fallbacks.
+
+    Returns the first exchange that yields non-empty primary OHLCV, or the last
+    empty attempt if all venues fail (caller may fall back to vision-only mode).
+
+    Caller owns the returned ``client`` and must call ``client.close()``.
+    Failed intermediate clients are always closed inside this function.
+    """
+    requested = normalize_exchange_id(preferred_exchange)
+    exchanges = build_exchange_attempt_order(
+        requested, config, auto_fallback=auto_fallback
+    )
+    attempted: List[str] = []
+    last_client: Optional[ExchangeClient] = None
+    last_mtf: Optional[MultiTimeframeData] = None
+
+    for ex_id in exchanges:
+        attempted.append(ex_id)
+        client: Optional[ExchangeClient] = None
+        try:
+            client = ExchangeClient(exchange_id=ex_id, config=config)
+            mtf = fetch_multi_timeframe(
+                client,
+                symbol=symbol,
+                primary_tf=primary_tf,
+                higher_tfs=higher_tfs,
+                limit=limit,
+                include_snapshot=include_snapshot,
+                config=config,
+            )
+            if not mtf.primary.empty:
+                # Success — release any prior empty-result client first
+                if last_client is not None:
+                    last_client.close()
+                    last_client = None
+                fallback_used = ex_id != requested
+                if fallback_used:
+                    logger.info(
+                        "Symbol {} unavailable on {} — using {} for data "
+                        "(tried: {})",
+                        symbol,
+                        requested,
+                        ex_id,
+                        " → ".join(attempted),
+                    )
+                else:
+                    logger.info("Using {} for {} market data", ex_id, symbol)
+                return FallbackFetchResult(
+                    mtf=mtf,
+                    client=client,
+                    requested_exchange=requested,
+                    exchange_used=ex_id,
+                    fallback_used=fallback_used,
+                    attempted_exchanges=list(attempted),
+                )
+
+            logger.warning(
+                "Empty OHLCV for {} on {} — trying next exchange",
+                symbol,
+                ex_id,
+            )
+            # Keep this client as last-resort shell; drop previous empty one
+            if last_client is not None:
+                last_client.close()
+            last_client = client
+            last_mtf = mtf
+            client = None  # ownership transferred to last_client
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Exchange {} failed for {}: {}", ex_id, symbol, exc)
+            if client is not None:
+                client.close()
+                client = None
+
+    if last_client is not None and last_mtf is not None:
+        used = last_client.exchange_id
+        logger.warning(
+            "All exchanges failed for {}; returning last empty attempt on {} "
+            "(tried: {})",
+            symbol,
+            used,
+            " → ".join(attempted) if attempted else requested,
+        )
+        return FallbackFetchResult(
+            mtf=last_mtf,
+            client=last_client,
+            requested_exchange=requested,
+            exchange_used=used,
+            fallback_used=used != requested,
+            attempted_exchanges=list(attempted),
+        )
+
+    # Every attempt raised — open preferred so caller still has a client to close
+    client = ExchangeClient(exchange_id=requested, config=config)
+    try:
+        mtf = fetch_multi_timeframe(
+            client,
+            symbol=symbol,
+            primary_tf=primary_tf,
+            higher_tfs=higher_tfs,
+            limit=limit,
+            include_snapshot=include_snapshot,
+            config=config,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Final preferred-exchange fetch failed for {} on {}: {}",
+            symbol,
+            requested,
+            exc,
+        )
+        mtf = MultiTimeframeData(
+            symbol=symbol,
+            exchange_id=requested,
+            primary_tf=primary_tf,
+            errors=[str(exc)],
+        )
+    return FallbackFetchResult(
+        mtf=mtf,
+        client=client,
+        requested_exchange=requested,
+        exchange_used=client.exchange_id,
+        fallback_used=False,
+        attempted_exchanges=list(attempted) if attempted else [requested],
+    )

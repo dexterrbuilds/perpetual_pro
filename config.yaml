@@ -2,6 +2,18 @@
 
 exchange:
   default: bybit
+  auto_fallback: true
+  fallback_exchanges:
+    - bybit
+    - binanceusdm
+    - okx
+    - bitget
+    - mexc
+    - bingx
+    - bitmart
+    - gate
+    - htx
+    - weex
   api_key: ""
   api_secret: ""
   password: ""
