@@ -173,7 +173,7 @@ def main() -> None:
             render_single_analysis(symbol, timeframe, exchange, no_news)
     with col2:
         if st.button("Scan watchlist"):
-            symbols = normalize_symbol_list(st.text_area("Symbols (comma-separated)", value="BTC,ETH,SOL,BNB"))
+            symbols = normalize_symbol_list(st.text_area("Symbols (comma-separated)", value="BTC,ETH,SOL,BNB,AAVE,ADA,AERO,ALGO,ARB,ATOM,AXS,BCH,BERA,BGB,BRETT,CAKE,BSV,CHZ,CRO,DASH,DOT,FIL,GRASS,HBAR,ICP,INJ,JUP,XLM,XMR,XTZ,ZEC,TIA,S,SEI,RAY,OP,NEAR,MNT,KAS,KAIA"))
             if not symbols:
                 st.warning("Add at least one symbol to scan.")
             else:
