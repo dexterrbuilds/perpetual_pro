@@ -71,7 +71,8 @@ news:
   enabled: true
   cryptopanic_token: ""
   max_articles: 12
-  lookback_hours: 24
+  # Prefer headlines from the last 1–4 hours (hard filter when timestamps exist)
+  lookback_hours: 4
   bullish_keywords:
     - approval
     - etf

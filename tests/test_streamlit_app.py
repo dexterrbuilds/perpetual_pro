@@ -7,11 +7,17 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from streamlit_app import build_report_markdown, normalize_symbol_list
+from streamlit_app import build_report_markdown, format_ticker_price, normalize_symbol_list
 
 
 def test_normalize_symbol_list_filters_empty_entries():
     assert normalize_symbol_list("BTC, ETH , , SOL") == ["BTC", "ETH", "SOL"]
+
+
+def test_format_ticker_price_shows_base_and_price():
+    assert format_ticker_price("BTC/USDT:USDT", 112450.25) == "BTC $112,450"
+    assert format_ticker_price("ETH", 3456.78).startswith("ETH $")
+    assert format_ticker_price("SOL", None) == "SOL —"
 
 
 def test_build_report_markdown_contains_key_sections():

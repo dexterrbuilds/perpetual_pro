@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -330,8 +331,8 @@ def call_backend(endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Dic
         return {"ok": False, "error": str(exc)}
 
 
-@st.cache_data(show_spinner=False)
 def analyze_symbol(symbol: str, timeframe: str, exchange: str, no_news: bool) -> Dict[str, Any]:
+    """Run a fresh single-symbol analysis (no Streamlit cache)."""
     from src.api.service import analyze_market_data
 
     req = AnalyzeRequest(
@@ -347,8 +348,12 @@ def analyze_symbol(symbol: str, timeframe: str, exchange: str, no_news: bool) ->
     return analyze_market_data(symbol, request=req, config=cfg)
 
 
-@st.cache_data(show_spinner=False)
 def scan_symbols(symbols: List[str], timeframe: str, exchange: str, no_news: bool) -> Dict[str, Any]:
+    """
+    Always run a fresh multi-symbol scan (no Streamlit cache).
+
+    Re-fetches market data + news on every click so results are not stale.
+    """
     from src.api.service import scan_symbols as scan_backend
 
     req = AnalyzeRequest(
@@ -363,6 +368,25 @@ def scan_symbols(symbols: List[str], timeframe: str, exchange: str, no_news: boo
     return scan_backend(symbols, request=req, config=cfg)
 
 
+def format_ticker_price(symbol: Any, price: Any) -> str:
+    """Human label like ``BTC $112,450`` for scan rows / expanders."""
+    raw = str(symbol or "—")
+    base = raw.split("/")[0].split(":")[0].upper() if raw != "—" else "—"
+    if price is None or price == "":
+        return f"{base} —"
+    try:
+        p = float(price)
+    except (TypeError, ValueError):
+        return f"{base} —"
+    if p >= 1000:
+        return f"{base} ${p:,.0f}"
+    if p >= 1:
+        return f"{base} ${p:,.4f}".rstrip("0").rstrip(".")
+    if p >= 0.01:
+        return f"{base} ${p:.6f}".rstrip("0").rstrip(".")
+    return f"{base} ${p:.8f}".rstrip("0").rstrip(".")
+
+
 def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") -> None:
     """Render ranked scan table + detail cards. ``key_prefix`` keeps widget IDs unique."""
     rows = payload.get("ranked_results", [])
@@ -370,11 +394,19 @@ def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") ->
         st.info("No ranked setups returned yet. Try a broader watchlist or a different exchange.")
         return
 
+    # Enrich rows with ticker + market price for display
+    display_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        enriched = dict(row)
+        enriched["ticker"] = format_ticker_price(row.get("symbol"), row.get("price"))
+        display_rows.append(enriched)
+
     cols = [
         c
         for c in [
-            "symbol",
+            "ticker",
             "direction",
+            "price",
             "llm_confidence",
             "rank_score",
             "confidence",
@@ -384,15 +416,23 @@ def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") ->
             "leverage",
             "model_leverage",
             "exchange",
-            "price",
             "entry_low",
             "entry_high",
             "stop_loss",
             "hold_label",
         ]
-        if c in (rows[0] if rows else {})
+        if c in (display_rows[0] if display_rows else {})
     ]
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(display_rows)
+    # Format price column for readability in the table
+    if "price" in df.columns:
+        df = df.copy()
+        df["price"] = df.apply(
+            lambda r: format_ticker_price(r.get("symbol"), r.get("price")).split(" ", 1)[-1]
+            if r.get("price") is not None
+            else "—",
+            axis=1,
+        )
     st.caption(
         f"Ranked by LLM confidence + technical confluence "
         f"({payload.get('ranking') or 'directional only'}). "
@@ -402,7 +442,8 @@ def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") ->
             if payload.get("flat_count")
             else "."
         )
-        + f" Display leverage capped at {payload.get('leverage_display_cap', SCAN_LEVERAGE_CAP)}x."
+        + f" Display leverage capped at {payload.get('leverage_display_cap', SCAN_LEVERAGE_CAP)}x. "
+        f"Prices are live from the exchange used for each symbol."
     )
     st.dataframe(
         df[cols],
@@ -419,19 +460,20 @@ def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") ->
     # Expandable detail cards for top results (unique titles avoid expander ID clashes)
     for i, row in enumerate(rows[:5]):
         sym = str(row.get("symbol") or f"row{i}")
+        ticker = format_ticker_price(row.get("symbol"), row.get("price"))
         llm_c = row.get("llm_confidence")
         title = (
-            f"#{i + 1} {sym} · {str(row.get('direction', 'flat')).upper()} · "
+            f"#{i + 1} {ticker} · {str(row.get('direction', 'flat')).upper()} · "
             f"LLM {llm_c if llm_c is not None else '—'}% · lev {row.get('leverage', '—')}x"
         )
         with st.expander(title, expanded=(i == 0)):
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric(
+            c1.metric(f"Price · {sym}", ticker.split(" ", 1)[-1] if " " in ticker else ticker)
+            c2.metric(
                 f"LLM Confidence · {sym}",
                 f"{_safe_float(llm_c):.0f}%" if llm_c is not None else "—",
             )
-            c2.metric(f"Rank score · {sym}", f"{_safe_float(row.get('rank_score')):.1f}")
-            c3.metric(f"Confluence · {sym}", f"{row.get('confluence_score', 0):.3f}")
+            c3.metric(f"Rank score · {sym}", f"{_safe_float(row.get('rank_score')):.1f}")
             c4.metric(f"Leverage (priority) · {sym}", f"{row.get('leverage', '—')}x")
             if row.get("llm_confidence_reason"):
                 st.info(f"**LLM Confidence:** {_safe_float(llm_c):.0f}% — {row['llm_confidence_reason']}")
@@ -744,7 +786,13 @@ def main() -> None:
             key="input_exchange",
         )
         st.caption("If the symbol is missing on the preferred venue, others are tried automatically.")
-        no_news = st.checkbox("Skip news", value=True, key="input_no_news")
+        # Default: fetch news (recent lookback). Key bumped so old sessions reset to unchecked.
+        no_news = st.checkbox(
+            "Skip news",
+            value=False,
+            key="input_no_news_v2",
+            help="When unchecked (default), analysis fetches recent headlines (last ~1–4 hours).",
+        )
         st.caption(f"Backend: {BACKEND_URL}")
         if st.button("Ping backend", key="btn_ping_backend"):
             result = call_backend("/health")
@@ -770,14 +818,22 @@ def main() -> None:
         if not symbols:
             st.warning("Add at least one symbol to scan.")
         else:
-            with st.spinner(f"Scanning {len(symbols)} symbols…"):
+            # Always start clean: drop prior ranked table before re-fetching
+            st.session_state.pop("last_scan", None)
+            with st.spinner(f"Scanning {len(symbols)} symbols (fresh data + news)…"):
                 payload = scan_symbols(symbols, timeframe, exchange, no_news)
             st.session_state["last_scan"] = payload
+            st.session_state["last_scan_at"] = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            )
 
     st.divider()
     st.subheader("Ranked signals")
     # Render scan results only once (from session state) so widget IDs stay unique
     if st.session_state.get("last_scan"):
+        scanned_at = st.session_state.get("last_scan_at")
+        if scanned_at:
+            st.caption(f"Last fresh scan: {scanned_at}")
         render_scan_results(st.session_state["last_scan"], key_prefix="scan")
     else:
         st.caption("Run a watchlist scan to populate ranked signals.")

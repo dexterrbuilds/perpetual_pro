@@ -114,7 +114,7 @@ class NewsConfig:
     enabled: bool = True
     cryptopanic_token: str = ""
     max_articles: int = 12
-    lookback_hours: int = 24
+    lookback_hours: int = 4
     bullish_keywords: List[str] = field(default_factory=list)
     bearish_keywords: List[str] = field(default_factory=list)
 
@@ -281,7 +281,7 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             enabled=bool(news.get("enabled", True)),
             cryptopanic_token=str(news.get("cryptopanic_token", "") or ""),
             max_articles=int(news.get("max_articles", 12)),
-            lookback_hours=int(news.get("lookback_hours", 24)),
+            lookback_hours=int(news.get("lookback_hours", 4)),
             bullish_keywords=list(news.get("bullish_keywords", [])),
             bearish_keywords=list(news.get("bearish_keywords", [])),
         ),

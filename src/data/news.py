@@ -103,7 +103,33 @@ class NewsAnalyzer:
             seen.add(key)
             unique.append(it)
 
-        unique.sort(key=lambda x: abs(x.sentiment_score), reverse=True)
+        lookback_h = max(1, int(getattr(self.news_cfg, "lookback_hours", 4) or 4))
+        # Prefer last 1–4h; if empty, soft-expand once to 2× lookback (still recent)
+        recent = [it for it in unique if self._is_within_hours(it.published_at, lookback_h)]
+        window_label = f"{lookback_h}h"
+        if not recent:
+            soft_h = min(8, lookback_h * 2)
+            recent = [it for it in unique if self._is_within_hours(it.published_at, soft_h)]
+            if recent:
+                window_label = f"{soft_h}h (soft expand)"
+        # Items with no parseable timestamp: treat as current only if we have nothing else
+        undated = [it for it in unique if not _parse_published_at(it.published_at)]
+        if recent:
+            unique = recent
+        elif undated:
+            unique = undated
+            window_label = "unknown age (undated sources)"
+        else:
+            unique = []
+
+        # Newest first, then by |sentiment|
+        unique.sort(
+            key=lambda x: (
+                _published_sort_key(x.published_at),
+                abs(x.sentiment_score),
+            ),
+            reverse=True,
+        )
         max_n = self.news_cfg.max_articles
         bundle.items = unique[:max_n]
 
@@ -115,7 +141,9 @@ class NewsAnalyzer:
             bundle.aggregate_sentiment = clamp(agg, -1.0, 1.0)
         else:
             bundle.aggregate_sentiment = 0.0
-            bundle.summary = f"No recent headlines found for {base}."
+            bundle.summary = (
+                f"No headlines in the last ~{lookback_h}h for {base}."
+            )
             return bundle
 
         if bundle.aggregate_sentiment >= 0.15:
@@ -128,9 +156,19 @@ class NewsAnalyzer:
         top_titles = "; ".join(i.title[:90] for i in bundle.items[:3])
         bundle.summary = (
             f"News bias {bundle.bias} (score {bundle.aggregate_sentiment:+.2f}) "
-            f"from {len(bundle.items)} headlines. Top: {top_titles}"
+            f"from {len(bundle.items)} headlines in last {window_label}. "
+            f"Top: {top_titles}"
         )
         return bundle
+
+    def _is_within_hours(self, published_at: str, hours: int) -> bool:
+        """True if published_at parses and is within the last ``hours`` hours."""
+        dt = _parse_published_at(published_at)
+        if dt is None:
+            return False
+        now = datetime.now(timezone.utc)
+        age_s = (now - dt).total_seconds()
+        return 0 <= age_s <= float(hours) * 3600.0
 
     def _fetch_cryptopanic(self, base: str) -> List[NewsItem]:
         params = {
@@ -286,3 +324,55 @@ def _ts_to_iso(ts: Any) -> str:
         return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
     except Exception:  # noqa: BLE001
         return str(ts or "")
+
+
+def _parse_published_at(value: Any) -> Optional[datetime]:
+    """Parse common news timestamps to timezone-aware UTC datetime."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # Unix seconds as string
+    if re.fullmatch(r"\d{10,13}", s):
+        try:
+            ts = int(s)
+            if ts > 1_000_000_000_000:  # ms
+                ts //= 1000
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    # ISO-8601 variants
+    try:
+        iso = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        pass
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%a, %d %b %Y %H:%M:%S %z",
+    ):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _published_sort_key(published_at: str) -> float:
+    dt = _parse_published_at(published_at)
+    if dt is None:
+        return 0.0
+    return dt.timestamp()
