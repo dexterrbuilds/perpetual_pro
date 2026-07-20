@@ -24,7 +24,7 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 
 # Default watchlist (matches extension / prior web app coins)
 DEFAULT_WATCHLIST = (
-    "BTC,ETH,SOL,BNB,AAVE,ARB,OP,NEAR,INJ,SEI,BSV,TIA,ADA,ALGO,APT"
+    "BTC,ETH,SOL,BNB,AAVE,ARB,OP,NEAR,INJ,SEI,BSV,TIA,ADA,SUI,APT,AVAX,TON,TRX"
 )
 
 EXCHANGE_OPTIONS = [
