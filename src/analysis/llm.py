@@ -32,6 +32,8 @@ class LLMNarrative:
     # Play-out likelihood for the proposed signal (0–100)
     llm_confidence: float = 0.0
     confidence_reason: str = ""
+    # Structured why-confident / why-not explanation
+    confidence_detail: Dict[str, Any] = field(default_factory=dict)
 
     # Reasons / risks / scenarios
     key_reasons: List[str] = field(default_factory=list)
@@ -114,6 +116,12 @@ class NarrativeLLM:
             '  "direction": "long|short|flat",\n'
             '  "llm_confidence": <0-100 integer>,  /* play-out likelihood for this signal */\n'
             '  "confidence_reason": "one short sentence justifying llm_confidence",\n'
+            '  "confidence_detail": {\n'
+            '    "summary": "2-3 sentences explaining why confident or not (prop risk-aware)",\n'
+            '    "supporting": ["factor that increases confidence", "..."],\n'
+            '    "opposing": ["factor that reduces confidence", "..."],\n'
+            '    "verdict": "high|medium|low|skip"\n'
+            "  },\n"
             '  "signal_narrative": "3-5 concise sentences explaining the trade",\n'
             '  "entry_zones": [{"low": <num>, "high": <num>, "note": "tight|retention"}],\n'
             '  "alternative_entries": [{"low": <num>, "high": <num>, "note": "retest/alt"}],\n'
@@ -230,6 +238,13 @@ class NarrativeLLM:
             if "flat" not in conf_reason.lower() and "no trade" not in conf_reason.lower():
                 conf_reason = (conf_reason + " " if conf_reason else "") + "Capped: flat / no-trade setup."
 
+        conf_detail = _normalize_confidence_detail(
+            parsed.get("confidence_detail"),
+            llm_conf=float(llm_conf if llm_conf is not None else 0.0),
+            conf_reason=conf_reason,
+            direction=direction,
+        )
+
         return LLMNarrative(
             signal_narrative=str(parsed.get("signal_narrative") or ""),
             direction=direction,
@@ -261,6 +276,7 @@ class NarrativeLLM:
             volume_confidence=_safe_num(parsed.get("volume_confidence"), 0.0) or 0.0,
             llm_confidence=float(llm_conf if llm_conf is not None else 0.0),
             confidence_reason=conf_reason[:280],
+            confidence_detail=conf_detail,
             key_reasons=[str(x) for x in (parsed.get("key_reasons") or [])][:8],
             key_risks=[str(x) for x in (parsed.get("key_risks") or [])][:8],
             scenarios={
@@ -371,6 +387,15 @@ class NarrativeLLM:
         card_lines.append(f"Lev: ~{lev:.0f}x (20x–100x). Hold ~30min–12h (max 24h)")
         trade_card = " | ".join(card_lines)
 
+        conf_detail = build_heuristic_confidence_detail(
+            direction=direction,
+            llm_confidence=llm_conf,
+            conf_reason=conf_reason,
+            factors=factors,
+            confluence_total=confluence,
+            technical_confidence=conf,
+        )
+
         return LLMNarrative(
             signal_narrative=narrative,
             direction=direction,
@@ -386,6 +411,7 @@ class NarrativeLLM:
             volume_confidence=float(ctx.get("volume_confidence") or 0.0),
             llm_confidence=llm_conf,
             confidence_reason=conf_reason,
+            confidence_detail=conf_detail,
             key_reasons=reasons,
             key_risks=risks,
             scenarios=scenarios,
@@ -456,6 +482,82 @@ def heuristic_llm_confidence(
         f"|confluence| {conf_mag:.3f} for {direction.upper()}."
     )
     return round(score, 1), reason
+
+
+def _normalize_confidence_detail(
+    raw: Any,
+    *,
+    llm_conf: float,
+    conf_reason: str,
+    direction: str,
+) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raw = {}
+    supporting = [str(x) for x in (raw.get("supporting") or []) if x][:6]
+    opposing = [str(x) for x in (raw.get("opposing") or []) if x][:6]
+    summary = str(raw.get("summary") or conf_reason or "").strip()
+    verdict = str(raw.get("verdict") or "").strip().lower()
+    if verdict not in ("high", "medium", "low", "skip"):
+        if direction in ("flat", "neutral", ""):
+            verdict = "skip"
+        elif llm_conf >= 70:
+            verdict = "high"
+        elif llm_conf >= 50:
+            verdict = "medium"
+        else:
+            verdict = "low"
+    if not summary:
+        summary = conf_reason or f"Play-out score {llm_conf:.0f}% for {direction or 'flat'}."
+    return {
+        "summary": summary[:500],
+        "supporting": supporting,
+        "opposing": opposing,
+        "verdict": verdict,
+    }
+
+
+def build_heuristic_confidence_detail(
+    *,
+    direction: str,
+    llm_confidence: float,
+    conf_reason: str,
+    factors: Any,
+    confluence_total: float,
+    technical_confidence: float,
+) -> Dict[str, Any]:
+    supporting: List[str] = []
+    opposing: List[str] = []
+    for f in (factors or [])[:6]:
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("name") or "factor")
+        score = float(f.get("score") or 0)
+        detail = str(f.get("detail") or "")[:80]
+        line = f"{name}: {score:+.2f}" + (f" — {detail}" if detail else "")
+        if score >= 0.15:
+            supporting.append(line)
+        elif score <= -0.15:
+            opposing.append(line)
+    if abs(confluence_total) >= 0.2:
+        supporting.append(f"Confluence magnitude {confluence_total:+.3f}")
+    else:
+        opposing.append(f"Weak confluence ({confluence_total:+.3f})")
+    if technical_confidence < 45:
+        opposing.append(f"Technical confidence only {technical_confidence:.0f}%")
+    elif technical_confidence >= 65:
+        supporting.append(f"Technical confidence {technical_confidence:.0f}%")
+    if direction in ("flat", "neutral", ""):
+        opposing.append("No clear directional bias — prefer stand aside")
+    return _normalize_confidence_detail(
+        {
+            "summary": conf_reason,
+            "supporting": supporting[:5],
+            "opposing": opposing[:5],
+        },
+        llm_conf=llm_confidence,
+        conf_reason=conf_reason,
+        direction=direction,
+    )
 
 
 def combined_rank_score(

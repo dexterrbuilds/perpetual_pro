@@ -49,15 +49,21 @@ class RiskConfig:
 
     simulated_capital: float = 1000.0
     risk_per_trade_pct: float = 1.0
-    # Aggressive perp leverage suggestions (not exchange max margin)
-    leverage_ceiling: float = 100.0
-    leverage_floor: float = 20.0
+    # Prop account mode: clamp risk 0.5–1% and max leverage 5x
+    prop_mode: bool = True
+    risk_per_trade_min_pct: float = 0.5
+    risk_per_trade_max_pct: float = 1.0
+    daily_drawdown_warn_pct: float = 3.0
+    max_open_risk_pct: float = 2.0
+    # Leverage bounds (prop default 1–5; aggressive mode uses 20–100)
+    leverage_ceiling: float = 5.0
+    leverage_floor: float = 1.0
     min_rr: float = 1.2
     default_stop_atr_mult: float = 1.0
     default_tp_atr_mults: List[float] = field(default_factory=lambda: [0.7, 1.3, 2.0, 3.0])
     # Legacy alias (read-only migration)
     account_balance: float = 1000.0
-    max_leverage: int = 100
+    max_leverage: int = 5
 
 
 @dataclass
@@ -162,6 +168,39 @@ class LoggingConfig:
 
 
 @dataclass
+class TelegramConfig:
+    """Telegram alert policy.
+
+    Secrets (bot token, chat id) are NEVER loaded from YAML — only from
+    environment variables TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.
+    """
+
+    enabled: bool = False
+    # Runtime-only; populated exclusively from env in _apply_env_overrides
+    bot_token: str = ""
+    chat_id: str = ""
+    min_llm_confidence: float = 65.0
+    min_rank_score: float = 50.0
+    parse_mode: str = "HTML"
+    notify_on_empty: bool = False
+
+    def credentials_configured(self) -> bool:
+        return bool((self.bot_token or "").strip() and (self.chat_id or "").strip())
+
+
+@dataclass
+class SchedulerConfig:
+    enabled: bool = False
+    timezone: str = "Africa/Lagos"  # WAT
+    times: List[str] = field(default_factory=lambda: ["05:00", "16:00", "20:00"])
+    watchlist: List[str] = field(default_factory=list)
+    exchange: str = "bybit"
+    timeframe: str = "15m"
+    no_news: bool = False
+    only_prop_safe: bool = True
+
+
+@dataclass
 class AppConfig:
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -174,6 +213,8 @@ class AppConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     config_path: Optional[Path] = None
 
     def resolve_path(self, path: str) -> Path:
@@ -208,8 +249,14 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
     llm = data.get("llm", {}) or {}
     output = data.get("output", {}) or {}
     logging_cfg = data.get("logging", {}) or {}
+    tg = data.get("telegram", {}) or {}
+    sched = data.get("scheduler", {}) or {}
 
     sim_cap = risk.get("simulated_capital", risk.get("account_balance", 1000.0))
+    prop_mode = bool(risk.get("prop_mode", True))
+    default_lev_ceil = 5.0 if prop_mode else 100.0
+    default_lev_floor = 1.0 if prop_mode else 20.0
+    default_max_lev = 5 if prop_mode else 100
     return AppConfig(
         exchange=ExchangeConfig(
             default=str(ex.get("default", "bybit")),
@@ -242,9 +289,14 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             simulated_capital=float(sim_cap),
             account_balance=float(sim_cap),
             risk_per_trade_pct=float(risk.get("risk_per_trade_pct", 1.0)),
-            leverage_ceiling=float(risk.get("leverage_ceiling", risk.get("max_leverage", 100))),
-            leverage_floor=float(risk.get("leverage_floor", 20.0)),
-            max_leverage=int(risk.get("max_leverage", risk.get("leverage_ceiling", 100))),
+            prop_mode=prop_mode,
+            risk_per_trade_min_pct=float(risk.get("risk_per_trade_min_pct", 0.5)),
+            risk_per_trade_max_pct=float(risk.get("risk_per_trade_max_pct", 1.0)),
+            daily_drawdown_warn_pct=float(risk.get("daily_drawdown_warn_pct", 3.0)),
+            max_open_risk_pct=float(risk.get("max_open_risk_pct", 2.0)),
+            leverage_ceiling=float(risk.get("leverage_ceiling", risk.get("max_leverage", default_lev_ceil))),
+            leverage_floor=float(risk.get("leverage_floor", default_lev_floor)),
+            max_leverage=int(risk.get("max_leverage", risk.get("leverage_ceiling", default_max_lev))),
             min_rr=float(risk.get("min_rr", 1.2)),
             default_stop_atr_mult=float(risk.get("default_stop_atr_mult", 1.0)),
             default_tp_atr_mults=list(risk.get("default_tp_atr_mults", [0.7, 1.3, 2.0, 3.0])),
@@ -325,6 +377,26 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             rotation=str(logging_cfg.get("rotation", "10 MB")),
             retention=str(logging_cfg.get("retention", "14 days")),
         ),
+        telegram=TelegramConfig(
+            # Never read bot_token / chat_id from YAML (secrets → env only)
+            enabled=False,
+            bot_token="",
+            chat_id="",
+            min_llm_confidence=float(tg.get("min_llm_confidence", 65)),
+            min_rank_score=float(tg.get("min_rank_score", 50)),
+            parse_mode=str(tg.get("parse_mode", "HTML") or "HTML"),
+            notify_on_empty=bool(tg.get("notify_on_empty", False)),
+        ),
+        scheduler=SchedulerConfig(
+            enabled=bool(sched.get("enabled", True)),
+            timezone=str(sched.get("timezone", "Africa/Lagos") or "Africa/Lagos"),
+            times=list(sched.get("times", ["05:00", "16:00", "20:00"])),
+            watchlist=list(sched.get("watchlist", [])),
+            exchange=str(sched.get("exchange", "bybit") or "bybit"),
+            timeframe=str(sched.get("timeframe", "15m") or "15m"),
+            no_news=bool(sched.get("no_news", False)),
+            only_prop_safe=bool(sched.get("only_prop_safe", True)),
+        ),
         config_path=config_path,
     )
 
@@ -350,6 +422,28 @@ def _apply_env_overrides(cfg: AppConfig) -> AppConfig:
         cfg.risk.account_balance = cfg.risk.simulated_capital
     if os.getenv("RISK_PER_TRADE_PCT"):
         cfg.risk.risk_per_trade_pct = float(os.environ["RISK_PER_TRADE_PCT"])
+    if os.getenv("PROP_MODE"):
+        cfg.risk.prop_mode = os.environ["PROP_MODE"].strip().lower() in ("1", "true", "yes", "on")
+    # Telegram secrets: environment only — never from config.yaml
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    cfg.telegram.bot_token = token
+    cfg.telegram.chat_id = chat_id
+    # Auto-enable when both credentials are present (unless explicitly disabled)
+    force_tg = (os.getenv("TELEGRAM_ENABLED") or "").strip().lower()
+    if force_tg in ("0", "false", "no", "off"):
+        cfg.telegram.enabled = False
+    elif force_tg in ("1", "true", "yes", "on"):
+        cfg.telegram.enabled = bool(token and chat_id)
+    else:
+        cfg.telegram.enabled = bool(token and chat_id)
+    if os.getenv("SCHEDULER_ENABLED"):
+        cfg.scheduler.enabled = os.environ["SCHEDULER_ENABLED"].strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
     if os.getenv("TESSERACT_CMD"):
         cfg.ocr.tesseract_cmd = os.environ["TESSERACT_CMD"]
     if os.getenv("OLLAMA_BASE_URL"):

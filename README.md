@@ -35,6 +35,26 @@ Built to feel like a senior prop trader sitting next to you.
 - Save **Markdown + JSON**
 - Optional annotated chart image with levels / SL / TPs
 
+### Prop account toolkit
+- **Prop risk** (default): **0.5–1% risk per trade**, **max 5x leverage**, flags for high drawdown / wide stop / low R:R
+- **LLM confidence** with supporting vs opposing factors in reports
+- **Backtest**: `python main.py BTC --backtest --bars 500` (win rate, profit factor, max DD, equity curve)
+- **Scheduled scans** at **05:00 / 16:00 / 20:00 WAT** + **Telegram** high-confidence alerts
+
+**Telegram secrets are env-only** (never put tokens in `config.yaml` or commit them):
+
+```bash
+# Copy .env.example → .env (gitignored) and fill:
+export TELEGRAM_BOT_TOKEN="your-bot-token-from-BotFather"
+export TELEGRAM_CHAT_ID="your-chat-id"
+
+python scripts/run_scheduled_scans.py --once   # test one high-conf report now
+python scripts/run_scheduled_scans.py          # loop: 05:00 / 16:00 / 20:00 WAT
+# or: python main.py --scheduled-scan
+```
+
+Streamlit: **Scan & analyze** (manual, always fresh) + **Backtest** tabs.
+
 ---
 
 ## Project structure

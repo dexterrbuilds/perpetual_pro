@@ -68,6 +68,12 @@ def test_from_parsed_reads_llm_confidence():
             "direction": "short",
             "llm_confidence": 72,
             "confidence_reason": "HTF resistance holding with weak bounce.",
+            "confidence_detail": {
+                "summary": "Resistance + weak bounce support short.",
+                "supporting": ["HTF resistance"],
+                "opposing": ["Possible squeeze"],
+                "verdict": "medium",
+            },
             "signal_narrative": "Short bias into supply.",
             "key_reasons": ["Rejection wick"],
             "key_risks": ["Squeeze risk"],
@@ -79,6 +85,8 @@ def test_from_parsed_reads_llm_confidence():
     assert narrative.llm_confidence == 72
     assert "HTF resistance" in narrative.confidence_reason
     assert narrative.raw_ok is True
+    assert narrative.confidence_detail.get("verdict") == "medium"
+    assert narrative.confidence_detail.get("supporting")
 
 
 def test_from_parsed_caps_flat_confidence():

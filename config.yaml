@@ -22,17 +22,50 @@ exchange:
   sandbox: false
 
 risk:
+  # Prop account management defaults
+  prop_mode: true
   # Simulated capital for position sizing (NOT a live exchange balance)
   simulated_capital: 1000.0
+  # Risk per trade clamped to [risk_per_trade_min_pct, risk_per_trade_max_pct] in prop mode
   risk_per_trade_pct: 1.0
-  # Aggressive perp leverage (always ≥20x)
-  leverage_ceiling: 100.0
-  leverage_floor: 20.0
+  risk_per_trade_min_pct: 0.5
+  risk_per_trade_max_pct: 1.0
+  daily_drawdown_warn_pct: 3.0
+  max_open_risk_pct: 2.0
+  # Prop max leverage 5x
+  max_leverage: 5
+  leverage_ceiling: 5.0
+  leverage_floor: 1.0
   min_rr: 1.2
   # Tight stops for scalps / day trades
   default_stop_atr_mult: 1.0
   # TP1–TP4: realistic short-term targets (ATR multiples)
   default_tp_atr_mults: [0.7, 1.3, 2.0, 3.0]
+
+# Telegram alert policy (credentials NEVER go here — use env only):
+#   TELEGRAM_BOT_TOKEN
+#   TELEGRAM_CHAT_ID
+# Optional: TELEGRAM_ENABLED=1 to force-enable when credentials are set
+telegram:
+  # enabled is auto-true when both env credentials are present (see load_config)
+  min_llm_confidence: 65
+  min_rank_score: 50
+  parse_mode: "HTML"
+  notify_on_empty: false
+
+# Auto watchlist scans at best WAT windows (credentials via env above)
+scheduler:
+  enabled: true
+  timezone: "Africa/Lagos"   # WAT
+  times:
+    - "05:00"
+    - "16:00"
+    - "20:00"
+  watchlist: []          # empty → built-in default coins
+  exchange: bybit
+  timeframe: "15m"
+  no_news: false
+  only_prop_safe: true
 
 # Day-trade stack: 5m + 15m primary, 1h drive, 4h confirmation only
 timeframes:

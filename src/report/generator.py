@@ -245,6 +245,7 @@ class ReportGenerator:
                 "technical_confidence": getattr(analysis, "technical_confidence", analysis.confidence),
                 "llm_confidence": getattr(analysis, "llm_confidence", 0.0),
                 "llm_confidence_reason": getattr(analysis, "llm_confidence_reason", ""),
+                "llm_confidence_detail": getattr(analysis, "llm_confidence_detail", {}) or {},
                 "rank_score": getattr(analysis, "rank_score", 0.0),
                 "setup_name": analysis.setup_name,
                 "strategy_tags": analysis.strategy_tags,
@@ -256,6 +257,7 @@ class ReportGenerator:
             "technical_confidence": getattr(analysis, "technical_confidence", analysis.confidence),
             "llm_confidence": getattr(analysis, "llm_confidence", 0.0),
             "llm_confidence_reason": getattr(analysis, "llm_confidence_reason", ""),
+            "llm_confidence_detail": getattr(analysis, "llm_confidence_detail", {}) or {},
             "rank_score": getattr(analysis, "rank_score", 0.0),
             "setup_name": analysis.setup_name,
             "strategy_tags": analysis.strategy_tags,
@@ -321,13 +323,22 @@ class ReportGenerator:
                 "headline": setup["headline"],
                 "pro_lines": setup["pro_lines"],
                 "is_simulation": True,
+                "prop_mode": getattr(plan, "prop_mode", True),
+                "prop_safe": getattr(plan, "prop_safe", True),
+                "prop_flags": list(getattr(plan, "prop_flags", None) or []),
+                "max_leverage_allowed": getattr(plan, "max_leverage_allowed", 5.0),
             }
+            data["prop_safe"] = getattr(plan, "prop_safe", True)
+            data["prop_flags"] = list(getattr(plan, "prop_flags", None) or [])
         if getattr(analysis, "llm", None):
             llm = analysis.llm
             data["llm_narrative"] = {
                 "signal_narrative": llm.signal_narrative,
                 "llm_confidence": getattr(llm, "llm_confidence", analysis.llm_confidence),
                 "confidence_reason": getattr(llm, "confidence_reason", analysis.llm_confidence_reason),
+                "confidence_detail": getattr(llm, "confidence_detail", None)
+                or getattr(analysis, "llm_confidence_detail", {})
+                or {},
                 "leverage_reasoning": llm.leverage_reasoning,
                 "key_reasons": llm.key_reasons,
                 "key_risks": llm.key_risks,
@@ -432,18 +443,36 @@ class ReportGenerator:
             f"- **Tags:** {', '.join(analysis.strategy_tags)}",
             f"- **Confluence:** {analysis.confluence_total:+.3f}",
             "",
-            "## 🚨 Primary Setup",
+            "## LLM Confidence",
             "",
         ]
+        detail = getattr(analysis, "llm_confidence_detail", None) or {}
+        lines.append(f"- **Score:** {getattr(analysis, 'llm_confidence', 0):.0f}%")
+        lines.append(f"- **Headline:** {getattr(analysis, 'llm_confidence_reason', '') or '—'}")
+        if detail.get("verdict"):
+            lines.append(f"- **Verdict:** {detail.get('verdict')}")
+        if detail.get("summary"):
+            lines.append(f"- **Why:** {detail.get('summary')}")
+        for s in detail.get("supporting") or []:
+            lines.append(f"- ✅ {s}")
+        for o in detail.get("opposing") or []:
+            lines.append(f"- ⚠️ {o}")
+        lines += ["", "## 🚨 Primary Setup", ""]
         if plan:
             for line in plan.to_pro_lines(analysis.symbol, price):
                 lines.append(f"**{line}**" if line.startswith("🚨") or line.startswith("⏸") else f"- {line}")
             lines += [
                 "",
-                f"- **Sim leverage:** {plan.leverage_suggested:.0f}x",
+                f"- **Sim leverage:** {plan.leverage_suggested:.0f}x (max {getattr(plan, 'max_leverage_allowed', 5):.0f}x)",
+                f"- **Risk:** {plan.risk_pct:.2f}%",
+                f"- **Prop-safe:** {getattr(plan, 'prop_safe', True)}",
                 f"- **Quality:** {plan.quality}",
                 "",
             ]
+            flags = getattr(plan, "prop_flags", None) or []
+            if flags:
+                lines.append(f"- **Flags:** {', '.join(flags)}")
+                lines.append("")
         else:
             lines.append("_No trade plan_\n")
 

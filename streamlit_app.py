@@ -409,6 +409,8 @@ def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") ->
             "price",
             "llm_confidence",
             "rank_score",
+            "prop_safe",
+            "risk_pct",
             "confidence",
             "technical_confidence",
             "confluence_score",
@@ -689,6 +691,25 @@ def render_single_analysis(symbol: str, timeframe: str, exchange: str, no_news: 
             f"**LLM Confidence: {_safe_float(llm_c):.0f}%**"
             + (f" — {llm_reason}" if llm_reason else "")
         )
+    detail = (
+        payload.get("llm_confidence_detail")
+        or (payload.get("llm_narrative") or {}).get("confidence_detail")
+        or {}
+    )
+    if detail:
+        with st.expander("Why the model is confident (or not)", expanded=True):
+            if detail.get("verdict"):
+                st.write(f"**Verdict:** `{detail.get('verdict')}`")
+            if detail.get("summary"):
+                st.write(detail["summary"])
+            if detail.get("supporting"):
+                st.write("**Supporting**")
+                for s in detail["supporting"][:6]:
+                    st.write(f"- ✅ {s}")
+            if detail.get("opposing"):
+                st.write("**Opposing / risks**")
+                for o in detail["opposing"][:6]:
+                    st.write(f"- ⚠️ {o}")
 
     conf_total = payload.get("confluence_total")
     tech_c = payload.get("technical_confidence")
@@ -702,6 +723,12 @@ def render_single_analysis(symbol: str, timeframe: str, exchange: str, no_news: 
         meta_bits.append(f"Rank score {_safe_float(rank_s):.1f}")
     if payload.get("confidence") is not None:
         meta_bits.append(f"Blended conf {_safe_float(payload.get('confidence')):.1f}%")
+    plan = payload.get("trade_plan") or {}
+    if plan.get("prop_safe") is False or payload.get("prop_safe") is False:
+        meta_bits.append("⚠ not prop-safe")
+    flags = plan.get("prop_flags") or payload.get("prop_flags") or []
+    if flags:
+        meta_bits.append("flags: " + ", ".join(flags))
     if meta_bits:
         st.caption(" · ".join(meta_bits))
 
@@ -752,16 +779,103 @@ def render_single_analysis(symbol: str, timeframe: str, exchange: str, no_news: 
     )
 
 
+def render_backtest_panel(symbol: str, timeframe: str, exchange: str) -> None:
+    st.subheader("Prop backtest")
+    st.caption(
+        "Historical EMA/RSI/ATR signal test with prop rules (0.5–1% risk, ≤5x leverage). "
+        "Approximation of the live stack — educational only."
+    )
+    bars = st.slider("Bars", min_value=150, max_value=1000, value=500, step=50, key="bt_bars")
+    if st.button("Run backtest", key="btn_run_backtest"):
+        from src.api.service import run_symbol_backtest
+
+        with st.spinner(f"Backtesting {symbol}…"):
+            result = run_symbol_backtest(
+                symbol,
+                timeframe=timeframe,
+                bars=int(bars),
+                exchange=exchange,
+                config=load_config(),
+            )
+        st.session_state["last_backtest"] = result
+
+    result = st.session_state.get("last_backtest")
+    if not result:
+        st.caption("Run a backtest to see win rate, profit factor, max drawdown, and equity curve.")
+        return
+    if not result.get("ok", True) and result.get("error"):
+        st.error(result.get("error"))
+        return
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Win rate", f"{_safe_float(result.get('win_rate')):.1f}%")
+    m2.metric("Profit factor", f"{_safe_float(result.get('profit_factor')):.2f}")
+    m3.metric("Max drawdown", f"{_safe_float(result.get('max_drawdown_pct')):.2f}%")
+    m4.metric("Net P/L", f"{_safe_float(result.get('net_pnl')):+.2f}")
+    st.caption(
+        f"Trades: {result.get('n_trades', 0)} · "
+        f"Final equity: ${_safe_float(result.get('final_equity')):,.2f} · "
+        f"Start: ${_safe_float(result.get('starting_equity')):,.2f}"
+    )
+    props = result.get("prop_settings") or {}
+    if props:
+        st.caption(
+            f"Prop: risk {props.get('risk_pct')}% · max lev {props.get('max_leverage')}x · "
+            f"mode={props.get('prop_mode')}"
+        )
+    curve = result.get("equity_curve") or []
+    if curve:
+        eq_df = pd.DataFrame(curve)
+        if "t" in eq_df.columns and "equity" in eq_df.columns:
+            eq_df = eq_df.set_index("t")
+            st.line_chart(eq_df["equity"], height=260)
+    trades = result.get("trades") or []
+    if trades:
+        with st.expander(f"Trades ({len(trades)} shown)"):
+            st.dataframe(pd.DataFrame(trades), use_container_width=True, hide_index=True)
+    for note in result.get("notes") or []:
+        st.caption(note)
+
+
 def main() -> None:
     _check_access()
-    st.title("Perpetual Pro")
+    st.title("Perpetual Pro — Prop toolkit")
+    try:
+        cfg = load_config()
+        prop_on = bool(getattr(cfg.risk, "prop_mode", True))
+        # Secrets live in env only — never check/display token values
+        from src.notify.telegram import is_telegram_ready
+
+        tg_ok = is_telegram_ready(cfg)
+    except Exception:  # noqa: BLE001
+        cfg = None
+        prop_on = True
+        tg_ok = False
+
     st.caption(
-        "Private-friendly web companion with multi-exchange fallback, "
-        f"{SCAN_LEVERAGE_CAP}x display leverage priority, and full trade cards."
+        "Prop account management: ≤5x leverage · 0.5–1% risk · LLM confidence · "
+        "scheduled WAT scans + Telegram. Manual scan stays fresh (no cache)."
     )
 
     with st.sidebar:
         st.header("Inputs")
+        if prop_on:
+            st.success("Prop mode: ≤5x · 0.5–1% risk")
+        else:
+            st.warning("Aggressive mode (prop_mode=false)")
+        st.caption(
+            "Telegram: "
+            + (
+                "ready (env TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)"
+                if tg_ok
+                else "not configured — set env vars (never commit secrets)"
+            )
+        )
+        if cfg and cfg.scheduler.times:
+            st.caption(
+                f"Schedule (WAT): {', '.join(cfg.scheduler.times)} · "
+                f"tz={cfg.scheduler.timezone} · high-confidence only"
+            )
         symbol = st.text_input(
             "Symbol",
             value="BTC",
@@ -775,7 +889,7 @@ def main() -> None:
             key="input_timeframe",
         )
         try:
-            default_ex = load_config().exchange.default or "bybit"
+            default_ex = (cfg.exchange.default if cfg else None) or "bybit"
         except Exception:  # noqa: BLE001
             default_ex = "bybit"
         ex_index = EXCHANGE_OPTIONS.index(default_ex) if default_ex in EXCHANGE_OPTIONS else 0
@@ -786,7 +900,6 @@ def main() -> None:
             key="input_exchange",
         )
         st.caption("If the symbol is missing on the preferred venue, others are tried automatically.")
-        # Default: fetch news (recent lookback). Key bumped so old sessions reset to unchecked.
         no_news = st.checkbox(
             "Skip news",
             value=False,
@@ -798,45 +911,49 @@ def main() -> None:
             result = call_backend("/health")
             st.json(result)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        run_single = st.button("Run single analysis", type="primary", key="btn_run_single")
-    with col2:
-        watchlist = st.text_area(
-            "Symbols (comma-separated)",
-            value=DEFAULT_WATCHLIST,
-            height=100,
-            key="input_watchlist",
-        )
-        run_scan = st.button("Scan watchlist", key="btn_scan_watchlist")
+    tab_scan, tab_bt = st.tabs(["Scan & analyze", "Backtest"])
 
-    if run_single:
-        render_single_analysis(symbol, timeframe, exchange, no_news)
-
-    if run_scan:
-        symbols = normalize_symbol_list(watchlist)
-        if not symbols:
-            st.warning("Add at least one symbol to scan.")
-        else:
-            # Always start clean: drop prior ranked table before re-fetching
-            st.session_state.pop("last_scan", None)
-            with st.spinner(f"Scanning {len(symbols)} symbols (fresh data + news)…"):
-                payload = scan_symbols(symbols, timeframe, exchange, no_news)
-            st.session_state["last_scan"] = payload
-            st.session_state["last_scan_at"] = datetime.now(timezone.utc).strftime(
-                "%Y-%m-%d %H:%M:%S UTC"
+    with tab_scan:
+        col1, col2 = st.columns(2)
+        with col1:
+            run_single = st.button("Run single analysis", type="primary", key="btn_run_single")
+        with col2:
+            watchlist = st.text_area(
+                "Symbols (comma-separated)",
+                value=DEFAULT_WATCHLIST,
+                height=100,
+                key="input_watchlist",
             )
+            run_scan = st.button("Scan watchlist", key="btn_scan_watchlist")
 
-    st.divider()
-    st.subheader("Ranked signals")
-    # Render scan results only once (from session state) so widget IDs stay unique
-    if st.session_state.get("last_scan"):
-        scanned_at = st.session_state.get("last_scan_at")
-        if scanned_at:
-            st.caption(f"Last fresh scan: {scanned_at}")
-        render_scan_results(st.session_state["last_scan"], key_prefix="scan")
-    else:
-        st.caption("Run a watchlist scan to populate ranked signals.")
+        if run_single:
+            render_single_analysis(symbol, timeframe, exchange, no_news)
+
+        if run_scan:
+            symbols = normalize_symbol_list(watchlist)
+            if not symbols:
+                st.warning("Add at least one symbol to scan.")
+            else:
+                st.session_state.pop("last_scan", None)
+                with st.spinner(f"Scanning {len(symbols)} symbols (fresh data + news)…"):
+                    payload = scan_symbols(symbols, timeframe, exchange, no_news)
+                st.session_state["last_scan"] = payload
+                st.session_state["last_scan_at"] = datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%S UTC"
+                )
+
+        st.divider()
+        st.subheader("Ranked signals")
+        if st.session_state.get("last_scan"):
+            scanned_at = st.session_state.get("last_scan_at")
+            if scanned_at:
+                st.caption(f"Last fresh scan: {scanned_at}")
+            render_scan_results(st.session_state["last_scan"], key_prefix="scan")
+        else:
+            st.caption("Run a watchlist scan to populate ranked signals.")
+
+    with tab_bt:
+        render_backtest_panel(symbol, timeframe, exchange)
 
 
 if __name__ == "__main__":

@@ -107,7 +107,14 @@ def test_structure_analyzer_runs():
 
 
 def test_risk_manager_long_plan():
-    rm = RiskManager(simulated_capital=1000, risk_pct=1.0)
+    from src.utils.config import RiskConfig
+
+    # Prop mode (default product path)
+    rm = RiskManager(
+        risk_cfg=RiskConfig(prop_mode=True, max_leverage=5, leverage_ceiling=5, leverage_floor=1),
+        simulated_capital=1000,
+        risk_pct=1.0,
+    )
     plan = rm.build_plan(
         "long",
         price=100.0,
@@ -122,9 +129,9 @@ def test_risk_manager_long_plan():
     assert plan.position_size_units > 0
     assert plan.primary_rr > 0
     assert plan.simulated_capital == 1000
-    # Aggressive perp band: never sub-20x
-    assert plan.leverage_suggested >= 20
-    assert plan.leverage_suggested <= 100
+    assert 0.5 <= plan.risk_pct <= 1.0
+    assert plan.leverage_suggested <= 5
+    assert plan.prop_mode is True
     assert len(plan.potential_profits) >= 4
     assert plan.is_simulation is True
     assert plan.hold_detail
@@ -137,6 +144,24 @@ def test_risk_manager_long_plan():
     assert setup["tp4"] is not None
     sim = plan.to_position_simulation()
     assert sim["risk_amount"] > 0
+
+
+def test_risk_manager_aggressive_band():
+    from src.utils.config import RiskConfig
+
+    rm = RiskManager(
+        risk_cfg=RiskConfig(
+            prop_mode=False,
+            leverage_floor=20,
+            leverage_ceiling=100,
+            max_leverage=100,
+        ),
+        simulated_capital=1000,
+        risk_pct=1.0,
+    )
+    plan = rm.build_plan("long", price=100.0, atr=2.0, confidence=70, primary_tf="15m")
+    assert plan.leverage_suggested >= 20
+    assert plan.leverage_suggested <= 100
 
 
 def test_load_config_defaults():

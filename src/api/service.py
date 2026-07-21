@@ -607,9 +607,10 @@ def scan_symbols(
                     or (analysis.key_reasons[:1] or [analysis.setup_name or ""])[0]
                 )
                 reason = llm_reason
-                primary = (
-                    analysis.trade_plan.to_primary_setup() if analysis.trade_plan else None
-                )
+                plan = analysis.trade_plan
+                primary = plan.to_primary_setup() if plan else None
+                prop_safe = bool(getattr(plan, "prop_safe", True)) if plan else True
+                prop_flags = list(getattr(plan, "prop_flags", None) or []) if plan else []
                 row = {
                     "symbol": normalized_symbol,
                     "exchange": fetch.exchange_used,
@@ -622,19 +623,23 @@ def scan_symbols(
                     "technical_confidence": round(float(analysis.technical_confidence), 1),
                     "llm_confidence": round(float(analysis.llm_confidence), 1),
                     "llm_confidence_reason": analysis.llm_confidence_reason,
+                    "llm_confidence_detail": getattr(analysis, "llm_confidence_detail", {}) or {},
                     "rank_score": round(float(analysis.rank_score), 2),
                     "confluence_score": round(float(analysis.confluence_total), 3),
                     "setup_name": analysis.setup_name,
                     "leverage": leverage,
                     "model_leverage": int(round(float(model_lev))),
+                    "risk_pct": round(float(getattr(plan, "risk_pct", 1.0) or 1.0), 2) if plan else 1.0,
+                    "prop_safe": prop_safe,
+                    "prop_flags": prop_flags,
                     "reason": reason,
                     "price": analysis.meta.get("price") if analysis.meta else None,
                     "support": analysis.key_levels[0].get("mid") if analysis.key_levels else None,
                     "resistance": analysis.key_levels[1].get("mid") if len(analysis.key_levels) > 1 else None,
-                    "entry_low": getattr(analysis.trade_plan, "entry_low", None) if analysis.trade_plan else None,
-                    "entry_high": getattr(analysis.trade_plan, "entry_high", None) if analysis.trade_plan else None,
-                    "stop_loss": getattr(analysis.trade_plan, "stop_loss", None) if analysis.trade_plan else None,
-                    "hold_label": getattr(analysis.trade_plan, "hold_label", "") if analysis.trade_plan else "",
+                    "entry_low": getattr(plan, "entry_low", None) if plan else None,
+                    "entry_high": getattr(plan, "entry_high", None) if plan else None,
+                    "stop_loss": getattr(plan, "stop_loss", None) if plan else None,
+                    "hold_label": getattr(plan, "hold_label", "") if plan else "",
                     "payload": {
                         "bias": analysis.bias,
                         "direction": analysis.direction,
@@ -642,6 +647,7 @@ def scan_symbols(
                         "technical_confidence": analysis.technical_confidence,
                         "llm_confidence": analysis.llm_confidence,
                         "llm_confidence_reason": analysis.llm_confidence_reason,
+                        "llm_confidence_detail": getattr(analysis, "llm_confidence_detail", {}) or {},
                         "rank_score": analysis.rank_score,
                         "setup_name": analysis.setup_name,
                         "confluence_total": analysis.confluence_total,
@@ -649,10 +655,10 @@ def scan_symbols(
                         "key_reasons": analysis.key_reasons[:3],
                         "trade_plan": primary,
                         "primary_setup": primary,
+                        "prop_safe": prop_safe,
+                        "prop_flags": prop_flags,
                         "position_simulation": (
-                            analysis.trade_plan.to_position_simulation()
-                            if analysis.trade_plan
-                            else None
+                            plan.to_position_simulation() if plan else None
                         ),
                     },
                 }
@@ -705,7 +711,36 @@ def scan_symbols(
         "exchange": ex_id,
         "leverage_display_cap": SCAN_LEVERAGE_CAP,
         "ranking": "llm_confidence + technical confluence (flat excluded)",
+        "prop_mode": bool(getattr(cfg.risk, "prop_mode", True)),
     }
+
+
+def run_symbol_backtest(
+    symbol: str,
+    *,
+    timeframe: Optional[str] = None,
+    bars: int = 500,
+    exchange: Optional[str] = None,
+    config: Optional[AppConfig] = None,
+) -> Dict[str, Any]:
+    """Prop-oriented historical backtest wrapper for API / Streamlit / CLI."""
+    from src.analysis.backtest import run_backtest
+
+    cfg = config or load_config()
+    try:
+        result = run_backtest(
+            symbol,
+            timeframe=timeframe or cfg.timeframes.primary,
+            bars=bars,
+            config=cfg,
+            exchange=exchange or cfg.exchange.default,
+        )
+        out = result.to_dict()
+        out["ok"] = True
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Backtest failed for {}: {}", symbol, exc)
+        return {"ok": False, "error": str(exc), "symbol": symbol}
 
 
 def _apply_vision_conflict_warnings(

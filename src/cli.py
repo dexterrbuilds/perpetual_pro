@@ -422,6 +422,22 @@ Examples:
         action="store_true",
         help="List supported exchanges and exit",
     )
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        help="Run prop-oriented historical backtest for the given symbol",
+    )
+    parser.add_argument(
+        "--bars",
+        type=int,
+        default=500,
+        help="OHLCV bars for --backtest (default 500)",
+    )
+    parser.add_argument(
+        "--scheduled-scan",
+        action="store_true",
+        help="Run one scheduled watchlist scan (+ Telegram if configured)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="DEBUG logging")
     return parser
 
@@ -440,6 +456,41 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.verbose:
         config.logging.level = "DEBUG"
     setup_logging(config)
+
+    if args.scheduled_scan:
+        from src.scheduler.scan_job import run_scheduled_scan_once
+
+        out = run_scheduled_scan_once(config, slot_label="cli", send=True)
+        console.print(out.get("report") or out)
+        return 0 if out.get("ok") else 1
+
+    if args.backtest:
+        from src.api.service import run_symbol_backtest
+
+        if not args.symbol:
+            parser.error("symbol is required with --backtest")
+        result = run_symbol_backtest(
+            args.symbol,
+            timeframe=args.timeframe,
+            bars=args.bars,
+            exchange=args.exchange,
+            config=config,
+        )
+        if not result.get("ok", True) and result.get("error"):
+            console.print(f"[red]Backtest failed:[/] {result['error']}")
+            return 1
+        console.print(
+            Panel(
+                f"Symbol: {result.get('symbol')}\n"
+                f"Trades: {result.get('n_trades')} · Win rate: {result.get('win_rate')}%\n"
+                f"Profit factor: {result.get('profit_factor')} · Max DD: {result.get('max_drawdown_pct')}%\n"
+                f"Net P/L: {result.get('net_pnl')} ({result.get('net_pnl_pct')}%)\n"
+                f"Equity: {result.get('starting_equity')} → {result.get('final_equity')}",
+                title="Prop backtest",
+                border_style="cyan",
+            )
+        )
+        return 0
 
     screen_mode = args.screen or args.region or args.image or args.full_screen
 

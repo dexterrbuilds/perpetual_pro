@@ -28,7 +28,7 @@ class TradePlan:
     position_size_units: float = 0.0
     position_size_notional: float = 0.0
     margin_required: float = 0.0
-    leverage_suggested: float = 20.0
+    leverage_suggested: float = 5.0
     leverage_reasoning: str = ""
     potential_profits: List[float] = field(default_factory=list)  # $ at each TP
     potential_profit_pcts: List[float] = field(default_factory=list)  # % of capital
@@ -43,6 +43,11 @@ class TradePlan:
     hold_hours_max: float = 24.0
     # Explicit: no hardcoded exchange leverage / balance claims
     is_simulation: bool = True
+    # Prop account management
+    prop_mode: bool = True
+    prop_safe: bool = True
+    prop_flags: List[str] = field(default_factory=list)
+    max_leverage_allowed: float = 5.0
 
     @property
     def entry_mid(self) -> float:
@@ -98,6 +103,11 @@ class TradePlan:
             "hold_hours_max": self.hold_hours_max,
             "invalidation": self.invalidation,
             "quality": self.quality,
+            "prop_mode": self.prop_mode,
+            "prop_safe": self.prop_safe,
+            "prop_flags": list(self.prop_flags),
+            "max_leverage_allowed": self.max_leverage_allowed,
+            "risk_pct": self.risk_pct,
         }
 
     def to_position_simulation(self) -> Dict[str, Any]:
@@ -116,6 +126,10 @@ class TradePlan:
             "atr": self.atr,
             "atr_pct": self.atr_pct,
             "notes": self.notes,
+            "prop_mode": self.prop_mode,
+            "prop_safe": self.prop_safe,
+            "prop_flags": list(self.prop_flags),
+            "max_leverage_allowed": self.max_leverage_allowed,
         }
 
     def to_pro_lines(self, symbol: str, price: Optional[float] = None) -> List[str]:
@@ -144,7 +158,13 @@ class TradePlan:
             lines.append(
                 f"{emoji} TP{i}: {format_price(tp, ref)}  ·  R:R {rr:.2f}"
             )
-        lines.append(f"⚡ Suggested Leverage: {self.leverage_suggested:.0f}x")
+        lines.append(f"⚡ Suggested Leverage: {self.leverage_suggested:.0f}x (max {self.max_leverage_allowed:.0f}x)")
+        lines.append(f"📉 Risk: {self.risk_pct:.2f}% of capital (${self.risk_amount:,.2f})")
+        if self.prop_mode:
+            safe = "YES" if self.prop_safe else "NO — review flags"
+            lines.append(f"🛡 Prop-safe: {safe}")
+            if self.prop_flags:
+                lines.append(f"⚠ Flags: {', '.join(self.prop_flags)}")
         if self.hold_detail:
             lines.append(f"⏱ {self.hold_detail}")
         if self.invalidation:
@@ -162,16 +182,20 @@ class ScenarioSet:
 
 class RiskManager:
     """
-    Build aggressive crypto-perp trade plans:
+    Build crypto-perp trade plans with prop-aware defaults:
     - structure/ATR stops & TP1–TP4
-    - dynamic leverage 20x–100x from ATR%, confidence, funding
+    - prop mode: risk 0.5–1%, leverage ≤5x, drawdown flags
+    - aggressive mode (prop_mode=false): dynamic leverage 20x–100x
     - simulated capital + fixed risk %
     - scalp / day-trade hold windows (max 12–24h unless strong swing)
     """
 
-    # Perp-native floor/ceiling — never suggest sub-20x for directional perps
-    DEFAULT_LEV_FLOOR = 20.0
-    DEFAULT_LEV_CEILING = 100.0
+    # Aggressive band (when prop_mode is false)
+    AGGRESSIVE_LEV_FLOOR = 20.0
+    AGGRESSIVE_LEV_CEILING = 100.0
+    # Prop band
+    PROP_LEV_FLOOR = 1.0
+    PROP_LEV_CEILING = 5.0
     # Short-term TP stack (ATR multiples) — scalp / day-trade realistic
     DEFAULT_TP_MULTS = [0.7, 1.3, 2.0, 3.0]
 
@@ -192,6 +216,21 @@ class RiskManager:
         if risk_pct is not None:
             self.risk.risk_per_trade_pct = float(risk_pct)
 
+    @property
+    def prop_mode(self) -> bool:
+        return bool(getattr(self.risk, "prop_mode", True))
+
+    def _clamp_risk_pct(self, risk_pct: float) -> float:
+        """Enforce 0.5–1% band in prop mode."""
+        risk_pct = float(risk_pct or 1.0)
+        if not self.prop_mode:
+            return max(0.1, min(5.0, risk_pct))
+        lo = float(getattr(self.risk, "risk_per_trade_min_pct", 0.5) or 0.5)
+        hi = float(getattr(self.risk, "risk_per_trade_max_pct", 1.0) or 1.0)
+        if lo > hi:
+            lo, hi = 0.5, 1.0
+        return float(clamp(risk_pct, lo, hi))
+
     def build_plan(
         self,
         direction: str,
@@ -209,14 +248,22 @@ class RiskManager:
         atr = max(safe_float(atr), price * 0.001)
         price = safe_float(price)
         capital = float(getattr(self.risk, "simulated_capital", None) or 1000.0)
-        risk_pct = float(self.risk.risk_per_trade_pct or 1.0)
+        risk_pct = self._clamp_risk_pct(float(self.risk.risk_per_trade_pct or 1.0))
         atr_pct = (atr / price * 100.0) if price else 0.0
         tags = list(strategy_tags or [])
+        max_lev = (
+            float(getattr(self.risk, "max_leverage", None) or self.PROP_LEV_CEILING)
+            if self.prop_mode
+            else float(getattr(self.risk, "leverage_ceiling", None) or self.AGGRESSIVE_LEV_CEILING)
+        )
+        if self.prop_mode:
+            max_lev = min(max_lev, self.PROP_LEV_CEILING)
 
         if direction not in ("long", "short"):
             hold_label, hold_detail, hold_max = suggest_hold_window(
                 primary_tf, setup_name, tags, direction, confidence
             )
+            floor = self.PROP_LEV_FLOOR if self.prop_mode else self.AGGRESSIVE_LEV_FLOOR
             return TradePlan(
                 direction="flat",
                 entry_low=price,
@@ -229,11 +276,15 @@ class RiskManager:
                 notes=["No trade — wait for clearer bias / structure."],
                 quality="poor",
                 invalidation="N/A",
-                leverage_suggested=self.DEFAULT_LEV_FLOOR,
+                leverage_suggested=floor,
                 leverage_reasoning="Flat bias — no leverage recommendation.",
                 hold_label=hold_label,
                 hold_detail=hold_detail,
                 hold_hours_max=hold_max,
+                prop_mode=self.prop_mode,
+                prop_safe=True,
+                prop_flags=["FLAT_NO_TRADE"],
+                max_leverage_allowed=max_lev,
             )
 
         # Tight scalp / day-trade stop (ATR multiples)
@@ -341,10 +392,15 @@ class RiskManager:
 
         risk_amount = capital * (risk_pct / 100.0)
         if confidence < 40:
-            risk_amount *= 0.5
-            effective_risk_pct = risk_pct * 0.5
+            cut = risk_pct * 0.5
+            if self.prop_mode:
+                cut = max(float(getattr(self.risk, "risk_per_trade_min_pct", 0.5) or 0.5), cut)
+            risk_amount = capital * (cut / 100.0)
+            effective_risk_pct = cut
         else:
             effective_risk_pct = risk_pct
+        effective_risk_pct = self._clamp_risk_pct(effective_risk_pct)
+        risk_amount = capital * (effective_risk_pct / 100.0)
 
         units = risk_amount / risk_per_unit
         notional = units * price
@@ -356,6 +412,14 @@ class RiskManager:
             units = notional / price
             risk_amount = units * risk_per_unit
             effective_risk_pct = (risk_amount / capital) * 100.0
+            if self.prop_mode:
+                hi = float(getattr(self.risk, "risk_per_trade_max_pct", 1.0) or 1.0)
+                if effective_risk_pct > hi:
+                    effective_risk_pct = hi
+                    risk_amount = capital * (hi / 100.0)
+                    units = risk_amount / risk_per_unit
+                    notional = units * price
+                    margin_required = notional / max(lev, 1e-9)
 
         potential_profits = [units * abs(tp - price) for tp in tps]
         potential_pcts = [(p / capital) * 100.0 for p in potential_profits]
@@ -367,11 +431,31 @@ class RiskManager:
             primary_tf, setup_name, tags, direction, confidence
         )
 
+        prop_flags = self._prop_flags(
+            atr_pct=atr_pct,
+            primary_rr=primary_rr,
+            min_rr=float(min_rr or 1.2),
+            effective_risk_pct=effective_risk_pct,
+            confidence=confidence,
+            lev=lev,
+        )
+        prop_safe = not any(
+            f in prop_flags
+            for f in ("HIGH_DRAWDOWN_RISK", "WIDE_STOP", "LOW_RR", "LOW_CONFIDENCE")
+        )
+
+        mode_note = (
+            f"PROP mode: risk {effective_risk_pct:.2f}% (band 0.5–1%), leverage ≤{max_lev:.0f}x."
+            if self.prop_mode
+            else (
+                f"Aggressive perp leverage ~{lev:.0f}x from ATR {atr_pct:.2f}%, "
+                f"confidence {confidence:.0f}% (floor 20x / ceiling 100x)."
+            )
+        )
         notes: List[str] = [
             f"SIMULATION: ${capital:,.2f} capital, risking {effective_risk_pct:.2f}% "
             f"(${risk_amount:,.2f}) at stop.",
-            f"Aggressive perp leverage ~{lev:.0f}x from ATR {atr_pct:.2f}%, "
-            f"confidence {confidence:.0f}%, funding context (floor 20x / ceiling 100x).",
+            mode_note,
             f"{hold_detail}",
             f"Position ≈ {units:.6g} units · notional ${notional:,.2f} · margin ${margin_required:,.2f}.",
         ]
@@ -385,8 +469,10 @@ class RiskManager:
                 f"R:R to TP1 is {primary_rr:.2f} < min {min_rr:.2f} — prefer tighter entry or skip."
             )
         if confidence < 40:
-            notes.append("Low confidence — size halved in simulation; consider standing aside.")
-        if lev >= 50:
+            notes.append("Low confidence — size reduced; consider standing aside.")
+        if prop_flags:
+            notes.append(f"Prop flags: {', '.join(prop_flags)}.")
+        if not self.prop_mode and lev >= 50:
             notes.append(
                 "High leverage — size small, trail hard after TP1, and respect the stop without exception."
             )
@@ -420,7 +506,37 @@ class RiskManager:
             hold_detail=hold_detail,
             hold_hours_max=hold_max,
             is_simulation=True,
+            prop_mode=self.prop_mode,
+            prop_safe=prop_safe,
+            prop_flags=prop_flags,
+            max_leverage_allowed=float(max_lev),
         )
+
+    def _prop_flags(
+        self,
+        *,
+        atr_pct: float,
+        primary_rr: float,
+        min_rr: float,
+        effective_risk_pct: float,
+        confidence: float,
+        lev: float,
+    ) -> List[str]:
+        flags: List[str] = []
+        if not self.prop_mode:
+            return flags
+        day_warn = float(getattr(self.risk, "daily_drawdown_warn_pct", 3.0) or 3.0)
+        if atr_pct > 2.5:
+            flags.append("WIDE_STOP")
+        if atr_pct > 3.5 or effective_risk_pct >= day_warn * 0.5:
+            flags.append("HIGH_DRAWDOWN_RISK")
+        if primary_rr < min_rr:
+            flags.append("LOW_RR")
+        if confidence < 40:
+            flags.append("LOW_CONFIDENCE")
+        if lev >= self.PROP_LEV_CEILING - 1e-9:
+            flags.append("LEV_CAPPED_5X")
+        return flags
 
     def _dynamic_leverage(
         self,
@@ -429,21 +545,17 @@ class RiskManager:
         funding_rate: Optional[float],
         direction: str,
     ) -> Tuple[float, str]:
-        """
-        Aggressive crypto-perp leverage: always in [20x, 100x].
+        """Prop: [1x, 5x]. Aggressive: [20x, 100x]."""
+        if self.prop_mode:
+            return self._prop_leverage(atr_pct, confidence, funding_rate, direction)
 
-        Lower ATR% (calmer tape) → higher lev; higher confidence → higher lev;
-        funding against the position → cut toward floor (still ≥20x).
-        """
-        raw_ceil = float(getattr(self.risk, "leverage_ceiling", None) or self.DEFAULT_LEV_CEILING)
-        raw_floor = float(getattr(self.risk, "leverage_floor", None) or self.DEFAULT_LEV_FLOOR)
-        # Enforce aggressive perp bounds regardless of stale config
-        ceiling = max(self.DEFAULT_LEV_FLOOR, min(100.0, raw_ceil if raw_ceil >= 20 else 100.0))
-        floor = max(self.DEFAULT_LEV_FLOOR, min(ceiling, raw_floor if raw_floor >= 20 else 20.0))
+        raw_ceil = float(getattr(self.risk, "leverage_ceiling", None) or self.AGGRESSIVE_LEV_CEILING)
+        raw_floor = float(getattr(self.risk, "leverage_floor", None) or self.AGGRESSIVE_LEV_FLOOR)
+        ceiling = max(self.AGGRESSIVE_LEV_FLOOR, min(100.0, raw_ceil if raw_ceil >= 20 else 100.0))
+        floor = max(self.AGGRESSIVE_LEV_FLOOR, min(ceiling, raw_floor if raw_floor >= 20 else 20.0))
         if floor > ceiling:
-            floor, ceiling = self.DEFAULT_LEV_FLOOR, self.DEFAULT_LEV_CEILING
+            floor, ceiling = self.AGGRESSIVE_LEV_FLOOR, self.AGGRESSIVE_LEV_CEILING
 
-        # Base from ATR% of price — calm books allow max aggression
         if atr_pct <= 0.4:
             base = 90.0
         elif atr_pct <= 0.7:
@@ -457,11 +569,9 @@ class RiskManager:
         elif atr_pct <= 4.0:
             base = 28.0
         else:
-            base = 22.0  # still ≥ floor after clamps
+            base = 22.0
 
-        # Confidence scale ~0.75 .. 1.35
         conf_mult = 0.75 + (clamp(confidence, 0, 100) / 100.0) * 0.60
-
         fund_mult = 1.0
         fund_note = "funding neutral"
         if funding_rate is not None:
@@ -483,7 +593,6 @@ class RiskManager:
 
         lev = base * conf_mult * fund_mult
         lev = float(clamp(lev, floor, ceiling))
-        # Round to neat 5x steps for perp UX (20, 25, 30 … 100)
         lev = max(floor, min(ceiling, round(lev / 5.0) * 5.0))
         if lev < floor:
             lev = floor
@@ -493,6 +602,50 @@ class RiskManager:
             f"×{conf_mult:.2f} confidence; {fund_note}; "
             f"clamped to [{floor:.0f}x–{ceiling:.0f}x] → {lev:.0f}x. "
             f"High leverage is for illustration — always size risk first."
+        )
+        return lev, reason
+
+    def _prop_leverage(
+        self,
+        atr_pct: float,
+        confidence: float,
+        funding_rate: Optional[float],
+        direction: str,
+    ) -> Tuple[float, str]:
+        """Conservative prop leverage in [1x, 5x]."""
+        ceiling = min(
+            self.PROP_LEV_CEILING,
+            float(getattr(self.risk, "leverage_ceiling", None) or self.PROP_LEV_CEILING),
+            float(getattr(self.risk, "max_leverage", None) or self.PROP_LEV_CEILING),
+        )
+        floor = max(
+            self.PROP_LEV_FLOOR,
+            min(ceiling, float(getattr(self.risk, "leverage_floor", None) or self.PROP_LEV_FLOOR)),
+        )
+        if atr_pct <= 0.5:
+            base = 5.0
+        elif atr_pct <= 1.0:
+            base = 4.0
+        elif atr_pct <= 1.8:
+            base = 3.0
+        elif atr_pct <= 2.5:
+            base = 2.5
+        else:
+            base = 2.0
+        conf_mult = 0.85 + (clamp(confidence, 0, 100) / 100.0) * 0.25
+        fund_note = "funding neutral"
+        if funding_rate is not None:
+            fr_pct = funding_rate * 100.0
+            if (direction == "long" and fr_pct > 0.05) or (direction == "short" and fr_pct < -0.05):
+                conf_mult *= 0.85
+                fund_note = f"hostile funding ({fr_pct:+.4f}%)"
+            else:
+                fund_note = f"funding {fr_pct:+.4f}%"
+        lev = float(clamp(base * conf_mult, floor, ceiling))
+        lev = max(floor, min(ceiling, round(lev)))
+        reason = (
+            f"Prop leverage ~{lev:.0f}x (max {ceiling:.0f}x) from ATR {atr_pct:.2f}%, "
+            f"confidence {confidence:.0f}%, {fund_note}. Risk first — never max margin."
         )
         return lev, reason
 

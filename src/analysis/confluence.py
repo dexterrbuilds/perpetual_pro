@@ -52,6 +52,7 @@ class FullAnalysis:
     technical_confidence: float = 0.0  # pure technical score
     llm_confidence: float = 0.0  # 0-100 play-out likelihood from LLM
     llm_confidence_reason: str = ""
+    llm_confidence_detail: Dict[str, Any] = field(default_factory=dict)
     rank_score: float = 0.0  # combined LLM + technical ranking score
     setup_name: str = ""
     strategy_tags: List[str] = field(default_factory=list)
@@ -315,6 +316,7 @@ class ConfluenceEngine:
                 # LLM play-out confidence
                 result.llm_confidence = float(narrative.llm_confidence or 0.0)
                 result.llm_confidence_reason = (narrative.confidence_reason or "").strip()
+                result.llm_confidence_detail = dict(getattr(narrative, "confidence_detail", None) or {})
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LLM narrative layer failed: {}", exc)
                 result.trader_commentary = self._commentary(result)
@@ -325,6 +327,16 @@ class ConfluenceEngine:
                     atr_pct=plan.atr_pct,
                     funding_rate_pct=funding_pct,
                 )
+                from src.analysis.llm import build_heuristic_confidence_detail
+
+                result.llm_confidence_detail = build_heuristic_confidence_detail(
+                    direction=direction,
+                    llm_confidence=result.llm_confidence,
+                    conf_reason=result.llm_confidence_reason,
+                    factors=result.factor_breakdown(),
+                    confluence_total=result.confluence_total,
+                    technical_confidence=conf,
+                )
         else:
             result.trader_commentary = self._commentary(result)
             result.llm_confidence, result.llm_confidence_reason = heuristic_llm_confidence(
@@ -333,6 +345,16 @@ class ConfluenceEngine:
                 confluence_total=result.confluence_total,
                 atr_pct=plan.atr_pct,
                 funding_rate_pct=funding_pct,
+            )
+            from src.analysis.llm import build_heuristic_confidence_detail
+
+            result.llm_confidence_detail = build_heuristic_confidence_detail(
+                direction=direction,
+                llm_confidence=result.llm_confidence,
+                conf_reason=result.llm_confidence_reason,
+                factors=result.factor_breakdown(),
+                confluence_total=result.confluence_total,
+                technical_confidence=conf,
             )
 
         if not result.llm_confidence_reason:
@@ -383,7 +405,10 @@ class ConfluenceEngine:
             "technical_confidence": result.technical_confidence,
             "llm_confidence": result.llm_confidence,
             "llm_confidence_reason": result.llm_confidence_reason,
+            "llm_confidence_detail": result.llm_confidence_detail,
             "rank_score": result.rank_score,
+            "prop_safe": bool(getattr(plan, "prop_safe", True)),
+            "prop_flags": list(getattr(plan, "prop_flags", None) or []),
         }
         logger.info(
             "Analysis {} {} bias={} tech={:.1f}% llm={:.1f}% rank={:.1f} score={:.3f} lev={:.1f}x",
