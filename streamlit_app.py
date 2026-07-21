@@ -24,7 +24,7 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 
 # Default watchlist (matches extension / prior web app coins)
 DEFAULT_WATCHLIST = (
-    "BTC,ETH,SOL,BNB,AAVE,ARB,OP,NEAR,INJ,SEI,BSV,TIA,ADA,SUI,APT,AVAX,TRXV,VIRTUAL,KAITO,UNI,JTO"
+    "BTC,ETH,SOL,BNB,AAVE,ARB,NEAR,INJ,SEI,TIA,SUI,APT,AVAX,TRX,UNI"
 )
 
 EXCHANGE_OPTIONS = [
@@ -754,7 +754,7 @@ def render_single_analysis(symbol: str, timeframe: str, exchange: str, no_news: 
 
 def main() -> None:
     _check_access()
-    st.title("Perpetual Pro — Web App")
+    st.title("Perpetual Pro")
     st.caption(
         "Private-friendly web companion with multi-exchange fallback, "
         f"{SCAN_LEVERAGE_CAP}x display leverage priority, and full trade cards."
