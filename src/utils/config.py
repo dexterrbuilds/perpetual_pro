@@ -55,7 +55,7 @@ class RiskConfig:
     risk_per_trade_max_pct: float = 1.0
     daily_drawdown_warn_pct: float = 3.0
     max_open_risk_pct: float = 2.0
-    # Leverage bounds (prop default 1–5; aggressive mode uses 20–100)
+    # Leverage bounds (prop default 1–5; day-trade mode uses 10–30)
     leverage_ceiling: float = 5.0
     leverage_floor: float = 1.0
     min_rr: float = 1.2
@@ -68,11 +68,13 @@ class RiskConfig:
 
 @dataclass
 class TimeframesConfig:
-    """Day-trade stack: 5m / 15m / 1h with 4h confirmation."""
+    """Day-trade stack: 15m execution, 1h drive, 4h confirmation."""
 
     primary: str = "15m"
-    higher: List[str] = field(default_factory=lambda: ["5m", "1h", "4h"])
+    higher: List[str] = field(default_factory=lambda: ["1h", "4h"])
     ohlcv_limit: int = 500
+    cache_ttl_seconds: int = 300
+    fetch_workers: int = 4
 
 
 @dataclass
@@ -87,16 +89,17 @@ class LLMConfig:
 
 @dataclass
 class AnalysisWeights:
-    """Short-term perp weights — momentum, funding, volume, micro-structure first."""
+    """Intraday perp weights. Directional inputs dominate contextual inputs."""
 
-    momentum: float = 0.20
-    derivatives: float = 0.16
-    structure: float = 0.14
-    volume: float = 0.12
-    multi_tf: float = 0.12
-    patterns: float = 0.10
-    trend: float = 0.10
-    news: float = 0.06
+    trend: float = 0.17
+    momentum: float = 0.18
+    structure: float = 0.17
+    multi_tf: float = 0.16
+    volume: float = 0.11
+    derivatives: float = 0.10
+    volatility: float = 0.07
+    patterns: float = 0.03
+    news: float = 0.01
 
 
 @dataclass
@@ -254,9 +257,9 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
 
     sim_cap = risk.get("simulated_capital", risk.get("account_balance", 1000.0))
     prop_mode = bool(risk.get("prop_mode", True))
-    default_lev_ceil = 5.0 if prop_mode else 100.0
-    default_lev_floor = 1.0 if prop_mode else 20.0
-    default_max_lev = 5 if prop_mode else 100
+    default_lev_ceil = 5.0 if prop_mode else 30.0
+    default_lev_floor = 1.0 if prop_mode else 10.0
+    default_max_lev = 5 if prop_mode else 30
     return AppConfig(
         exchange=ExchangeConfig(
             default=str(ex.get("default", "bybit")),
@@ -303,8 +306,10 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
         ),
         timeframes=TimeframesConfig(
             primary=str(tf.get("primary", "15m")),
-            higher=list(tf.get("higher", ["5m", "1h", "4h"])),
+            higher=list(tf.get("higher", ["1h", "4h"])),
             ohlcv_limit=int(tf.get("ohlcv_limit", 500)),
+            cache_ttl_seconds=max(0, int(tf.get("cache_ttl_seconds", 300))),
+            fetch_workers=max(1, min(8, int(tf.get("fetch_workers", 4)))),
         ),
         analysis=AnalysisConfig(
             rsi_period=int(an.get("rsi_period", 14)),
@@ -317,14 +322,15 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             ema_slow=int(an.get("ema_slow", 50)),
             ema_trend=int(an.get("ema_trend", 200)),
             weights=AnalysisWeights(
-                momentum=float(weights.get("momentum", 0.20)),
-                derivatives=float(weights.get("derivatives", 0.16)),
-                structure=float(weights.get("structure", 0.14)),
-                volume=float(weights.get("volume", 0.12)),
-                multi_tf=float(weights.get("multi_tf", 0.12)),
-                patterns=float(weights.get("patterns", 0.10)),
-                trend=float(weights.get("trend", 0.10)),
-                news=float(weights.get("news", 0.06)),
+                trend=float(weights.get("trend", 0.17)),
+                momentum=float(weights.get("momentum", 0.18)),
+                structure=float(weights.get("structure", 0.17)),
+                multi_tf=float(weights.get("multi_tf", 0.16)),
+                volume=float(weights.get("volume", 0.11)),
+                derivatives=float(weights.get("derivatives", 0.10)),
+                volatility=float(weights.get("volatility", 0.07)),
+                patterns=float(weights.get("patterns", 0.03)),
+                news=float(weights.get("news", 0.01)),
             ),
             min_confidence=float(an.get("min_confidence", 15)),
             max_confidence=float(an.get("max_confidence", 92)),

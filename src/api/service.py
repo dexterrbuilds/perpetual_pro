@@ -21,7 +21,7 @@ from src.data.multi_tf import fetch_multi_timeframe_with_fallback
 from src.data.news import NewsAnalyzer
 from src.report.generator import ReportGenerator
 from src.utils.config import AppConfig, load_config
-from src.utils.helpers import normalize_symbol
+from src.utils.helpers import clamp, normalize_symbol
 from src.vision.chart_detect import ChartVision
 from src.vision.ocr import OCREngine
 from src.vision.url_symbol import parse_chart_url
@@ -600,6 +600,45 @@ def scan_symbols(
                     risk_pct=req.risk_pct or 1.0,
                     use_llm=use_llm,
                 )
+                backtest_summary: Dict[str, Any] = {}
+                try:
+                    from src.analysis.backtest import run_backtest
+
+                    bt = run_backtest(
+                        normalized_symbol,
+                        timeframe=primary_tf,
+                        bars=len(mtf.primary),
+                        config=cfg,
+                        df=mtf.primary,
+                        step=3,
+                        warmup=min(80, max(40, len(mtf.primary) // 3)),
+                        indicator_suite=analysis.indicators,
+                    )
+                    sample_ok = bt.n_trades >= 3
+                    validation_score = float(
+                        clamp(
+                            50.0
+                            + (bt.win_rate - 50.0) * 0.45
+                            + (min(bt.profit_factor, 2.5) - 1.0) * 14.0
+                            - bt.max_drawdown_pct * 2.0,
+                            0.0,
+                            100.0,
+                        )
+                    ) if sample_ok else 50.0
+                    backtest_summary = {
+                        "sample_ok": sample_ok,
+                        "n_trades": bt.n_trades,
+                        "win_rate": bt.win_rate,
+                        "profit_factor": bt.profit_factor,
+                        "max_drawdown_pct": bt.max_drawdown_pct,
+                        "net_pnl_pct": bt.net_pnl_pct,
+                        "validation_score": round(validation_score, 1),
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Scan backtest skipped for {}: {}", normalized_symbol, exc)
+                    validation_score = 50.0
+                    sample_ok = False
+
                 model_lev = getattr(analysis.trade_plan, "leverage_suggested", 0) or 1
                 leverage = _cap_display_leverage(model_lev, SCAN_LEVERAGE_CAP)
                 llm_reason = (
@@ -611,6 +650,12 @@ def scan_symbols(
                 primary = plan.to_primary_setup() if plan else None
                 prop_safe = bool(getattr(plan, "prop_safe", True)) if plan else True
                 prop_flags = list(getattr(plan, "prop_flags", None) or []) if plan else []
+                live_rank_score = float(analysis.rank_score)
+                scan_rank_score = (
+                    0.90 * live_rank_score + 0.10 * validation_score
+                    if sample_ok
+                    else live_rank_score
+                )
                 row = {
                     "symbol": normalized_symbol,
                     "exchange": fetch.exchange_used,
@@ -624,13 +669,17 @@ def scan_symbols(
                     "llm_confidence": round(float(analysis.llm_confidence), 1),
                     "llm_confidence_reason": analysis.llm_confidence_reason,
                     "llm_confidence_detail": getattr(analysis, "llm_confidence_detail", {}) or {},
-                    "rank_score": round(float(analysis.rank_score), 2),
+                    "rank_score": round(scan_rank_score, 2),
+                    "live_rank_score": round(live_rank_score, 2),
                     "confluence_score": round(float(analysis.confluence_total), 3),
                     "setup_name": analysis.setup_name,
                     "leverage": leverage,
                     "model_leverage": int(round(float(model_lev))),
                     "risk_pct": round(float(getattr(plan, "risk_pct", 1.0) or 1.0), 2) if plan else 1.0,
                     "prop_safe": prop_safe,
+                    "signal_eligible": bool(
+                        analysis.meta.get("signal_eligible", False) if analysis.meta else False
+                    ),
                     "prop_flags": prop_flags,
                     "reason": reason,
                     "price": analysis.meta.get("price") if analysis.meta else None,
@@ -640,6 +689,7 @@ def scan_symbols(
                     "entry_high": getattr(plan, "entry_high", None) if plan else None,
                     "stop_loss": getattr(plan, "stop_loss", None) if plan else None,
                     "hold_label": getattr(plan, "hold_label", "") if plan else "",
+                    "backtest": backtest_summary,
                     "payload": {
                         "bias": analysis.bias,
                         "direction": analysis.direction,
@@ -648,7 +698,9 @@ def scan_symbols(
                         "llm_confidence": analysis.llm_confidence,
                         "llm_confidence_reason": analysis.llm_confidence_reason,
                         "llm_confidence_detail": getattr(analysis, "llm_confidence_detail", {}) or {},
-                        "rank_score": analysis.rank_score,
+                        "rank_score": scan_rank_score,
+                        "live_rank_score": live_rank_score,
+                        "backtest": backtest_summary,
                         "setup_name": analysis.setup_name,
                         "confluence_total": analysis.confluence_total,
                         "key_levels": analysis.key_levels[:4],
@@ -710,7 +762,7 @@ def scan_symbols(
         "timeframe": primary_tf,
         "exchange": ex_id,
         "leverage_display_cap": SCAN_LEVERAGE_CAP,
-        "ranking": "llm_confidence + technical confluence (flat excluded)",
+        "ranking": "90% live confluence/LLM + 10% same-data backtest validation (flat excluded)",
         "prop_mode": bool(getattr(cfg.risk, "prop_mode", True)),
     }
 

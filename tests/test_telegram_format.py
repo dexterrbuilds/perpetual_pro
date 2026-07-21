@@ -31,6 +31,16 @@ def test_format_prop_scan_report_with_rows():
                 "rank_score": 72,
                 "llm_confidence_reason": "MTF aligned with volume",
                 "prop_flags": ["LEV_CAPPED_5X"],
+                "entry_low": 112300,
+                "entry_high": 112500,
+                "stop_loss": 111900,
+                "hold_label": "2–8h day trade",
+                "backtest": {
+                    "sample_ok": True,
+                    "win_rate": 60,
+                    "profit_factor": 1.4,
+                    "n_trades": 10,
+                },
             }
         ],
         slot_label="16:00 WAT",
@@ -40,6 +50,8 @@ def test_format_prop_scan_report_with_rows():
     assert "112,450" in text or "112450" in text
     assert "LLM 78%" in text
     assert "MTF aligned" in text
+    assert "Entry" in text
+    assert "PF 1.40" in text
 
 
 def test_format_empty():

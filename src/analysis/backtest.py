@@ -13,10 +13,10 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from src.analysis.indicators import compute_indicators
+from src.analysis.indicators import IndicatorSuite, compute_indicators
 from src.data.exchange import ExchangeClient
 from src.utils.config import AppConfig, RiskConfig, load_config
-from src.utils.helpers import normalize_symbol, safe_float
+from src.utils.helpers import normalize_symbol, safe_float, timeframe_to_minutes
 
 
 @dataclass
@@ -68,7 +68,8 @@ def run_backtest(
     df: Optional[pd.DataFrame] = None,
     step: int = 4,
     warmup: int = 80,
-    max_hold_bars: int = 24,
+    max_hold_bars: Optional[int] = None,
+    indicator_suite: Optional[IndicatorSuite] = None,
 ) -> BacktestResult:
     """
     Run a simple long/short backtest with prop risk rules.
@@ -76,6 +77,9 @@ def run_backtest(
     If ``df`` is provided, no network fetch is performed (tests).
     """
     cfg = config or load_config()
+    if max_hold_bars is None:
+        # Enforce the day-trade horizon across timeframes (up to 24 hours).
+        max_hold_bars = max(1, int((24 * 60) / max(1, timeframe_to_minutes(timeframe))))
     risk: RiskConfig = cfg.risk
     prop = bool(getattr(risk, "prop_mode", True))
     risk_pct = float(risk.risk_per_trade_pct or 1.0)
@@ -122,7 +126,7 @@ def run_backtest(
     if not isinstance(work.index, pd.DatetimeIndex):
         work.index = pd.to_datetime(work.index, utc=True)
     try:
-        suite = compute_indicators(work, cfg)
+        suite = indicator_suite or compute_indicators(work, cfg)
         work = suite.df if suite is not None and suite.df is not None else work
     except Exception as exc:  # noqa: BLE001
         logger.warning("Indicator compute failed in backtest: {}", exc)
@@ -144,6 +148,16 @@ def run_backtest(
     ema_f = _col("ema_fast", "EMA_fast", "ema_9", "EMA_9")
     ema_m = _col("ema_mid", "EMA_mid", "ema_21", "EMA_21")
     rsi_col = _col("rsi", "RSI", "rsi_14", "RSI_14")
+    supertrend_col = _col("supertrend_dir", "SUPERTd_10_3.0", "SUPERTd_10_3")
+    vol_ratio_col = _col("vol_ratio")
+    macd_hist_col = next(
+        (c for c in work.columns if str(c).upper().startswith("MACDH")),
+        None,
+    )
+    bb_pos_col = next(
+        (c for c in work.columns if str(c).upper().startswith("BBP_")),
+        None,
+    )
 
     closes = work["close"].astype(float)
     highs = work["high"].astype(float)
@@ -215,7 +229,17 @@ def run_backtest(
             i += 1
             continue
 
-        direction = _signal_direction(work, i, ema_f, ema_m, rsi_col)
+        direction = _signal_direction(
+            work,
+            i,
+            ema_f,
+            ema_m,
+            rsi_col,
+            supertrend_col,
+            macd_hist_col,
+            bb_pos_col,
+            vol_ratio_col,
+        )
         if direction not in ("long", "short"):
             i += 1
             continue
@@ -314,9 +338,10 @@ def run_backtest(
             "max_leverage": max_lev,
             "stop_atr_mult": stop_atr,
             "tp_atr_mult": tp_atr,
+            "max_hold_hours": 24,
         },
         notes=[
-            "Rule-based EMA/RSI/ATR backtest — approximates live confluence stack.",
+            "Intraday EMA/Supertrend/RSI/MACD/Bollinger/volume/ATR validator.",
             f"Prop rules: risk {risk_pct}% · max lev {max_lev:.0f}x · one position at a time.",
         ],
     )
@@ -328,8 +353,12 @@ def _signal_direction(
     ema_f: Optional[str],
     ema_m: Optional[str],
     rsi_col: Optional[str],
+    supertrend_col: Optional[str] = None,
+    macd_hist_col: Optional[str] = None,
+    bb_pos_col: Optional[str] = None,
+    vol_ratio_col: Optional[str] = None,
 ) -> str:
-    """Lightweight directional bias at bar i."""
+    """Lightweight historical approximation of the live intraday stack."""
     close = float(df["close"].iloc[i])
     score = 0.0
     if ema_f and ema_m and pd.notna(df[ema_f].iloc[i]) and pd.notna(df[ema_m].iloc[i]):
@@ -345,6 +374,16 @@ def _signal_direction(
             score += 0.5
         elif rsi <= 45:
             score -= 0.5
+    if supertrend_col and pd.notna(df[supertrend_col].iloc[i]):
+        score += 0.75 if float(df[supertrend_col].iloc[i]) > 0 else -0.75
+    if macd_hist_col and pd.notna(df[macd_hist_col].iloc[i]):
+        score += 0.60 if float(df[macd_hist_col].iloc[i]) > 0 else -0.60
+    if bb_pos_col and pd.notna(df[bb_pos_col].iloc[i]):
+        bb_pos = float(df[bb_pos_col].iloc[i])
+        if bb_pos >= 0.58:
+            score += 0.25
+        elif bb_pos <= 0.42:
+            score -= 0.25
     # Fallback: short momentum
     if abs(score) < 0.5 and i >= 5:
         ret = close / float(df["close"].iloc[i - 5]) - 1.0
@@ -352,8 +391,14 @@ def _signal_direction(
             score += 0.8
         elif ret < -0.004:
             score -= 0.8
-    if score >= 0.8:
+    if vol_ratio_col and pd.notna(df[vol_ratio_col].iloc[i]):
+        vol_ratio = float(df[vol_ratio_col].iloc[i])
+        if vol_ratio >= 1.15:
+            score *= 1.10
+        elif vol_ratio < 0.70:
+            score *= 0.85
+    if score >= 1.25:
         return "long"
-    if score <= -0.8:
+    if score <= -1.25:
         return "short"
     return "flat"

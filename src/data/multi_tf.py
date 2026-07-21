@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -57,13 +58,13 @@ def fetch_multi_timeframe(
     """
     Fetch primary + higher timeframe OHLCV (and optional derivatives snapshot).
 
-    Higher TFs default to day-trade stack: 5m, 1h, 4h confirmation.
+    Higher TFs default to the day-trade stack: 1h drive, 4h confirmation.
     """
     if higher_tfs is None:
         higher_tfs = (
             list(config.timeframes.higher)
             if config
-            else ["5m", "1h", "4h"]
+            else ["1h", "4h"]
         )
     # Day-trade bar depth (enough for micro-structure without HTF bloat)
     if config:
@@ -86,25 +87,42 @@ def fetch_multi_timeframe(
         primary_tf=primary_tf,
     )
 
-    for tf in ordered:
-        try:
-            df = client.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-            result.frames[tf] = df
-            logger.info("Loaded {} · {} · {} bars", symbol, tf, len(df))
-        except Exception as exc:  # noqa: BLE001
-            msg = f"{tf}: {exc}"
-            result.errors.append(msg)
-            logger.error("Failed multi-tf fetch {}: {}", tf, exc)
-            result.frames[tf] = pd.DataFrame()
+    workers = max(
+        1,
+        min(
+            len(ordered) + (1 if include_snapshot else 0),
+            int(getattr(getattr(config, "timeframes", None), "fetch_workers", 4) or 4),
+        ),
+    )
+    futures: Dict[Future, tuple[str, str]] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for tf in ordered:
+            future = pool.submit(client.fetch_ohlcv, symbol, timeframe=tf, limit=limit)
+            futures[future] = ("ohlcv", tf)
+        if include_snapshot:
+            futures[pool.submit(client.fetch_market_snapshot, symbol)] = ("snapshot", "snapshot")
 
-    if include_snapshot:
-        try:
-            result.snapshot = client.fetch_market_snapshot(symbol)
-            if result.snapshot and result.snapshot.symbol:
-                result.symbol = result.snapshot.symbol
-        except Exception as exc:  # noqa: BLE001
-            result.errors.append(f"snapshot: {exc}")
-            logger.warning("Market snapshot failed: {}", exc)
+        for future in as_completed(futures):
+            kind, label = futures[future]
+            try:
+                value = future.result()
+                if kind == "ohlcv":
+                    result.frames[label] = value
+                    logger.info("Loaded {} · {} · {} bars", symbol, label, len(value))
+                else:
+                    result.snapshot = value
+                    if value and value.symbol:
+                        result.symbol = value.symbol
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(f"{label}: {exc}")
+                if kind == "ohlcv":
+                    result.frames[label] = pd.DataFrame()
+                    logger.error("Failed multi-tf fetch {}: {}", label, exc)
+                else:
+                    logger.warning("Market snapshot failed: {}", exc)
+
+    # Preserve a deterministic frame order despite completion order.
+    result.frames = {tf: result.frames.get(tf, pd.DataFrame()) for tf in ordered}
 
     return result
 

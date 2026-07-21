@@ -6,8 +6,11 @@ when derivatives endpoints are unavailable.
 
 from __future__ import annotations
 
+import copy
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
 
 import ccxt
@@ -16,6 +19,40 @@ from loguru import logger
 
 from src.utils.config import AppConfig, ExchangeConfig
 from src.utils.helpers import normalize_symbol, safe_float
+
+
+# Public market data changes quickly, but duplicate requests inside a scan add
+# latency and rate-limit pressure. This small process cache is shared by client
+# instances and returns defensive copies so callers cannot mutate cached data.
+_CACHE_LOCK = RLock()
+_MARKET_DATA_CACHE: Dict[Tuple[Any, ...], Tuple[float, Any]] = {}
+
+
+def _cache_get(key: Tuple[Any, ...]) -> Any:
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        hit = _MARKET_DATA_CACHE.get(key)
+        if hit is None:
+            return None
+        expires_at, value = hit
+        if expires_at <= now:
+            _MARKET_DATA_CACHE.pop(key, None)
+            return None
+        return value.copy(deep=True) if isinstance(value, pd.DataFrame) else copy.deepcopy(value)
+
+
+def _cache_put(key: Tuple[Any, ...], value: Any, ttl_seconds: int) -> None:
+    if ttl_seconds <= 0:
+        return
+    stored = value.copy(deep=True) if isinstance(value, pd.DataFrame) else copy.deepcopy(value)
+    with _CACHE_LOCK:
+        _MARKET_DATA_CACHE[key] = (time.monotonic() + ttl_seconds, stored)
+        # Bound long-running scheduler memory without a maintenance thread.
+        if len(_MARKET_DATA_CACHE) > 2000:
+            now = time.monotonic()
+            stale = [k for k, (expiry, _) in _MARKET_DATA_CACHE.items() if expiry <= now]
+            for stale_key in stale:
+                _MARKET_DATA_CACHE.pop(stale_key, None)
 
 
 # Map friendly names → ccxt class names
@@ -142,8 +179,17 @@ class ExchangeClient:
         self.exchange_cfg = exchange_cfg or (config.exchange if config else ExchangeConfig())
         raw_id = (exchange_id or self.exchange_cfg.default or "bybit").lower()
         self.exchange_id = normalize_exchange_id(raw_id)
+        self.cache_ttl_seconds = max(
+            0,
+            int(getattr(getattr(config, "timeframes", None), "cache_ttl_seconds", 300) or 0),
+        )
+        self.fetch_workers = max(
+            1,
+            min(8, int(getattr(getattr(config, "timeframes", None), "fetch_workers", 4) or 4)),
+        )
         self._exchange = self._build_exchange()
         self._markets_loaded = False
+        self._markets_lock = RLock()
 
     def _normalize_exchange_id(self, exchange_id: str) -> str:
         return normalize_exchange_id(exchange_id)
@@ -177,27 +223,34 @@ class ExchangeClient:
         return exchange
 
     def load_markets(self, reload: bool = False) -> Dict[str, Any]:
-        if self._markets_loaded and not reload:
-            return self._exchange.markets or {}
-        try:
-            markets = self._exchange.load_markets(reload=reload)
-            self._markets_loaded = True
-            return markets
-        except ccxt.NetworkError as exc:
-            logger.warning("Network error loading markets (will try direct fetch): {}", exc)
-            return self._exchange.markets or {}
-        except ccxt.ExchangeError as exc:
-            logger.warning("Exchange error loading markets (will try direct fetch): {}", exc)
-            return self._exchange.markets or {}
+        if not hasattr(self, "_markets_lock"):
+            self._markets_lock = RLock()
+        with self._markets_lock:
+            if self._markets_loaded and not reload:
+                return self._exchange.markets or {}
+            try:
+                markets = self._exchange.load_markets(reload=reload)
+                self._markets_loaded = True
+                return markets
+            except ccxt.NetworkError as exc:
+                logger.warning("Network error loading markets (will try direct fetch): {}", exc)
+                return self._exchange.markets or {}
+            except ccxt.ExchangeError as exc:
+                logger.warning("Exchange error loading markets (will try direct fetch): {}", exc)
+                return self._exchange.markets or {}
 
     def resolve_symbol(self, symbol: str) -> str:
         """Normalize and resolve symbol against exchange markets."""
+        unified = normalize_symbol(symbol)
+        cache_key = ("symbol", self.exchange_id, unified)
+        cached = _cache_get(cache_key)
+        if cached:
+            return str(cached)
         try:
             self.load_markets()
         except Exception as exc:  # noqa: BLE001
             logger.debug("load_markets skipped: {}", exc)
 
-        unified = normalize_symbol(symbol)
         logger.info("Symbol input '{}' -> cleaned symbol '{}'", symbol, unified)
         markets = self._exchange.markets or {}
         base = unified.split("/")[0]
@@ -219,27 +272,38 @@ class ExchangeClient:
         ]
 
         if unified in markets:
+            _cache_put(cache_key, unified, max(3600, getattr(self, "cache_ttl_seconds", 300)))
             return unified
 
-        # Also try common linear swap formats
+        # Rank perpetual candidates instead of returning whichever venue lists
+        # first. Prefer active linear USDT swaps, then USDC/USD derivatives.
+        matching: List[Tuple[int, str]] = []
         for m_id, m in markets.items():
             if not m.get("swap") and not m.get("future"):
                 continue
             if m.get("base") == base and m.get("quote") in ("USDT", "USDC", "USD"):
-                # Prefer linear USDT
-                if m.get("linear") or m.get("quote") == "USDT":
-                    logger.debug("Resolved {} → {}", symbol, m_id)
-                    return m_id
-                candidates.append(m_id)
+                rank = 0
+                rank += 8 if m.get("quote") == "USDT" else (4 if m.get("quote") == "USDC" else 1)
+                rank += 4 if m.get("linear") else 0
+                rank += 2 if m.get("swap") else 0
+                rank += 1 if m.get("active") is not False else -10
+                matching.append((rank, m_id))
+        if matching:
+            resolved = max(matching, key=lambda item: item[0])[1]
+            logger.debug("Resolved {} → {}", symbol, resolved)
+            _cache_put(cache_key, resolved, max(3600, getattr(self, "cache_ttl_seconds", 300)))
+            return resolved
 
         for c in candidates:
             if c in markets:
                 logger.debug("Resolved {} → {}", symbol, c)
+                _cache_put(cache_key, c, max(3600, getattr(self, "cache_ttl_seconds", 300)))
                 return c
 
         # Last resort: return normalized; fetch may still work
         if markets:
             logger.warning("Symbol {} not in markets map; using {}", symbol, unified)
+        _cache_put(cache_key, unified, getattr(self, "cache_ttl_seconds", 300))
         return unified
 
     def fetch_ohlcv(
@@ -252,6 +316,11 @@ class ExchangeClient:
     ) -> pd.DataFrame:
         """Fetch OHLCV and return a clean DataFrame indexed by datetime UTC."""
         resolved = self.resolve_symbol(symbol)
+        cache_key = ("ohlcv", self.exchange_id, resolved, timeframe, int(limit), since)
+        cached = _cache_get(cache_key)
+        if isinstance(cached, pd.DataFrame) and not cached.empty:
+            logger.debug("OHLCV cache hit {} {} {}", self.exchange_id, resolved, timeframe)
+            return cached
         last_err: Optional[Exception] = None
         for attempt in range(1, max_retries + 1):
             try:
@@ -276,6 +345,7 @@ class ExchangeClient:
                     timeframe,
                     self.exchange_id,
                 )
+                _cache_put(cache_key, df, getattr(self, "cache_ttl_seconds", 300))
                 return df
             except ccxt.RateLimitExceeded as exc:
                 last_err = exc
@@ -294,7 +364,13 @@ class ExchangeClient:
     def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
         normalized_symbol = normalize_symbol(symbol)
         logger.info("Ticker input '{}' -> cleaned symbol '{}'", symbol, normalized_symbol)
-        candidates = self._build_symbol_candidates(normalized_symbol, symbol)
+        resolved = self.resolve_symbol(normalized_symbol)
+        cache_key = ("ticker", self.exchange_id, resolved)
+        cached = _cache_get(cache_key)
+        if isinstance(cached, dict) and cached:
+            return cached
+        candidates = [resolved, *self._build_symbol_candidates(normalized_symbol, symbol)]
+        candidates = list(dict.fromkeys(candidates))
         last_error: Optional[Exception] = None
 
         for candidate in candidates:
@@ -302,7 +378,7 @@ class ExchangeClient:
                 result = self._exchange.fetch_ticker(candidate)
                 if result:
                     price = None
-                    for key in ("last", "close", "ask", "bid"):
+                    for key in ("last", "close", "mark", "index", "ask", "bid"):
                         price = result.get(key)
                         if price is not None:
                             break
@@ -313,6 +389,7 @@ class ExchangeClient:
                             candidate,
                             price,
                         )
+                        _cache_put(cache_key, result, getattr(self, "cache_ttl_seconds", 300))
                         return result
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
@@ -429,10 +506,32 @@ class ExchangeClient:
     def fetch_market_snapshot(self, symbol: str) -> MarketSnapshot:
         """Compose ticker + funding + OI + L/S into one snapshot."""
         resolved = self.resolve_symbol(symbol)
+        cache_key = ("snapshot", self.exchange_id, resolved)
+        cached = _cache_get(cache_key)
+        if isinstance(cached, MarketSnapshot):
+            logger.debug("Snapshot cache hit {} {}", self.exchange_id, resolved)
+            return cached
         snap = MarketSnapshot(symbol=resolved, exchange_id=self.exchange_id)
         errors: List[str] = []
 
-        ticker = self.fetch_ticker(resolved)
+        # These are independent public endpoints. Bound concurrency so a scan is
+        # fast without creating an unbounded burst against the venue.
+        with ThreadPoolExecutor(max_workers=min(4, getattr(self, "fetch_workers", 4))) as pool:
+            futures = {
+                "ticker": pool.submit(self.fetch_ticker, resolved),
+                "funding": pool.submit(self.fetch_funding_rate, resolved),
+                "oi": pool.submit(self.fetch_open_interest, resolved),
+                "ls": pool.submit(self.fetch_long_short_ratio, resolved),
+            }
+            fetched: Dict[str, Dict[str, Any]] = {}
+            for name, future in futures.items():
+                try:
+                    fetched[name] = future.result() or {}
+                except Exception as exc:  # noqa: BLE001
+                    fetched[name] = {}
+                    errors.append(f"{name}_error:{type(exc).__name__}")
+
+        ticker = fetched["ticker"]
         if ticker:
             snap.last = safe_float(ticker.get("last") or ticker.get("close"))
             snap.bid = safe_float(ticker.get("bid"))
@@ -452,7 +551,7 @@ class ExchangeClient:
         else:
             errors.append("ticker_unavailable")
 
-        fr = self.fetch_funding_rate(resolved)
+        fr = fetched["funding"]
         if fr:
             snap.funding_rate = (
                 safe_float(fr["fundingRate"]) if fr.get("fundingRate") is not None else None
@@ -471,7 +570,7 @@ class ExchangeClient:
         else:
             errors.append("funding_unavailable")
 
-        oi = self.fetch_open_interest(resolved)
+        oi = fetched["oi"]
         if oi:
             amount = oi.get("openInterestAmount")
             if amount is None:
@@ -488,7 +587,7 @@ class ExchangeClient:
         else:
             errors.append("oi_unavailable")
 
-        ls = self.fetch_long_short_ratio(resolved)
+        ls = fetched["ls"]
         if ls:
             if ls.get("longShortRatio") is not None:
                 snap.long_short_ratio = safe_float(ls["longShortRatio"])
@@ -500,7 +599,14 @@ class ExchangeClient:
         else:
             errors.append("ls_ratio_unavailable")
 
-        snap.errors = errors
+        # A mark/index quote is a safer last-price fallback than returning zero.
+        if not snap.last:
+            snap.last = next(
+                (p for p in (snap.mark, snap.index, snap.bid, snap.ask) if p is not None and p > 0),
+                0.0,
+            )
+        snap.errors = list(dict.fromkeys(errors))
+        _cache_put(cache_key, snap, getattr(self, "cache_ttl_seconds", 300))
         return snap
 
     def close(self) -> None:

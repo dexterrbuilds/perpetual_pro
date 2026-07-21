@@ -51,9 +51,15 @@ def _clean_symbol_text(raw: str) -> str:
         raise ValueError("Symbol is empty")
 
     s = raw.strip().upper()
+    # TradingView perpetual suffixes such as BTCUSDT.P / ETHUSDT.PERP.
+    s = re.sub(r"\.(?:P|PERP)$", "", s)
     s = re.sub(r"[\s\-_]+", "", s)
 
-    for suffix in ("PERP", "SWAP", "USDTM", "USD-M"):
+    # Exchange labels such as BTCUSD-M mean a USDT-margined contract.
+    if s.endswith("USDM") and len(s) > 4:
+        s = s[:-4] + "USDT"
+
+    for suffix in ("PERP", "SWAP", "USDTM"):
         if s.endswith(suffix) and len(s) > len(suffix) + 1:
             s = s[: -len(suffix)]
 

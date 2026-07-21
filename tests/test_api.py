@@ -336,6 +336,8 @@ def test_scan_symbols_ranks_results(monkeypatch):
         assert top["leverage"] <= svc.SCAN_LEVERAGE_CAP
         assert "llm_confidence" in top
         assert "rank_score" in top
+        assert "backtest" in top
+        assert "signal_eligible" in top
         # Sorted by rank_score desc
         scores = [float(r["rank_score"]) for r in result["ranked_results"]]
         assert scores == sorted(scores, reverse=True)

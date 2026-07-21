@@ -248,10 +248,11 @@ def _safe_assign(out: pd.DataFrame, name: str, series: Any) -> None:
 def _safe_join_df(out: pd.DataFrame, frame: Any) -> pd.DataFrame:
     if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
         return out
-    for c in frame.columns:
-        if c not in out.columns:
-            out[c] = frame[c]
-    return out
+    new_columns = [c for c in frame.columns if c not in out.columns]
+    if not new_columns:
+        return out
+    # A single concat avoids pandas block fragmentation from repeated inserts.
+    return pd.concat([out, frame[new_columns]], axis=1)
 
 
 def _compute_with_pandas_ta(
@@ -737,44 +738,61 @@ def _build_summary(df: pd.DataFrame, ac: AnalysisConfig) -> Dict[str, Any]:
     mfi = g("mfi")
     # Classic bbands: BBL_20_2.0 / BBU_20_2.0
     bb_lower = g("bbl_20_2.0", "bbl_20_2", "bbl", default=float("nan"))
+    bb_mid = g("bbm_20_2.0", "bbm_20_2", "bbm", default=float("nan"))
     bb_upper = g("bbu_20_2.0", "bbu_20_2", "bbu", default=float("nan"))
+    supertrend_dir = g("supertrend_dir")
 
     trend_votes = 0.0
     if not np.isnan(ema_fast) and not np.isnan(ema_slow):
-        trend_votes += 0.35 if ema_fast > ema_slow else -0.35
+        trend_votes += 0.30 if ema_fast > ema_slow else -0.30
     if not np.isnan(ema_mid) and not np.isnan(ema_trend):
-        trend_votes += 0.25 if ema_mid > ema_trend else -0.25
+        trend_votes += 0.20 if ema_mid > ema_trend else -0.20
     if not np.isnan(ema_trend):
-        trend_votes += 0.25 if close > ema_trend else -0.25
+        trend_votes += 0.15 if close > ema_trend else -0.15
+    if not np.isnan(supertrend_dir):
+        trend_votes += 0.25 if supertrend_dir > 0 else -0.25
     if len(df) >= 20:
         slope = (close - safe_float(df["close"].iloc[-20])) / max(atr if not np.isnan(atr) else 1e-12, 1e-12)
-        trend_votes += float(np.clip(slope / 10.0, -0.15, 0.15))
+        trend_votes += float(np.clip(slope / 10.0, -0.10, 0.10))
 
     mom = 0.0
     if not np.isnan(rsi):
         if rsi >= 55:
-            mom += 0.25
+            mom += 0.30
         elif rsi <= 45:
-            mom -= 0.25
+            mom -= 0.30
         if rsi >= 70:
             mom -= 0.1
         if rsi <= 30:
             mom += 0.1
     if not np.isnan(macdh):
-        mom += 0.2 if macdh > 0 else -0.2
+        mom += 0.25 if macdh > 0 else -0.25
     if not np.isnan(macd) and not np.isnan(macds):
-        mom += 0.15 if macd > macds else -0.15
+        mom += 0.20 if macd > macds else -0.20
 
     bb_pos = 0.5
     if not np.isnan(bb_lower) and not np.isnan(bb_upper) and bb_upper != bb_lower:
         bb_pos = float(np.clip((close - bb_lower) / (bb_upper - bb_lower), 0, 1))
 
+    volatility_bias = 0.0
+    if bb_pos >= 0.82:
+        volatility_bias = 0.45 if vol_ratio >= 1.05 else 0.25
+    elif bb_pos <= 0.18:
+        volatility_bias = -0.45 if vol_ratio >= 1.05 else -0.25
+    elif not np.isnan(bb_mid):
+        volatility_bias = 0.15 if close > bb_mid else -0.15
+
     vol_bias = 0.0
     if not np.isnan(vol_ratio):
+        candle_direction = 1.0 if close >= safe_float(prev.get("close")) else -1.0
         if vol_ratio > 1.5:
-            vol_bias = 0.2 if close >= safe_float(prev.get("close")) else -0.2
+            vol_bias = 0.55 * candle_direction
+        elif vol_ratio > 1.15:
+            vol_bias = 0.30 * candle_direction
         elif vol_ratio < 0.7:
-            vol_bias = -0.05
+            vol_bias = -0.08 * candle_direction
+    if not np.isnan(cmf):
+        vol_bias += float(np.clip(cmf * 1.5, -0.25, 0.25))
 
     return {
         "close": close,
@@ -792,15 +810,22 @@ def _build_summary(df: pd.DataFrame, ac: AnalysisConfig) -> Dict[str, Any]:
         "cmf": None if np.isnan(cmf) else cmf,
         "mfi": None if np.isnan(mfi) else mfi,
         "bb_position": bb_pos,
+        "bb_width_pct": (
+            None
+            if np.isnan(bb_lower) or np.isnan(bb_upper) or not close
+            else (bb_upper - bb_lower) / close * 100.0
+        ),
+        "atr_pct": None if np.isnan(atr) or not close else atr / close * 100.0,
         "trend_score": float(np.clip(trend_votes, -1, 1)),
         "momentum_score": float(np.clip(mom, -1, 1)),
         "volume_bias": float(np.clip(vol_bias, -1, 1)),
+        "volatility_score": float(np.clip(volatility_bias, -1, 1)),
         "natr": g("natr"),
         "willr": g("willr"),
         "cci": g("cci"),
         "stoch_k": g("stochk_14_3_3", "stk_14_3_3"),
         "stoch_d": g("stochd_14_3_3", "std_14_3_3"),
-        "supertrend_dir": g("supertrend_dir"),
+        "supertrend_dir": supertrend_dir,
         "above_vwap": bool(close > g("vwap")) if not np.isnan(g("vwap")) else None,
     }
 

@@ -135,7 +135,15 @@ class ConfluenceEngine:
             return result
 
         # --- Indicators ---
-        ind = compute_indicators(primary, config=self.config)
+        # Compute every timeframe once. The primary suite is reused by the live
+        # score and watchlist backtest; higher suites feed MTF alignment.
+        indicator_suites: Dict[str, IndicatorSuite] = {}
+        for tf, frame in mtf.frames.items():
+            if frame is not None and not frame.empty:
+                indicator_suites[tf] = compute_indicators(frame, config=self.config)
+        ind = indicator_suites.get(mtf.primary_tf) or compute_indicators(
+            primary, config=self.config
+        )
         result.indicators = ind
         if ind.errors:
             result.warnings.extend(ind.errors)
@@ -152,7 +160,7 @@ class ConfluenceEngine:
         result.structure = struct
 
         # --- Higher TF ---
-        htf_score, htf_notes = self._multi_tf_score(mtf)
+        htf_score, htf_notes = self._multi_tf_score(mtf, indicator_suites)
         result.multi_tf_notes = htf_notes
 
         # --- Derivatives ---
@@ -182,6 +190,12 @@ class ConfluenceEngine:
             FactorScore("derivatives", der_score, w.derivatives, "; ".join(der_notes) or "n/a"),
             FactorScore("multi_tf", htf_score, w.multi_tf, "; ".join(htf_notes[:3]) or "n/a"),
             FactorScore("volume", float(ind.summary.get("volume_bias", 0)), w.volume, self._vol_detail(ind)),
+            FactorScore(
+                "volatility",
+                float(ind.summary.get("volatility_score", 0)),
+                w.volatility,
+                self._volatility_detail(ind),
+            ),
             FactorScore("news", news_score, w.news, news_detail[:200]),
         ]
 
@@ -195,24 +209,28 @@ class ConfluenceEngine:
 
         result.factors = factors
 
-        # Boost short-term factors for day-trade primary timeframes (<=4h)
-        try:
-            from src.utils.helpers import timeframe_to_minutes
-
-            primary_mins = timeframe_to_minutes(mtf.primary_tf)
-        except Exception:
-            primary_mins = None
-        if primary_mins is not None and primary_mins <= 240:
-            for f in result.factors:
-                if f.name in ("momentum", "volume"):
-                    f.weight = f.weight * 1.20
-                if f.name in ("derivatives", "multi_tf", "structure"):
-                    f.weight = f.weight * 1.08
-
         total = sum(f.weighted for f in result.factors)
         # Normalize if weights don't sum to 1
         wsum = sum(f.weight for f in result.factors) or 1.0
         total = total / wsum
+
+        # A genuine confluence score must discount disagreement between the core
+        # directional systems. Context (news/funding) cannot overpower EMA,
+        # momentum, structure, and MTF conflicts.
+        core = [
+            f for f in result.factors
+            if f.name in ("trend", "momentum", "structure", "multi_tf")
+            and abs(f.score) >= 0.12
+        ]
+        if core and abs(total) >= 0.05:
+            total_sign = 1 if total > 0 else -1
+            aligned = sum(1 for f in core if np.sign(f.score) == total_sign)
+            opposed = sum(1 for f in core if np.sign(f.score) == -total_sign)
+            if opposed >= 2:
+                total *= 0.68
+                result.multi_tf_notes.insert(0, "Core-signal conflict: confidence discounted")
+            elif aligned >= 3 and opposed == 0:
+                total *= 1.08
         result.confluence_total = float(clamp(total, -1, 1))
 
         # Bias & confidence
@@ -385,6 +403,10 @@ class ConfluenceEngine:
             confluence_total=result.confluence_total,
         )
 
+        # Prop eligibility is based on the final blended confidence, not the
+        # earlier technical-only estimate used to draft the initial plan.
+        self.risk.apply_prop_confidence_gate(plan, result.confidence, minimum=60.0)
+
         result.meta = {
             "price": price,
             "atr": atr,
@@ -409,6 +431,13 @@ class ConfluenceEngine:
             "rank_score": result.rank_score,
             "prop_safe": bool(getattr(plan, "prop_safe", True)),
             "prop_flags": list(getattr(plan, "prop_flags", None) or []),
+            "signal_eligible": bool(
+                direction in ("long", "short")
+                and result.confidence >= 60.0
+                and getattr(plan, "prop_safe", True)
+            ),
+            "holding_window": "30m–24h",
+            "indicator_timeframes_computed": sorted(indicator_suites),
         }
         logger.info(
             "Analysis {} {} bias={} tech={:.1f}% llm={:.1f}% rank={:.1f} score={:.3f} lev={:.1f}x",
@@ -424,7 +453,11 @@ class ConfluenceEngine:
         return result
 
     # ------------------------------------------------------------------
-    def _multi_tf_score(self, mtf: MultiTimeframeData) -> Tuple[float, List[str]]:
+    def _multi_tf_score(
+        self,
+        mtf: MultiTimeframeData,
+        indicator_suites: Optional[Dict[str, IndicatorSuite]] = None,
+    ) -> Tuple[float, List[str]]:
         """
         Day-trade MTF blend: prioritize 15m, 1h, and 4h (4h as confirmation).
         Mix trend + momentum on LTF for intraday alignment; weight volume and momentum higher.
@@ -448,7 +481,9 @@ class ConfluenceEngine:
         for tf, df in mtf.frames.items():
             if df is None or df.empty or len(df) < 30:
                 continue
-            ind = compute_indicators(df, config=self.config)
+            ind = (indicator_suites or {}).get(tf)
+            if ind is None:
+                ind = compute_indicators(df, config=self.config)
             trend_s = float(ind.summary.get("trend_score", 0))
             mom_s = float(ind.summary.get("momentum_score", 0))
             mins = timeframe_to_minutes(tf)
@@ -730,6 +765,13 @@ class ConfluenceEngine:
         s = ind.summary
         return f"vol_ratio={s.get('vol_ratio')} CMF={s.get('cmf')} MFI={s.get('mfi')}"
 
+    def _volatility_detail(self, ind: IndicatorSuite) -> str:
+        s = ind.summary
+        return (
+            f"BB position={s.get('bb_position')} width={s.get('bb_width_pct')}%; "
+            f"ATR={s.get('atr_pct')}%"
+        )
+
     def _commentary(self, a: FullAnalysis) -> str:
         """Day-trader / scalper narrative for high-leverage perps."""
         parts: List[str] = []
@@ -759,7 +801,8 @@ class ConfluenceEngine:
                 f"Playbook: {a.setup_name}. Tight entry "
                 f"{format_price(tp.entry_low, price)}–{format_price(tp.entry_high, price)}, "
                 f"SL {format_price(tp.stop_loss, price)}, TP1 R:R {tp.primary_rr:.2f} ({tp.quality}). "
-                f"Suggested lev ~{tp.leverage_suggested:.0f}x (20–100x). {hold}."
+                f"Suggested lev ~{tp.leverage_suggested:.0f}x "
+                f"({'prop max 5x' if tp.prop_mode else 'day-trade band 10–30x'}). {hold}."
             )
         else:
             parts.append("No clean scalp — stand aside; do not force high leverage.")

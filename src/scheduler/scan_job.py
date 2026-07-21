@@ -68,6 +68,9 @@ def filter_high_confidence(
             continue
         llm = float(row.get("llm_confidence") or 0)
         rank = float(row.get("rank_score") or 0)
+        blended = row.get("confidence")
+        if blended is not None and float(blended or 0) < 60.0:
+            continue
         if llm < min_llm and rank < min_rank:
             # Require meeting at least one threshold when both set; prefer both
             continue

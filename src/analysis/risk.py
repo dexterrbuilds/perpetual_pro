@@ -1,4 +1,4 @@
-"""Risk management: aggressive perp leverage, multi-TP plans, hold windows."""
+"""Risk management: intraday perp leverage, multi-TP plans, hold windows."""
 
 from __future__ import annotations
 
@@ -185,17 +185,18 @@ class RiskManager:
     Build crypto-perp trade plans with prop-aware defaults:
     - structure/ATR stops & TP1–TP4
     - prop mode: risk 0.5–1%, leverage ≤5x, drawdown flags
-    - aggressive mode (prop_mode=false): dynamic leverage 20x–100x
+    - day-trade mode (prop_mode=false): dynamic leverage 10x–30x
     - simulated capital + fixed risk %
     - scalp / day-trade hold windows (max 12–24h unless strong swing)
     """
 
     # Aggressive band (when prop_mode is false)
-    AGGRESSIVE_LEV_FLOOR = 20.0
-    AGGRESSIVE_LEV_CEILING = 100.0
+    AGGRESSIVE_LEV_FLOOR = 10.0
+    AGGRESSIVE_LEV_CEILING = 30.0
     # Prop band
     PROP_LEV_FLOOR = 1.0
     PROP_LEV_CEILING = 5.0
+    MIN_PROP_SIGNAL_CONFIDENCE = 60.0
     # Short-term TP stack (ATR multiples) — scalp / day-trade realistic
     DEFAULT_TP_MULTS = [0.7, 1.3, 2.0, 3.0]
 
@@ -425,7 +426,10 @@ class RiskManager:
         potential_pcts = [(p / capital) * 100.0 for p in potential_profits]
 
         primary_rr = rrs[0] if rrs else 0.0
-        quality = self._quality(primary_rr, confidence, min_rr)
+        # TP1 is a partial/de-risk target. Prop quality is evaluated at TP2,
+        # where the planned trade is expected to meet its minimum R:R.
+        evaluation_rr = rrs[1] if len(rrs) > 1 else primary_rr
+        quality = self._quality(evaluation_rr, confidence, min_rr)
 
         hold_label, hold_detail, hold_max = suggest_hold_window(
             primary_tf, setup_name, tags, direction, confidence
@@ -433,7 +437,7 @@ class RiskManager:
 
         prop_flags = self._prop_flags(
             atr_pct=atr_pct,
-            primary_rr=primary_rr,
+            primary_rr=evaluation_rr,
             min_rr=float(min_rr or 1.2),
             effective_risk_pct=effective_risk_pct,
             confidence=confidence,
@@ -449,7 +453,7 @@ class RiskManager:
             if self.prop_mode
             else (
                 f"Aggressive perp leverage ~{lev:.0f}x from ATR {atr_pct:.2f}%, "
-                f"confidence {confidence:.0f}% (floor 20x / ceiling 100x)."
+                f"confidence {confidence:.0f}% (day-trade band 10x–30x)."
             )
         )
         notes: List[str] = [
@@ -464,9 +468,9 @@ class RiskManager:
                 f"TP{i} {format_price(tp, price)} → R:R {rr:.2f} · "
                 f"sim P/L ~${profit:,.2f} ({potential_pcts[i-1]:+.2f}% of capital)."
             )
-        if primary_rr < min_rr:
+        if evaluation_rr < min_rr:
             notes.append(
-                f"R:R to TP1 is {primary_rr:.2f} < min {min_rr:.2f} — prefer tighter entry or skip."
+                f"R:R to TP2 is {evaluation_rr:.2f} < min {min_rr:.2f} — prefer tighter entry or skip."
             )
         if confidence < 40:
             notes.append("Low confidence — size reduced; consider standing aside.")
@@ -512,6 +516,27 @@ class RiskManager:
             max_leverage_allowed=float(max_lev),
         )
 
+    def apply_prop_confidence_gate(
+        self,
+        plan: TradePlan,
+        confidence: float,
+        *,
+        minimum: float = MIN_PROP_SIGNAL_CONFIDENCE,
+    ) -> TradePlan:
+        """Apply the final blended-confidence gate to a drafted trade plan."""
+        if not plan.prop_mode or plan.direction not in ("long", "short"):
+            return plan
+        plan.prop_flags = [flag for flag in plan.prop_flags if flag != "LOW_CONFIDENCE"]
+        if confidence < minimum:
+            plan.prop_flags.append("LOW_CONFIDENCE")
+            plan.notes.append(
+                f"Prop gate: {confidence:.0f}% confidence is below the {minimum:.0f}% minimum — no prop signal."
+            )
+        unsafe = {"HIGH_DRAWDOWN_RISK", "WIDE_STOP", "LOW_RR", "LOW_CONFIDENCE"}
+        plan.prop_flags = list(dict.fromkeys(plan.prop_flags))
+        plan.prop_safe = not any(flag in unsafe for flag in plan.prop_flags)
+        return plan
+
     def _prop_flags(
         self,
         *,
@@ -532,7 +557,7 @@ class RiskManager:
             flags.append("HIGH_DRAWDOWN_RISK")
         if primary_rr < min_rr:
             flags.append("LOW_RR")
-        if confidence < 40:
+        if confidence < self.MIN_PROP_SIGNAL_CONFIDENCE:
             flags.append("LOW_CONFIDENCE")
         if lev >= self.PROP_LEV_CEILING - 1e-9:
             flags.append("LEV_CAPPED_5X")
@@ -545,33 +570,33 @@ class RiskManager:
         funding_rate: Optional[float],
         direction: str,
     ) -> Tuple[float, str]:
-        """Prop: [1x, 5x]. Aggressive: [20x, 100x]."""
+        """Prop: [1x, 5x]. Standard day-trade mode: [10x, 30x]."""
         if self.prop_mode:
             return self._prop_leverage(atr_pct, confidence, funding_rate, direction)
 
         raw_ceil = float(getattr(self.risk, "leverage_ceiling", None) or self.AGGRESSIVE_LEV_CEILING)
         raw_floor = float(getattr(self.risk, "leverage_floor", None) or self.AGGRESSIVE_LEV_FLOOR)
-        ceiling = max(self.AGGRESSIVE_LEV_FLOOR, min(100.0, raw_ceil if raw_ceil >= 20 else 100.0))
-        floor = max(self.AGGRESSIVE_LEV_FLOOR, min(ceiling, raw_floor if raw_floor >= 20 else 20.0))
+        ceiling = max(self.AGGRESSIVE_LEV_FLOOR, min(30.0, raw_ceil if raw_ceil >= 10 else 30.0))
+        floor = max(self.AGGRESSIVE_LEV_FLOOR, min(ceiling, raw_floor if raw_floor >= 10 else 10.0))
         if floor > ceiling:
             floor, ceiling = self.AGGRESSIVE_LEV_FLOOR, self.AGGRESSIVE_LEV_CEILING
 
         if atr_pct <= 0.4:
-            base = 90.0
+            base = 30.0
         elif atr_pct <= 0.7:
-            base = 75.0
+            base = 27.0
         elif atr_pct <= 1.0:
-            base = 60.0
+            base = 24.0
         elif atr_pct <= 1.5:
-            base = 45.0
+            base = 20.0
         elif atr_pct <= 2.5:
-            base = 35.0
+            base = 16.0
         elif atr_pct <= 4.0:
-            base = 28.0
+            base = 13.0
         else:
-            base = 22.0
+            base = 10.0
 
-        conf_mult = 0.75 + (clamp(confidence, 0, 100) / 100.0) * 0.60
+        conf_mult = 0.80 + (clamp(confidence, 0, 100) / 100.0) * 0.30
         fund_mult = 1.0
         fund_note = "funding neutral"
         if funding_rate is not None:
@@ -593,7 +618,7 @@ class RiskManager:
 
         lev = base * conf_mult * fund_mult
         lev = float(clamp(lev, floor, ceiling))
-        lev = max(floor, min(ceiling, round(lev / 5.0) * 5.0))
+        lev = max(floor, min(ceiling, round(lev / 2.0) * 2.0))
         if lev < floor:
             lev = floor
 
@@ -601,7 +626,7 @@ class RiskManager:
             f"Perp leverage base {base:.0f}x from ATR {atr_pct:.2f}% of price; "
             f"×{conf_mult:.2f} confidence; {fund_note}; "
             f"clamped to [{floor:.0f}x–{ceiling:.0f}x] → {lev:.0f}x. "
-            f"High leverage is for illustration — always size risk first."
+            f"Intraday 10x–30x band; always size risk first."
         )
         return lev, reason
 
@@ -707,28 +732,21 @@ def suggest_hold_window(
 ) -> Tuple[str, str, float]:
     """
     Crypto perp day-trade / scalp holds.
-    Max 12–24h for almost everything; longer only for rare very strong setups.
+    Every suggested window stays inside the 30-minute to 24-hour mandate.
     """
     t = (primary_tf or "").strip().lower()
     tags = [str(x).lower() for x in (strategy_tags or [])]
     blob = f"{setup_name or ''} {' '.join(tags)} {direction or ''}".lower()
-    very_strong = confidence >= 82 and (
-        "high_conviction" in blob or "momentum_scalp" in blob or "breakout" in blob
-    )
 
     if t in ("1m", "3m", "5m") or "scalp" in blob or "momentum_scalp" in blob:
-        return "Scalp", "Suggested hold: 15–90 minutes (scalp — max 2h)", 2.0
+        return "Scalp", "Suggested hold: 30–90 minutes (scalp — max 2h)", 2.0
     if t in ("15m", "30m") or "mean_reversion" in blob:
         return "Intraday", "Suggested hold: 1–8 hours (day trade — max 12h)", 12.0
     if t in ("1h", "2h"):
         return "Day trade", "Suggested hold: 4–12 hours (day trade — max 24h)", 24.0
     if t in ("4h", "6h", "8h", "12h"):
-        if very_strong and "swing" in blob:
-            return "Swing", "Suggested hold: 1–2 days (very strong setup only)", 48.0
         return "Day trade", "Suggested hold: 8–24 hours (flat by next session if thesis weak)", 24.0
     if t in ("1d", "3d", "1w") or t in ("d", "w"):
-        if very_strong:
-            return "Swing", "Suggested hold: 1–3 days (very strong HTF only)", 72.0
         return "Day trade", "Suggested hold: 12–24 hours — reassess; not a default swing tool", 24.0
     return "Day trade", "Suggested hold: 4–24 hours (default day-trade window)", 24.0
 

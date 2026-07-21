@@ -46,6 +46,35 @@ def test_prop_flags_wide_stop():
     assert "WIDE_STOP" in plan.prop_flags or "HIGH_DRAWDOWN_RISK" in plan.prop_flags
 
 
+def test_prop_signal_requires_final_60_percent_confidence():
+    rm = RiskManager(
+        risk_cfg=RiskConfig(prop_mode=True, max_leverage=5, leverage_ceiling=5),
+        simulated_capital=1000,
+        risk_pct=1.0,
+    )
+    plan = rm.build_plan("long", price=100.0, atr=1.0, confidence=70, primary_tf="15m")
+    rm.apply_prop_confidence_gate(plan, 59.9)
+    assert plan.prop_safe is False
+    assert "LOW_CONFIDENCE" in plan.prop_flags
+
+    rm.apply_prop_confidence_gate(plan, 60.0)
+    assert "LOW_CONFIDENCE" not in plan.prop_flags
+    assert plan.prop_safe is True
+
+
+def test_non_prop_day_trade_leverage_is_10_to_30x():
+    rm = RiskManager(
+        risk_cfg=RiskConfig(
+            prop_mode=False,
+            leverage_floor=10,
+            leverage_ceiling=30,
+            max_leverage=30,
+        )
+    )
+    plan = rm.build_plan("short", price=100.0, atr=0.8, confidence=75, primary_tf="15m")
+    assert 10 <= plan.leverage_suggested <= 30
+
+
 def test_config_loads_prop_and_telegram():
     cfg = load_config(ROOT / "config.yaml")
     assert cfg.risk.prop_mode is True

@@ -60,6 +60,33 @@ def test_exchange_client_uses_cleaned_perpetual_symbol_for_ticker():
     assert client._exchange.calls == ["BNB/USDT:USDT"]
 
 
+def test_normalize_tradingview_and_usdm_symbols():
+    assert normalize_symbol("BTCUSDT.P") == "BTC/USDT:USDT"
+    assert normalize_symbol("ETHUSD-M") == "ETH/USDT:USDT"
+
+
+def test_ticker_cache_avoids_duplicate_public_fetches():
+    class DummyExchange:
+        markets = {}
+
+        def __init__(self):
+            self.calls = []
+
+        def fetch_ticker(self, symbol):
+            self.calls.append(symbol)
+            return {"last": 1.2345}
+
+    client = ExchangeClient.__new__(ExchangeClient)
+    client.exchange_id = "cache-test-exchange"
+    client._exchange = DummyExchange()
+    client._markets_loaded = True
+    client.cache_ttl_seconds = 300
+    first = client.fetch_ticker("CACHECOIN")
+    second = client.fetch_ticker("CACHECOIN")
+    assert first == second
+    assert len(client._exchange.calls) == 1
+
+
 def test_symbol_base():
     assert symbol_base("BTC/USDT:USDT") == "BTC"
     assert symbol_base("ethusdt") == "ETH"
