@@ -839,7 +839,7 @@ def render_backtest_panel(symbol: str, timeframe: str, exchange: str) -> None:
 
 def main() -> None:
     _check_access()
-    st.title("Perpetual Pro — Prop toolkit")
+    st.title("Perpetual Pro")
     try:
         cfg = load_config()
         prop_on = bool(getattr(cfg.risk, "prop_mode", True))
@@ -853,8 +853,8 @@ def main() -> None:
         tg_ok = False
 
     st.caption(
-        "Prop account management: ≤5x leverage · 0.5–1% risk · LLM confidence · "
-        "scheduled WAT scans + Telegram. Manual scan stays fresh (no cache)."
+        "Your Trade Quant "
+        "scheduled scans + Telegram alerts. "
     )
 
     with st.sidebar:
