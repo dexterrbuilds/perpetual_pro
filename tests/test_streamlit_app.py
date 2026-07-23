@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import inspect
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -8,8 +9,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from streamlit_app import (
+    _app_css,
     build_report_markdown,
     format_ticker_price,
+    main,
     normalize_symbol_list,
     run_manual_telegram_scan_test,
     send_manual_telegram_test,
@@ -24,6 +27,23 @@ def test_format_ticker_price_shows_base_and_price():
     assert format_ticker_price("BTC/USDT:USDT", 112450.25) == "BTC $112,450"
     assert format_ticker_price("ETH", 3456.78).startswith("ETH $")
     assert format_ticker_price("SOL", None) == "SOL —"
+
+
+def test_app_styles_follow_streamlit_light_and_dark_theme():
+    css = _app_css()
+    assert "var(--background-color)" in css
+    assert "var(--secondary-background-color)" in css
+    assert "var(--text-color)" in css
+    assert "var(--primary-color)" in css
+
+
+def test_main_trading_workspace_hides_operational_controls():
+    source = inspect.getsource(main)
+    assert "Telegram diagnostics" not in source
+    assert "TELEGRAM_BOT_TOKEN" not in source
+    assert "Ping backend" not in source
+    assert "scheduler" not in source.lower()
+    assert '["15m", "1h", "4h"]' in source
 
 
 def test_manual_telegram_button_uses_local_fallback(monkeypatch):

@@ -43,6 +43,159 @@ EXCHANGE_OPTIONS = [
 SIM_BASE_USD = 100.0
 
 
+def _app_css() -> str:
+    """Theme-aware visual system shared by Streamlit light and dark modes."""
+    return """
+<style>
+    :root {
+        --pp-border: color-mix(in srgb, var(--text-color) 14%, transparent);
+        --pp-muted: color-mix(in srgb, var(--text-color) 66%, transparent);
+        --pp-primary-soft: color-mix(in srgb, var(--primary-color) 13%, transparent);
+        --pp-surface: color-mix(
+            in srgb,
+            var(--secondary-background-color) 86%,
+            var(--background-color)
+        );
+    }
+
+    .stApp {
+        background:
+            radial-gradient(
+                circle at 74% -12%,
+                color-mix(in srgb, var(--primary-color) 9%, transparent),
+                transparent 34rem
+            ),
+            var(--background-color);
+    }
+
+    .block-container {
+        max-width: 1440px;
+        padding-top: 2rem;
+        padding-bottom: 4rem;
+    }
+
+    [data-testid="stSidebar"] {
+        border-right: 1px solid var(--pp-border);
+    }
+
+    [data-testid="stSidebar"] .block-container {
+        padding-top: 1.6rem;
+    }
+
+    .pp-hero {
+        padding: 1.7rem 1.85rem;
+        margin-bottom: 1.15rem;
+        border: 1px solid var(--pp-border);
+        border-radius: 1.15rem;
+        background:
+            linear-gradient(135deg, var(--pp-primary-soft), transparent 52%),
+            var(--pp-surface);
+        box-shadow: 0 14px 36px color-mix(in srgb, var(--text-color) 7%, transparent);
+    }
+
+    .pp-eyebrow {
+        color: var(--primary-color);
+        font-size: 0.72rem;
+        font-weight: 750;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+        margin-bottom: 0.55rem;
+    }
+
+    .pp-title {
+        color: var(--text-color);
+        font-size: clamp(1.75rem, 4vw, 2.55rem);
+        font-weight: 760;
+        letter-spacing: -0.04em;
+        line-height: 1.04;
+    }
+
+    .pp-subtitle {
+        color: var(--pp-muted);
+        font-size: 0.98rem;
+        line-height: 1.55;
+        margin-top: 0.65rem;
+        max-width: 48rem;
+    }
+
+    .pp-section-label {
+        color: var(--pp-muted);
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        margin: 0.15rem 0 0.35rem;
+    }
+
+    div[data-testid="stMetric"] {
+        min-height: 7rem;
+        padding: 1rem 1.05rem;
+        border: 1px solid var(--pp-border);
+        border-radius: 0.9rem;
+        background: var(--pp-surface);
+    }
+
+    div[data-testid="stMetricLabel"] {
+        color: var(--pp-muted);
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        border-color: var(--pp-border);
+        border-radius: 1rem;
+        background: color-mix(in srgb, var(--pp-surface) 78%, transparent);
+    }
+
+    div[data-testid="stDataFrame"] {
+        overflow: hidden;
+        border: 1px solid var(--pp-border);
+        border-radius: 0.9rem;
+    }
+
+    .stButton > button,
+    .stDownloadButton > button {
+        min-height: 2.7rem;
+        border-radius: 0.7rem;
+        font-weight: 680;
+    }
+
+    [data-baseweb="tab-list"] {
+        gap: 0.45rem;
+        border-bottom: 1px solid var(--pp-border);
+    }
+
+    [data-baseweb="tab"] {
+        min-height: 3rem;
+        padding-inline: 1rem;
+        font-weight: 650;
+    }
+
+    [data-testid="stExpander"] {
+        border-color: var(--pp-border);
+        border-radius: 0.85rem;
+        overflow: hidden;
+    }
+
+    hr {
+        border-color: var(--pp-border) !important;
+    }
+
+    @media (max-width: 700px) {
+        .block-container {
+            padding-top: 1rem;
+        }
+
+        .pp-hero {
+            padding: 1.3rem;
+        }
+    }
+</style>
+"""
+
+
+def inject_app_styles() -> None:
+    st.markdown(_app_css(), unsafe_allow_html=True)
+
+
 def _is_private_enabled() -> bool:
     return bool(os.getenv("STREAMLIT_PASSWORD"))
 
@@ -609,14 +762,13 @@ def render_market_chart(
     fig.update_layout(
         title=title,
         height=height,
-        template="plotly_dark",
         xaxis_rangeslider_visible=False,
         margin={"l": 10, "r": 10, "t": 45, "b": 10},
         legend={"orientation": "h", "y": 1.02, "x": 0},
     )
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
-    st.plotly_chart(fig, use_container_width=True, key=key)
+    st.plotly_chart(fig, use_container_width=True, key=key, theme="streamlit")
     patterns = (chart or {}).get("patterns") or []
     if patterns:
         st.caption(
@@ -629,140 +781,125 @@ def render_market_chart(
 
 
 def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") -> None:
-    """Render ranked scan table + detail cards. ``key_prefix`` keeps widget IDs unique."""
+    """Render a concise leaderboard followed by the strongest setup cards."""
+    if payload.get("ok") is False and (payload.get("error") or payload.get("message")):
+        st.error(payload.get("error") or payload.get("message"))
+        return
     rows = payload.get("ranked_results", [])
     if not rows:
-        st.info("No ranked setups returned yet. Try a broader watchlist or a different exchange.")
+        st.info(
+            "No high-quality setup is available right now. Staying flat is a valid trade decision."
+        )
         return
 
-    # Enrich rows with ticker + market price for display
     display_rows: List[Dict[str, Any]] = []
     for row in rows:
-        enriched = dict(row)
-        enriched["ticker"] = format_ticker_price(row.get("symbol"), row.get("price"))
-        display_rows.append(enriched)
+        row_payload = row.get("payload") or {}
+        plan = row_payload.get("trade_plan") or {}
+        entry_zone = plan.get("entry_zone") or {}
+        entry_low = row.get("entry_low")
+        if entry_low is None:
+            entry_low = plan.get("entry_low", entry_zone.get("low"))
+        entry_high = row.get("entry_high")
+        if entry_high is None:
+            entry_high = plan.get("entry_high", entry_zone.get("high"))
+        stop = row.get("stop_loss")
+        if stop is None:
+            stop = plan.get("stop_loss")
+        target = plan.get("tp1")
+        if target is None:
+            targets = plan.get("take_profits") or []
+            target = targets[0] if targets else None
+        rr = plan.get("rr_tp1")
+        if rr is None:
+            risk_rewards = plan.get("risk_reward") or []
+            rr = risk_rewards[0] if risk_rewards else None
+        confidence = row.get("confidence")
+        if confidence is None:
+            confidence = row.get("llm_confidence")
+        entry_state = str(
+            row.get("entry_status")
+            or (row_payload.get("execution") or {}).get("status")
+            or "wait"
+        ).replace("_", " ").title()
+        display_rows.append(
+            {
+                "Market": format_ticker_price(row.get("symbol"), row.get("price")),
+                "Side": str(row.get("direction") or "flat").upper(),
+                "Confidence": round(_safe_float(confidence), 1),
+                "Entry": (
+                    f"{format_price(_safe_float(entry_low))} – "
+                    f"{format_price(_safe_float(entry_high))}"
+                    if entry_low is not None and entry_high is not None
+                    else "—"
+                ),
+                "Stop": format_price(_safe_float(stop)) if stop is not None else "—",
+                "TP1": format_price(_safe_float(target)) if target is not None else "—",
+                "R:R": round(_safe_float(rr), 2) if rr is not None else "—",
+                "Status": entry_state,
+                "Lev.": f"{row.get('leverage', '—')}x",
+            }
+        )
 
-    cols = [
-        c
-        for c in [
-            "ticker",
-            "direction",
-            "price",
-            "llm_confidence",
-            "rank_score",
-            "prop_safe",
-            "entry_status",
-            "execution_score",
-            "immediate_sl_risk",
-            "risk_pct",
-            "confidence",
-            "technical_confidence",
-            "confluence_score",
-            "setup_name",
-            "leverage",
-            "model_leverage",
-            "exchange",
-            "entry_low",
-            "entry_high",
-            "stop_loss",
-            "hold_label",
-        ]
-        if c in (display_rows[0] if display_rows else {})
-    ]
     df = pd.DataFrame(display_rows)
-    # Format price column for readability in the table
-    if "price" in df.columns:
-        df = df.copy()
-        df["price"] = df.apply(
-            lambda r: format_ticker_price(r.get("symbol"), r.get("price")).split(" ", 1)[-1]
-            if r.get("price") is not None
-            else "—",
-            axis=1,
-        )
-    st.caption(
-        f"Ranked by LLM confidence + technical confluence "
-        f"({payload.get('ranking') or 'directional only'}). "
-        f"Flat/neutral excluded"
-        + (
-            f" ({payload.get('flat_count', 0)} skipped)."
-            if payload.get("flat_count")
-            else "."
-        )
-        + f" Display leverage capped at {payload.get('leverage_display_cap', SCAN_LEVERAGE_CAP)}x. "
-        f"Prices are live from the exchange used for each symbol."
-    )
     st.dataframe(
-        df[cols],
+        df,
         use_container_width=True,
         hide_index=True,
         key=f"{key_prefix}_results_table",
+        column_config={
+            "Confidence": st.column_config.ProgressColumn(
+                "Confidence",
+                min_value=0,
+                max_value=100,
+                format="%.0f%%",
+            ),
+            "Side": st.column_config.TextColumn("Side", width="small"),
+            "Status": st.column_config.TextColumn("Entry status", width="medium"),
+        },
+    )
+    st.caption(
+        f"{len(rows)} qualified setup{'s' if len(rows) != 1 else ''} · "
+        f"{payload.get('flat_count', 0)} neutral market"
+        f"{'s' if payload.get('flat_count', 0) != 1 else ''} filtered out"
     )
 
-    skipped = payload.get("skipped_flat") or []
-    if skipped:
-        with st.expander(f"Skipped flat/neutral ({len(skipped)})", expanded=False):
-            st.dataframe(pd.DataFrame(skipped), use_container_width=True, hide_index=True)
-
-    # Expandable detail cards for top results (unique titles avoid expander ID clashes)
     for i, row in enumerate(rows[:5]):
-        sym = str(row.get("symbol") or f"row{i}")
         ticker = format_ticker_price(row.get("symbol"), row.get("price"))
-        llm_c = row.get("llm_confidence")
+        confidence = row.get("confidence")
+        if confidence is None:
+            confidence = row.get("llm_confidence")
         title = (
             f"#{i + 1} {ticker} · {str(row.get('direction', 'flat')).upper()} · "
-            f"LLM {llm_c if llm_c is not None else '—'}% · lev {row.get('leverage', '—')}x"
+            f"{_safe_float(confidence):.0f}% confidence"
         )
         with st.expander(title, expanded=(i == 0)):
+            row_payload = row.get("payload") or {}
+            execution = row_payload.get("execution") or {}
+            status = str(
+                execution.get("status") or row.get("entry_status") or "wait"
+            ).replace("_", " ").upper()
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric(f"Price · {sym}", ticker.split(" ", 1)[-1] if " " in ticker else ticker)
-            c2.metric(
-                f"LLM Confidence · {sym}",
-                f"{_safe_float(llm_c):.0f}%" if llm_c is not None else "—",
-            )
-            c3.metric(f"Rank score · {sym}", f"{_safe_float(row.get('rank_score')):.1f}")
-            c4.metric(f"Leverage (priority) · {sym}", f"{row.get('leverage', '—')}x")
+            c1.metric("Side", str(row.get("direction") or "flat").upper())
+            c2.metric("Confidence", f"{_safe_float(confidence):.0f}%")
+            c3.metric("Entry status", status)
+            c4.metric("Leverage", f"{row.get('leverage', '—')}x")
             if row.get("llm_confidence_reason"):
-                st.info(f"**LLM Confidence:** {_safe_float(llm_c):.0f}% — {row['llm_confidence_reason']}")
+                st.info(row["llm_confidence_reason"])
             elif row.get("reason"):
-                st.caption(f"Why: {row['reason']}")
-            if row.get("fallback_used"):
-                st.caption(
-                    f"Fallback used: requested {row.get('exchange_requested')} → {row.get('exchange')}"
-                )
-            execution = (row.get("payload") or {}).get("execution") or {}
-            if execution:
-                status = str(execution.get("status") or "blocked").replace("_", " ").upper()
-                st.write(
-                    f"**Entry status:** {status} · "
-                    f"**Execution:** {_safe_float(execution.get('score')):.0f}/100 · "
-                    f"**Immediate-SL risk:** {_safe_float(execution.get('immediate_sl_risk')):.0f}/100 · "
-                    f"**Order flow:** {_safe_float(execution.get('order_flow_score')):+.2f}"
-                )
-                if execution.get("entry_reason"):
+                st.info(row["reason"])
+            if execution.get("entry_reason"):
+                if status == "READY":
+                    st.success(execution["entry_reason"])
+                else:
                     st.warning(execution["entry_reason"])
             render_market_chart(
-                (row.get("payload") or {}).get("chart") or {},
-                title=f"{ticker} · closed-candle execution view",
+                row_payload.get("chart") or {},
+                title=f"{ticker} · execution chart",
                 key=f"{key_prefix}_chart_{i}",
                 height=440,
             )
-            plan = (row.get("payload") or {}).get("trade_plan") or {}
-            if plan:
-                ez = plan.get("entry_zone") or {}
-                st.write(
-                    f"**Entry:** {ez.get('low', '—')} – {ez.get('high', '—')}  ·  "
-                    f"**SL:** {plan.get('stop_loss', '—')}  ·  "
-                    f"**Hold:** {plan.get('hold_detail') or plan.get('hold_label') or '—'}"
-                )
-                tp_bits = []
-                for n in range(1, 5):
-                    tp = plan.get(f"tp{n}")
-                    rr = plan.get(f"rr_tp{n}")
-                    if tp is not None:
-                        rr_s = f" (R:R {float(rr):.2f})" if rr is not None else ""
-                        tp_bits.append(f"TP{n}: {tp}{rr_s}")
-                if tp_bits:
-                    st.write(" · ".join(tp_bits))
+            render_trade_setup_card(row_payload)
 
     if rows:
         export_payload = {
@@ -811,10 +948,10 @@ def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") ->
 
 
 def render_trade_setup_card(payload: Dict[str, Any]) -> None:
-    plan, primary, sim = _plan_bundle(payload)
+    plan, primary, _ = _plan_bundle(payload)
     direction = (plan.get("direction") or payload.get("direction") or "flat").lower()
     if direction == "flat":
-        st.info("No directional trade plan — stand aside or wait for clearer structure.")
+        st.info("No directional trade plan. Wait for clearer structure.")
         return
 
     entry_low, entry_high = _entry_zone(plan, primary)
@@ -822,7 +959,6 @@ def render_trade_setup_card(payload: Dict[str, Any]) -> None:
     tps = _take_profits(plan, primary)
     rrs = _risk_rewards(plan, primary, max(len(tps), 4))
     lev = _display_leverage(payload, plan, primary)
-    model_lev = _model_leverage(payload, plan)
     hold = plan.get("hold_detail") or primary.get("hold_detail") or "—"
     hold_label = plan.get("hold_label") or primary.get("hold_label") or ""
     invalidation = plan.get("invalidation") or primary.get("invalidation") or "—"
@@ -839,44 +975,42 @@ def render_trade_setup_card(payload: Dict[str, Any]) -> None:
             return "—"
         return format_price(_safe_float(v), ref if ref else None)
 
-    st.subheader("🚨 Trade setup")
-    dir_emoji = "🟢" if direction == "long" else ("🔴" if direction == "short" else "⚪")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Direction", f"{dir_emoji} {direction.upper()}")
-    m2.metric("Leverage (priority)", f"{lev}x")
-    m3.metric("Quality", quality)
-    m4.metric("Hold", hold_label or "Day trade")
+    with st.container(border=True):
+        st.markdown('<div class="pp-section-label">Trade plan</div>', unsafe_allow_html=True)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Side", direction.upper())
+        m2.metric("Entry zone", f"{fp(entry_low)} – {fp(entry_high)}")
+        m3.metric("Stop", fp(stop))
+        m4.metric("Leverage", f"{lev}x")
 
-    st.markdown(
-        f"""
-| Field | Value |
-|---|---|
-| 🎯 **Entry zone** | **{fp(entry_low)} – {fp(entry_high)}** |
-| 🛑 **Stop loss** | **{fp(stop)}** |
-| ⚡ **Display leverage** | **{lev}x** (priority cap {SCAN_LEVERAGE_CAP}x) |
-| ⏱ **Hold** | {hold} |
-| ❌ **Invalidation** | {invalidation} |
-"""
-    )
-    if model_lev is not None and model_lev != lev:
-        st.caption(f"Model suggested leverage: {model_lev}x (day-trade band 10–30x).")
+        st.markdown("**Profit targets**")
+        if tps:
+            tp_cols = st.columns(len(tps))
+            for i, tp in enumerate(tps):
+                rr = rrs[i] if i < len(rrs) else None
+                rr_s = f"R:R {rr:.2f}" if rr is not None else "R:R —"
+                with tp_cols[i]:
+                    st.metric(f"TP{i + 1}", fp(tp), delta=rr_s)
+        else:
+            st.caption("Targets are unavailable for this setup.")
 
-    alt_low = plan.get("alternative_entry_low")
-    alt_high = plan.get("alternative_entry_high")
-    if alt_low is not None and alt_high is not None:
-        note = plan.get("alternative_entry_note") or ""
-        st.markdown(
-            f"🔄 **Alternative entry:** {fp(alt_low)} – {fp(alt_high)}"
-            + (f" · _{note}_" if note else "")
+        detail_left, detail_right = st.columns(2)
+        with detail_left:
+            st.markdown(f"**Hold**  \n{hold_label or 'Day trade'} · {hold}")
+        with detail_right:
+            st.markdown(f"**Invalidation**  \n{invalidation}")
+
+        alt_low = plan.get("alternative_entry_low")
+        alt_high = plan.get("alternative_entry_high")
+        if alt_low is not None and alt_high is not None:
+            note = plan.get("alternative_entry_note") or ""
+            st.caption(
+                f"Alternative entry: {fp(alt_low)} – {fp(alt_high)}"
+                + (f" · {note}" if note else "")
+            )
+        st.caption(
+            f"{quality.title()} setup · prop-account leverage capped at {SCAN_LEVERAGE_CAP}x"
         )
-
-    st.markdown("#### Take profits")
-    tp_cols = st.columns(max(len(tps), 1))
-    for i, tp in enumerate(tps):
-        rr = rrs[i] if i < len(rrs) else None
-        rr_s = f"{rr:.2f}" if rr is not None else "—"
-        with tp_cols[i]:
-            st.metric(f"TP{i + 1}", fp(tp), delta=f"R:R {rr_s}")
 
 
 def render_simulation_card(payload: Dict[str, Any]) -> None:
@@ -889,173 +1023,147 @@ def render_simulation_card(payload: Dict[str, Any]) -> None:
     lev = _display_leverage(payload, plan, primary)
     scaled = _scale_sim_to_base(plan, sim, SIM_BASE_USD)
 
-    st.subheader(f"Simulation example (${SIM_BASE_USD:.0f} base)")
-    st.caption("For illustration only — not a real balance or order.")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Risk at stop", f"${scaled['risk_amount']:.2f}")
-    c2.metric("Notional", f"${scaled['notional']:.2f}")
-    c3.metric("Margin @ priority lev", f"${scaled['margin']:.2f}")
-    st.write(
-        f"If you trade this with **${SIM_BASE_USD:.0f}** at **{lev}x** display leverage priority "
-        f"(risk ~{scaled['risk_pct']:.2f}%):"
-    )
-    if scaled["profits"]:
-        for i, profit in enumerate(scaled["profits"], 1):
-            pct = scaled["profit_pcts"][i - 1] if i - 1 < len(scaled["profit_pcts"]) else None
-            pct_s = f" ({pct:+.2f}% of base)" if pct is not None else ""
-            st.write(f"- At **TP{i}** → sim P/L **${profit:,.2f}**{pct_s}")
-    else:
-        st.write("- Profit targets unavailable for this plan.")
-    lev_note = plan.get("leverage_reasoning") or sim.get("leverage_reasoning")
-    if lev_note:
-        st.caption(f"Leverage logic: {lev_note}")
+    with st.expander(f"Position sizing example · ${SIM_BASE_USD:.0f} account"):
+        st.caption("Illustration only. Size every trade to your own daily loss limits.")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Risk at stop", f"${scaled['risk_amount']:.2f}")
+        c2.metric("Notional", f"${scaled['notional']:.2f}")
+        c3.metric(f"Margin @ {lev}x", f"${scaled['margin']:.2f}")
+        if scaled["profits"]:
+            profit_rows = []
+            for i, profit in enumerate(scaled["profits"], 1):
+                pct = (
+                    scaled["profit_pcts"][i - 1]
+                    if i - 1 < len(scaled["profit_pcts"])
+                    else None
+                )
+                profit_rows.append(
+                    {
+                        "Target": f"TP{i}",
+                        "Estimated P/L": f"${profit:,.2f}",
+                        "Account return": f"{pct:+.2f}%" if pct is not None else "—",
+                    }
+                )
+            st.dataframe(
+                pd.DataFrame(profit_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
-def render_single_analysis(symbol: str, timeframe: str, exchange: str, no_news: bool) -> None:
-    if not symbol:
-        st.info("Enter a symbol to run a single analysis.")
-        return
-    with st.spinner(f"Analyzing {symbol}…"):
-        payload = analyze_symbol(symbol, timeframe, exchange, no_news)
+def render_single_analysis(
+    payload: Dict[str, Any],
+    *,
+    symbol: str,
+    exchange: str,
+) -> None:
+    """Render one completed analysis without exposing model/backend internals."""
     if not payload.get("ok"):
         st.error(payload.get("error") or payload.get("message") or "Analysis failed")
-        if payload.get("attempted_exchanges"):
-            st.caption(f"Tried exchanges: {', '.join(payload['attempted_exchanges'])}")
         return
 
-    st.success("Analysis complete")
-    if payload.get("fallback_used"):
-        st.warning(
-            f"Auto-fallback: requested **{payload.get('exchange_requested')}** → "
-            f"using **{payload.get('exchange')}**"
-        )
-
-    h1, h2, h3, h4 = st.columns(4)
-    h1.metric("Bias", str(payload.get("bias") or payload.get("direction") or "flat").upper())
-    llm_c = payload.get("llm_confidence")
-    if llm_c is None:
-        llm_c = (payload.get("signal") or {}).get("llm_confidence")
-    h2.metric(
-        "LLM Confidence",
-        f"{_safe_float(llm_c):.0f}%" if llm_c is not None else "—",
+    direction = str(payload.get("bias") or payload.get("direction") or "flat").upper()
+    confidence = payload.get("confidence")
+    if confidence is None:
+        confidence = payload.get("llm_confidence")
+    if confidence is None:
+        confidence = (payload.get("signal") or {}).get("llm_confidence")
+    execution = payload.get("execution") or (payload.get("meta") or {}).get("execution") or {}
+    status = str(execution.get("status") or "wait").replace("_", " ").upper()
+    ticker = format_ticker_price(
+        payload.get("symbol") or symbol,
+        (payload.get("meta") or {}).get("price"),
     )
+    st.subheader(ticker)
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Side", direction)
+    h2.metric("Confidence", f"{_safe_float(confidence):.0f}%")
     h3.metric("Setup", payload.get("setup_name") or "—")
-    h4.metric("Exchange", payload.get("exchange") or exchange)
+    h4.metric("Entry status", status)
 
-    llm_reason = (
+    reason = (
         payload.get("llm_confidence_reason")
         or (payload.get("llm_narrative") or {}).get("confidence_reason")
+        or payload.get("reason")
         or ""
     )
-    if llm_c is not None or llm_reason:
-        st.info(
-            f"**LLM Confidence: {_safe_float(llm_c):.0f}%**"
-            + (f" — {llm_reason}" if llm_reason else "")
-        )
-    detail = (
-        payload.get("llm_confidence_detail")
-        or (payload.get("llm_narrative") or {}).get("confidence_detail")
-        or {}
-    )
-    if detail:
-        with st.expander("Why the model is confident (or not)", expanded=True):
-            if detail.get("verdict"):
-                st.write(f"**Verdict:** `{detail.get('verdict')}`")
-            if detail.get("summary"):
-                st.write(detail["summary"])
-            if detail.get("supporting"):
-                st.write("**Supporting**")
-                for s in detail["supporting"][:6]:
-                    st.write(f"- ✅ {s}")
-            if detail.get("opposing"):
-                st.write("**Opposing / risks**")
-                for o in detail["opposing"][:6]:
-                    st.write(f"- ⚠️ {o}")
-
-    conf_total = payload.get("confluence_total")
-    tech_c = payload.get("technical_confidence")
-    rank_s = payload.get("rank_score")
-    meta_bits = []
-    if conf_total is not None:
-        meta_bits.append(f"Confluence {float(conf_total):+.3f}")
-    if tech_c is not None:
-        meta_bits.append(f"Technical conf {_safe_float(tech_c):.1f}%")
-    if rank_s is not None:
-        meta_bits.append(f"Rank score {_safe_float(rank_s):.1f}")
-    if payload.get("confidence") is not None:
-        meta_bits.append(f"Blended conf {_safe_float(payload.get('confidence')):.1f}%")
     plan = payload.get("trade_plan") or {}
     if plan.get("prop_safe") is False or payload.get("prop_safe") is False:
-        meta_bits.append("⚠ not prop-safe")
-    flags = plan.get("prop_flags") or payload.get("prop_flags") or []
-    if flags:
-        meta_bits.append("flags: " + ", ".join(flags))
-    if meta_bits:
-        st.caption(" · ".join(meta_bits))
+        st.warning("This setup does not pass prop-account guardrails. Do not treat it as actionable.")
+    elif reason:
+        st.info(reason)
 
-    execution = payload.get("execution") or (payload.get("meta") or {}).get("execution") or {}
-    if execution:
-        status = str(execution.get("status") or "blocked").replace("_", " ").upper()
-        e1, e2, e3, e4 = st.columns(4)
-        e1.metric("Entry status", status)
-        e2.metric("Execution score", f"{_safe_float(execution.get('score')):.0f}/100")
-        e3.metric(
-            "Immediate-SL risk",
-            f"{_safe_float(execution.get('immediate_sl_risk')):.0f}/100",
-        )
-        e4.metric("Order-flow proxy", f"{_safe_float(execution.get('order_flow_score')):+.2f}")
-        if execution.get("entry_reason"):
-            if status == "READY":
-                st.success(execution["entry_reason"])
-            else:
-                st.warning(execution["entry_reason"])
+    if execution.get("entry_reason"):
+        if status == "READY":
+            st.success(execution["entry_reason"])
+        else:
+            st.warning(execution["entry_reason"])
+
+    render_trade_setup_card(payload)
 
     render_market_chart(
         payload.get("chart") or {},
-        title=f"{format_ticker_price(payload.get('symbol') or symbol, (payload.get('meta') or {}).get('price'))} · closed candles",
+        title=f"{ticker} · structure and execution",
         key=f"single_chart_{symbol.replace('/', '_').replace(':', '_')}",
     )
-
-    render_trade_setup_card(payload)
-    st.divider()
     render_simulation_card(payload)
 
     reasons = payload.get("key_reasons") or []
     risks = payload.get("key_risks") or []
     if reasons or risks:
-        st.divider()
         r1, r2 = st.columns(2)
         with r1:
-            st.subheader("Why this signal")
-            if reasons:
-                for item in reasons[:6]:
-                    st.write(f"- {item}")
-            else:
-                st.caption("—")
+            with st.container(border=True):
+                st.markdown("**Why this setup**")
+                if reasons:
+                    for item in reasons[:5]:
+                        st.write(f"- {item}")
+                else:
+                    st.caption("No additional confirmations.")
         with r2:
-            st.subheader("Risk notes")
-            if risks:
-                for item in risks[:6]:
-                    st.write(f"- {item}")
-            else:
-                st.caption("—")
+            with st.container(border=True):
+                st.markdown("**What could invalidate it**")
+                if risks:
+                    for item in risks[:6]:
+                        st.write(f"- {item}")
+                else:
+                    st.caption("No additional risk notes.")
 
-    if payload.get("key_levels"):
-        with st.expander("Key levels"):
-            st.json(payload.get("key_levels")[:6])
-
-    if payload.get("trader_commentary"):
-        with st.expander("Trader commentary"):
-            st.write(payload["trader_commentary"])
-
-    if payload.get("warnings"):
-        with st.expander("Warnings"):
-            for w in payload["warnings"]:
-                st.write(f"- {w}")
+    has_more = any(
+        (
+            payload.get("key_levels"),
+            payload.get("trader_commentary"),
+            payload.get("warnings"),
+        )
+    )
+    if has_more:
+        with st.expander("More market context"):
+            if payload.get("trader_commentary"):
+                st.write(payload["trader_commentary"])
+            if payload.get("key_levels"):
+                st.markdown("**Key levels**")
+                for level in payload.get("key_levels")[:6]:
+                    if isinstance(level, dict):
+                        label = level.get("label") or level.get("kind") or "Level"
+                        value = level.get("price", level.get("value", level.get("mid")))
+                        st.write(
+                            f"- {str(label).replace('_', ' ').title()}: "
+                            + (
+                                format_price(_safe_float(value))
+                                if value is not None
+                                else str(level.get("note") or "—")
+                            )
+                        )
+                    else:
+                        st.write(f"- {level}")
+            if payload.get("warnings"):
+                st.markdown("**Warnings**")
+                for w in payload["warnings"]:
+                    st.write(f"- {w}")
 
     safe_sym = symbol.replace("/", "_").replace(":", "_") or "symbol"
     st.download_button(
-        label="Export full report",
+        label="Download trade report",
         data=build_report_markdown(payload),
         file_name=f"{safe_sym}_report.md",
         mime="text/markdown",
@@ -1064,190 +1172,107 @@ def render_single_analysis(symbol: str, timeframe: str, exchange: str, no_news: 
 
 
 def render_backtest_panel(symbol: str, timeframe: str, exchange: str) -> None:
-    st.subheader("Prop backtest")
-    st.caption(
-        "Closed-candle confluence test with pending retest entries, conservative intrabar "
-        "stop ordering, fees/slippage, 0.5–1% risk, and ≤5x leverage."
-    )
-    bars = st.slider("Bars", min_value=150, max_value=1000, value=500, step=50, key="bt_bars")
-    if st.button("Run backtest", key="btn_run_backtest"):
-        from src.api.service import run_symbol_backtest
-
-        with st.spinner(f"Backtesting {symbol}…"):
-            result = run_symbol_backtest(
-                symbol,
-                timeframe=timeframe,
-                bars=int(bars),
-                exchange=exchange,
-                config=load_config(),
+    st.markdown("### Backtest a setup")
+    st.caption("Validate the current market and timeframe with prop-safe sizing.")
+    with st.container(border=True):
+        left, right = st.columns([3, 1])
+        with left:
+            bars = st.slider(
+                "History length",
+                min_value=150,
+                max_value=1000,
+                value=500,
+                step=50,
+                key="bt_bars",
+                help="More candles improve context but take longer to process.",
             )
-        st.session_state["last_backtest"] = result
+        with right:
+            st.markdown('<div class="pp-section-label">Current test</div>', unsafe_allow_html=True)
+            st.write(f"**{symbol.upper()} · {timeframe}**")
+        if st.button(
+            "Run backtest",
+            key="btn_run_backtest",
+            type="primary",
+            use_container_width=True,
+        ):
+            from src.api.service import run_symbol_backtest
+
+            with st.spinner(f"Backtesting {symbol.upper()} on {timeframe}…"):
+                result = run_symbol_backtest(
+                    symbol,
+                    timeframe=timeframe,
+                    bars=int(bars),
+                    exchange=exchange,
+                    config=load_config(),
+                )
+            st.session_state["last_backtest"] = result
+            st.session_state["last_backtest_label"] = f"{symbol.upper()} · {timeframe}"
 
     result = st.session_state.get("last_backtest")
     if not result:
-        st.caption("Run a backtest to see win rate, profit factor, max drawdown, and equity curve.")
+        st.info("Run a backtest to see performance, drawdown, and the equity curve.")
         return
     if not result.get("ok", True) and result.get("error"):
         st.error(result.get("error"))
         return
 
+    result_label = st.session_state.get("last_backtest_label")
+    if result_label:
+        st.markdown(f"#### Results · {result_label}")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Win rate", f"{_safe_float(result.get('win_rate')):.1f}%")
     m2.metric("Profit factor", f"{_safe_float(result.get('profit_factor')):.2f}")
     m3.metric("Max drawdown", f"{_safe_float(result.get('max_drawdown_pct')):.2f}%")
-    m4.metric("Net P/L", f"{_safe_float(result.get('net_pnl')):+.2f}")
+    m4.metric("Net P&L", f"${_safe_float(result.get('net_pnl')):+,.2f}")
     st.caption(
-        f"Signals: {result.get('n_signals', 0)} · trades: {result.get('n_trades', 0)} · "
-        f"unfilled/cancelled: {result.get('unfilled_signals', 0)} · "
-        f"stop-out rate: {_safe_float(result.get('stop_out_rate')):.1f}% · "
-        f"Final equity: ${_safe_float(result.get('final_equity')):,.2f} · "
-        f"Start: ${_safe_float(result.get('starting_equity')):,.2f}"
+        f"{result.get('n_trades', 0)} trades · "
+        f"{_safe_float(result.get('stop_out_rate')):.1f}% stop-out rate · "
+        f"${_safe_float(result.get('final_equity')):,.2f} final equity"
     )
-    props = result.get("prop_settings") or {}
-    if props:
-        st.caption(
-            f"Prop: risk {props.get('risk_pct')}% · max lev {props.get('max_leverage')}x · "
-            f"mode={props.get('prop_mode')}"
-        )
     curve = result.get("equity_curve") or []
     if curve:
         eq_df = pd.DataFrame(curve)
         if "t" in eq_df.columns and "equity" in eq_df.columns:
             eq_df = eq_df.set_index("t")
+            st.markdown("**Equity curve**")
             st.line_chart(eq_df["equity"], height=260)
     trades = result.get("trades") or []
     if trades:
-        with st.expander(f"Trades ({len(trades)} shown)"):
+        with st.expander(f"Trade history · {len(trades)}"):
             st.dataframe(pd.DataFrame(trades), use_container_width=True, hide_index=True)
-    for note in result.get("notes") or []:
-        st.caption(note)
 
 
 def main() -> None:
     _check_access()
-    st.title("Perpetual Pro")
+    inject_app_styles()
     try:
         cfg = load_config()
         prop_on = bool(getattr(cfg.risk, "prop_mode", True))
-        # Secrets live in env only — never check/display token values
-        from src.notify.telegram import is_telegram_ready
-
-        tg_ok = is_telegram_ready(cfg)
     except Exception:  # noqa: BLE001
         cfg = None
         prop_on = True
-        tg_ok = False
 
-    st.caption(
-        "Your Trade Quant "
-        "scheduled scans + Telegram alerts. "
+    st.markdown(
+        """
+<div class="pp-hero">
+    <div class="pp-eyebrow">Crypto perps · intraday intelligence</div>
+    <div class="pp-title">Perpetual Pro</div>
+    <div class="pp-subtitle">
+        Find selective, structure-led setups with precise entries, realistic targets,
+        and prop-account guardrails.
+    </div>
+</div>
+""",
+        unsafe_allow_html=True,
     )
 
     with st.sidebar:
-        st.header("Inputs")
+        st.markdown("## Market setup")
         if prop_on:
-            st.success("Prop mode: ≤5x · 0.5–1% risk")
+            st.success("Prop guardrails active")
+            st.caption("Maximum 5x leverage · 0.5–1% risk")
         else:
-            st.warning("Aggressive mode (prop_mode=false)")
-        st.caption(
-            "Telegram: "
-            + (
-                "ready (env TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)"
-                if tg_ok
-                else "not configured — set env vars (never commit secrets)"
-            )
-        )
-        if cfg:
-            sessions = list(getattr(cfg.scheduler, "sessions", None) or [])
-            if sessions:
-                st.caption(
-                    "Schedule: "
-                    + " · ".join(
-                        f"{session.get('name')} {session.get('time')} "
-                        f"{session.get('timezone')}"
-                        for session in sessions
-                    )
-                    + " · DST-aware"
-                )
-            elif cfg.scheduler.times:
-                st.caption(
-                    f"Schedule (WAT): {', '.join(cfg.scheduler.times)} · "
-                    f"tz={cfg.scheduler.timezone}"
-                )
-            if cfg.telegram.notify_on_empty:
-                st.caption("Telegram confirms every scheduled scan, including no-trade windows.")
-        with st.expander("Telegram diagnostics"):
-            st.caption(
-                "Runs live bot identity/chat permission checks, then sends one fixed test message."
-            )
-            if st.button(
-                "Send Test Telegram Alert",
-                key="btn_test_telegram",
-                disabled=not tg_ok,
-            ):
-                with st.spinner("Checking Telegram and sending test…"):
-                    telegram_test_result = send_manual_telegram_test()
-                if telegram_test_result.get("ok"):
-                    delivery = telegram_test_result.get("delivery") or {}
-                    st.success(
-                        "Telegram test delivered"
-                        + (
-                            f" (message ID {delivery.get('message_id')})"
-                            if delivery.get("message_id") is not None
-                            else ""
-                        )
-                    )
-                else:
-                    delivery = telegram_test_result.get("delivery") or {}
-                    diagnostics = telegram_test_result.get("diagnostics") or {}
-                    description = (
-                        delivery.get("description")
-                        or diagnostics.get("description")
-                        or telegram_test_result.get("description")
-                        or telegram_test_result.get("error")
-                        or "Unknown Telegram failure"
-                    )
-                    st.error(f"Telegram test failed: {description}")
-                st.json(telegram_test_result)
-            if st.button(
-                "Run Test Scan & Send Alert",
-                key="btn_test_telegram_scan",
-                disabled=not (
-                    tg_ok or bool((os.getenv("TELEGRAM_TEST_KEY") or "").strip())
-                ),
-                help=(
-                    "Runs the full configured watchlist now. Sends chart alerts "
-                    "for qualified setups, otherwise sends the no-quality-setup message."
-                ),
-            ):
-                with st.spinner(
-                    "Running the full watchlist scan and sending Telegram output…"
-                ):
-                    scan_test_result = run_manual_telegram_scan_test()
-                if scan_test_result.get("ok"):
-                    alert_count = int(scan_test_result.get("alert_count") or 0)
-                    if alert_count:
-                        st.success(
-                            f"Test scan delivered {alert_count} qualified signal alert(s)."
-                        )
-                    else:
-                        st.success(
-                            "Test scan completed; the no-quality-setup message was delivered."
-                        )
-                else:
-                    delivery = scan_test_result.get("delivery") or {}
-                    st.error(
-                        "Test scan did not deliver: "
-                        + str(
-                            delivery.get("description")
-                            or scan_test_result.get("delivery_status")
-                            or scan_test_result.get("error")
-                            or "unknown failure"
-                        )
-                    )
-                st.json(scan_test_result)
-            if st.button("Refresh scheduler status", key="btn_scheduler_status"):
-                st.json(call_backend("/telegram/status"))
+            st.warning("Prop guardrails are off")
         symbol = st.text_input(
             "Symbol",
             value="BTC",
@@ -1256,8 +1281,8 @@ def main() -> None:
         )
         timeframe = st.selectbox(
             "Timeframe",
-            ["1m", "5m", "15m", "1h", "4h"],
-            index=2,
+            ["15m", "1h", "4h"],
+            index=0,
             key="input_timeframe",
         )
         try:
@@ -1271,58 +1296,98 @@ def main() -> None:
             index=ex_index,
             key="input_exchange",
         )
-        st.caption("If the symbol is missing on the preferred venue, others are tried automatically.")
-        no_news = st.checkbox(
-            "Skip news",
-            value=False,
+        include_news = st.toggle(
+            "Use news filter",
+            value=True,
             key="input_no_news_v2",
-            help="When unchecked (default), analysis fetches recent headlines (last ~1–4 hours).",
+            help="Include recent market headlines when validating a setup.",
         )
-        st.caption(f"Backend: {BACKEND_URL}")
-        if st.button("Ping backend", key="btn_ping_backend"):
-            result = call_backend("/health")
-            st.json(result)
+        no_news = not include_news
 
-    tab_scan, tab_bt = st.tabs(["Scan & analyze", "Backtest"])
+    tab_scan, tab_bt = st.tabs(["Market scanner", "Backtest"])
 
     with tab_scan:
-        col1, col2 = st.columns(2)
-        with col1:
-            run_single = st.button("Run single analysis", type="primary", key="btn_run_single")
-        with col2:
-            watchlist = st.text_area(
-                "Symbols (comma-separated)",
-                value=DEFAULT_WATCHLIST,
-                height=100,
-                key="input_watchlist",
-            )
-            run_scan = st.button("Scan watchlist", key="btn_scan_watchlist")
-
+        single_col, scan_col = st.columns([0.85, 1.15], gap="large")
+        with single_col:
+            with st.container(border=True):
+                st.markdown("### Analyze one market")
+                st.caption(f"{symbol.upper()} · {timeframe} · {exchange}")
+                run_single = st.button(
+                    "Analyze market",
+                    type="primary",
+                    key="btn_run_single",
+                    use_container_width=True,
+                )
+        with scan_col:
+            with st.container(border=True):
+                st.markdown("### Scan watchlist")
+                watchlist = st.text_area(
+                    "Markets",
+                    value=DEFAULT_WATCHLIST,
+                    height=86,
+                    key="input_watchlist",
+                    label_visibility="collapsed",
+                    placeholder="BTC, ETH, SOL",
+                )
+                run_scan = st.button(
+                    "Find qualified setups",
+                    key="btn_scan_watchlist",
+                    use_container_width=True,
+                )
         if run_single:
-            render_single_analysis(symbol, timeframe, exchange, no_news)
+            clean_symbol = symbol.strip().upper()
+            if not clean_symbol:
+                st.warning("Enter a market symbol first.")
+            else:
+                with st.spinner(
+                    f"Analyzing {clean_symbol} across 15m, 1h, and 4h structure…"
+                ):
+                    single_payload = analyze_symbol(
+                        clean_symbol,
+                        timeframe,
+                        exchange,
+                        no_news,
+                    )
+                st.session_state["last_single"] = single_payload
+                st.session_state["last_single_symbol"] = clean_symbol
+                st.session_state["last_single_at"] = datetime.now(timezone.utc).strftime(
+                    "%H:%M UTC"
+                )
 
         if run_scan:
             symbols = normalize_symbol_list(watchlist)
             if not symbols:
                 st.warning("Add at least one symbol to scan.")
             else:
-                st.session_state.pop("last_scan", None)
-                with st.spinner(f"Scanning {len(symbols)} symbols (fresh data + news)…"):
+                with st.spinner(f"Scanning {len(symbols)} markets for qualified setups…"):
                     payload = scan_symbols(symbols, timeframe, exchange, no_news)
                 st.session_state["last_scan"] = payload
                 st.session_state["last_scan_at"] = datetime.now(timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M:%S UTC"
+                    "%H:%M UTC"
                 )
 
+        if st.session_state.get("last_single"):
+            st.divider()
+            single_label = st.session_state.get("last_single_symbol") or symbol.upper()
+            single_at = st.session_state.get("last_single_at")
+            st.markdown(f"## Individual analysis · {single_label}")
+            if single_at:
+                st.caption(f"Updated {single_at}")
+            render_single_analysis(
+                st.session_state["last_single"],
+                symbol=single_label,
+                exchange=exchange,
+            )
+
         st.divider()
-        st.subheader("Ranked signals")
+        st.markdown("## Ranked signals")
         if st.session_state.get("last_scan"):
             scanned_at = st.session_state.get("last_scan_at")
             if scanned_at:
-                st.caption(f"Last fresh scan: {scanned_at}")
+                st.caption(f"Updated {scanned_at}")
             render_scan_results(st.session_state["last_scan"], key_prefix="scan")
         else:
-            st.caption("Run a watchlist scan to populate ranked signals.")
+            st.info("Scan your watchlist to rank only the setups that pass current filters.")
 
     with tab_bt:
         render_backtest_panel(symbol, timeframe, exchange)
