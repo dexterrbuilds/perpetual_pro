@@ -646,6 +646,8 @@ def format_prop_scan_report(
     timezone: str = "Africa/Lagos",
     max_rows: int = 6,
     min_signal_confidence: float = 68.0,
+    scanned_count: Optional[int] = None,
+    ranked_count: Optional[int] = None,
 ) -> str:
     """Compact Telegram report for actionable, prop-safe intraday signals."""
     try:
@@ -659,7 +661,26 @@ def format_prop_scan_report(
         header += f" · {html.escape(slot_label)}"
     lines = [header, when, "15m execution · 1h/4h confirmation · ≤5x", ""]
     if not ranked:
-        lines.append("No high-confidence prop-safe signals this window.")
+        lines += [
+            "⏸ <b>NO QUALITY SETUP — STAND ASIDE</b>",
+            "",
+            (
+                f"Scanned {scanned_count} symbols"
+                if scanned_count is not None
+                else "Scheduled scan completed"
+            )
+            + (
+                f" · {ranked_count} directional candidate(s)"
+                if ranked_count is not None
+                else ""
+            )
+            + ".",
+            (
+                f"Nothing passed ≥{min_signal_confidence:.0f}% confidence, "
+                "execution ≥65, and the prop-safety gate."
+            ),
+            "No trade is the correct position until a clean entry appears.",
+        ]
         return "\n".join(lines)
 
     lines.append(f"<b>{len(ranked)} actionable signal(s)</b>\n")

@@ -41,11 +41,14 @@ Built to feel like a senior prop trader sitting next to you.
 - **Prop risk** (default): **0.5–1% risk per trade**, **max 5x leverage**, flags for high drawdown / wide stop / low R:R
 - **LLM confidence** with supporting vs opposing factors in reports
 - **Backtest**: `python main.py BTC --backtest --bars 500` (pending retest fills, fees/slippage, unfilled signals, stop-out rate, MFE/MAE, win rate, profit factor, max DD)
-- **Scheduled scans** at **05:00 / 16:00 / 20:00 WAT** + high-confidence
+- **DST-aware scheduled scans** at the London open, shortly before the New York
+  cash open, and the New York 3 p.m. liquidity/ETF window, with
   **Telegram chart alerts**. Each actionable alert includes a plotted closed-candle
   chart (EMA/VWAP, structure, entry, SL, TP1–TP4) and a compact signal call with
   confidence, execution status, reason, risk, funding/OI context, and hold window.
   Text delivery remains as an automatic fallback if media rendering/upload fails.
+  When no setup passes the quality gates, Telegram sends an explicit
+  **NO QUALITY SETUP — STAND ASIDE** confirmation.
 
 **Telegram secrets are env-only** (never put tokens in `config.yaml` or commit them):
 
@@ -56,7 +59,7 @@ export TELEGRAM_CHAT_ID="your-chat-id"
 export TELEGRAM_TEST_KEY="a-long-random-admin-key"
 
 python scripts/run_scheduled_scans.py --once   # test one high-conf report now
-python scripts/run_scheduled_scans.py          # loop: 05:00 / 16:00 / 20:00 WAT
+python scripts/run_scheduled_scans.py          # DST-aware market-session loop
 # or: python main.py --scheduled-scan
 ```
 

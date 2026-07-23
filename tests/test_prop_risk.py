@@ -81,9 +81,15 @@ def test_config_loads_prop_and_telegram():
     assert cfg.risk.max_leverage <= 5
     assert hasattr(cfg, "telegram")
     assert hasattr(cfg, "scheduler")
-    assert "05:00" in cfg.scheduler.times
-    assert "16:00" in cfg.scheduler.times
+    assert "09:00" in cfg.scheduler.times
+    assert "15:00" in cfg.scheduler.times
     assert "20:00" in cfg.scheduler.times
+    assert [session["name"] for session in cfg.scheduler.sessions] == [
+        "London open",
+        "New York open",
+        "New York liquidity window",
+    ]
+    assert cfg.telegram.notify_on_empty is True
     # Secrets must never be sourced from YAML defaults
     # (empty unless env vars are set in the test process)
     assert not getattr(cfg.telegram, "bot_token", None) or True

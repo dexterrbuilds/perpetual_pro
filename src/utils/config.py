@@ -188,7 +188,7 @@ class TelegramConfig:
     min_llm_confidence: float = 65.0
     min_rank_score: float = 50.0
     parse_mode: str = "HTML"
-    notify_on_empty: bool = False
+    notify_on_empty: bool = True
 
     def credentials_configured(self) -> bool:
         return bool((self.bot_token or "").strip() and (self.chat_id or "").strip())
@@ -198,7 +198,27 @@ class TelegramConfig:
 class SchedulerConfig:
     enabled: bool = False
     timezone: str = "Africa/Lagos"  # WAT
-    times: List[str] = field(default_factory=lambda: ["05:00", "16:00", "20:00"])
+    # Legacy/fallback WAT slots. Session-aware slots below take priority.
+    times: List[str] = field(default_factory=lambda: ["09:00", "15:00", "20:00"])
+    sessions: List[Dict[str, str]] = field(
+        default_factory=lambda: [
+            {
+                "name": "London open",
+                "time": "08:00",
+                "timezone": "Europe/London",
+            },
+            {
+                "name": "New York open",
+                "time": "09:15",
+                "timezone": "America/New_York",
+            },
+            {
+                "name": "New York liquidity window",
+                "time": "15:00",
+                "timezone": "America/New_York",
+            },
+        ]
+    )
     watchlist: List[str] = field(default_factory=list)
     exchange: str = "bybit"
     timeframe: str = "15m"
@@ -399,12 +419,40 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             min_llm_confidence=float(tg.get("min_llm_confidence", 65)),
             min_rank_score=float(tg.get("min_rank_score", 50)),
             parse_mode=str(tg.get("parse_mode", "HTML") or "HTML"),
-            notify_on_empty=bool(tg.get("notify_on_empty", False)),
+            notify_on_empty=bool(tg.get("notify_on_empty", True)),
         ),
         scheduler=SchedulerConfig(
             enabled=bool(sched.get("enabled", True)),
             timezone=str(sched.get("timezone", "Africa/Lagos") or "Africa/Lagos"),
-            times=list(sched.get("times", ["05:00", "16:00", "20:00"])),
+            times=list(sched.get("times", ["09:00", "15:00", "20:00"])),
+            sessions=[
+                {
+                    "name": str(item.get("name") or "Trading session"),
+                    "time": str(item.get("time") or "00:00"),
+                    "timezone": str(item.get("timezone") or "UTC"),
+                }
+                for item in (
+                    sched.get("sessions")
+                    or [
+                        {
+                            "name": "London open",
+                            "time": "08:00",
+                            "timezone": "Europe/London",
+                        },
+                        {
+                            "name": "New York open",
+                            "time": "09:15",
+                            "timezone": "America/New_York",
+                        },
+                        {
+                            "name": "New York liquidity window",
+                            "time": "15:00",
+                            "timezone": "America/New_York",
+                        },
+                    ]
+                )
+                if isinstance(item, dict)
+            ],
             watchlist=list(sched.get("watchlist", [])),
             exchange=str(sched.get("exchange", "bybit") or "bybit"),
             timeframe=str(sched.get("timeframe", "15m") or "15m"),

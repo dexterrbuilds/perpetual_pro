@@ -1108,11 +1108,25 @@ def main() -> None:
                 else "not configured — set env vars (never commit secrets)"
             )
         )
-        if cfg and cfg.scheduler.times:
-            st.caption(
-                f"Schedule (WAT): {', '.join(cfg.scheduler.times)} · "
-                f"tz={cfg.scheduler.timezone} · high-confidence only"
-            )
+        if cfg:
+            sessions = list(getattr(cfg.scheduler, "sessions", None) or [])
+            if sessions:
+                st.caption(
+                    "Schedule: "
+                    + " · ".join(
+                        f"{session.get('name')} {session.get('time')} "
+                        f"{session.get('timezone')}"
+                        for session in sessions
+                    )
+                    + " · DST-aware"
+                )
+            elif cfg.scheduler.times:
+                st.caption(
+                    f"Schedule (WAT): {', '.join(cfg.scheduler.times)} · "
+                    f"tz={cfg.scheduler.timezone}"
+                )
+            if cfg.telegram.notify_on_empty:
+                st.caption("Telegram confirms every scheduled scan, including no-trade windows.")
         with st.expander("Telegram diagnostics"):
             st.caption(
                 "Runs live bot identity/chat permission checks, then sends one fixed test message."

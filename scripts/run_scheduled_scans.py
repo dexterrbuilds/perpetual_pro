@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run prop watchlist scans on a WAT schedule (or once).
 
-Sends high-confidence prop-safe reports via Telegram at:
-  05:00 WAT · 16:00 WAT · 20:00 WAT
+Sends prop-safe Telegram chart alerts at DST-aware market sessions:
+  London open · New York open · New York 3 p.m. liquidity window
 
 Usage:
   export TELEGRAM_BOT_TOKEN=...   # required for alerts (never commit)

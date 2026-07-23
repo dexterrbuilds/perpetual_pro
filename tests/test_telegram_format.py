@@ -21,6 +21,7 @@ from src.notify.telegram import (
 from src.scheduler.scan_job import (
     filter_high_confidence,
     get_scheduler_status,
+    next_session_datetime,
     next_slot_datetime,
     run_scheduler_loop,
 )
@@ -75,8 +76,16 @@ def test_format_prop_scan_report_with_rows():
 
 
 def test_format_empty():
-    text = format_prop_scan_report([], slot_label="05:00 WAT")
-    assert "No high-confidence" in text
+    text = format_prop_scan_report(
+        [],
+        slot_label="London open",
+        scanned_count=15,
+        ranked_count=2,
+    )
+    assert "NO QUALITY SETUP" in text
+    assert "STAND ASIDE" in text
+    assert "Scanned 15 symbols" in text
+    assert "2 directional candidate" in text
 
 
 def test_filter_high_confidence():
@@ -137,6 +146,33 @@ def test_next_slot_datetime_future():
     now = datetime(2026, 7, 21, 10, 0, tzinfo=ZoneInfo("Africa/Lagos"))
     nxt = next_slot_datetime(["05:00", "16:00", "20:00"], "Africa/Lagos", now=now)
     assert nxt.hour == 16
+
+
+def test_session_schedule_follows_london_and_new_york_dst():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    cfg = load_config(ROOT / "config.yaml")
+    summer_now = datetime(2026, 7, 23, 6, 0, tzinfo=ZoneInfo("UTC"))
+    london, london_name = next_session_datetime(cfg.scheduler.sessions, now=summer_now)
+    assert london_name == "London open"
+    assert london.strftime("%H:%M %Z") == "08:00 BST"
+    assert london.astimezone(ZoneInfo("Africa/Lagos")).strftime("%H:%M") == "08:00"
+
+    after_london = datetime(2026, 7, 23, 12, 0, tzinfo=ZoneInfo("UTC"))
+    ny_open, ny_name = next_session_datetime(cfg.scheduler.sessions, now=after_london)
+    assert ny_name == "New York open"
+    assert ny_open.strftime("%H:%M %Z") == "09:15 EDT"
+    assert ny_open.astimezone(ZoneInfo("Africa/Lagos")).strftime("%H:%M") == "14:15"
+
+    winter_now = datetime(2026, 1, 15, 13, 30, tzinfo=ZoneInfo("UTC"))
+    winter_open, winter_name = next_session_datetime(
+        cfg.scheduler.sessions,
+        now=winter_now,
+    )
+    assert winter_name == "New York open"
+    assert winter_open.strftime("%H:%M %Z") == "09:15 EST"
+    assert winter_open.astimezone(ZoneInfo("Africa/Lagos")).strftime("%H:%M") == "15:15"
 
 
 def test_credentials_from_env_only(monkeypatch):
@@ -325,7 +361,11 @@ def test_scheduler_loop_triggers_due_slot(monkeypatch):
     cfg = load_config(ROOT / "config.yaml")
     calls = []
     due = datetime.now(ZoneInfo(cfg.scheduler.timezone))
-    monkeypatch.setattr(scan_job, "next_slot_datetime", lambda *a, **k: due)
+    monkeypatch.setattr(
+        scan_job,
+        "next_session_datetime",
+        lambda *a, **k: (due, "Test session"),
+    )
     monkeypatch.setattr(
         scan_job,
         "run_scheduled_scan_once",
@@ -378,6 +418,37 @@ def test_scheduled_scan_calls_detailed_sender(monkeypatch):
     assert result["telegram_sent"] is True
     assert result["telegram_delivery_status"] == "sent_with_text_fallback"
     assert result["telegram_delivery"]["text_fallback"]["message_id"] == 42
+
+
+def test_scheduled_scan_sends_no_quality_setup_message(monkeypatch):
+    from src.scheduler import scan_job
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "123456")
+    cfg = load_config(ROOT / "config.yaml")
+    assert cfg.telegram.notify_on_empty is True
+    monkeypatch.setattr(
+        scan_job,
+        "scan_symbols",
+        lambda *a, **k: {"ok": True, "ranked_results": []},
+    )
+    messages = []
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_message_detailed",
+        lambda text, **kwargs: messages.append(text)
+        or {"ok": True, "message_id": 55},
+    )
+
+    result = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label="London open",
+        send=True,
+    )
+    assert messages
+    assert "NO QUALITY SETUP" in messages[0]
+    assert result["telegram_sent"] is True
+    assert result["telegram_delivery_status"] == "sent_empty_report"
 
 
 def test_scheduled_scan_sends_chart_alert_without_text_fallback(monkeypatch):

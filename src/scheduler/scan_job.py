@@ -33,6 +33,8 @@ _SCHEDULER_STATUS: Dict[str, Any] = {
     "thread_alive": False,
     "timezone": None,
     "times": [],
+    "sessions": [],
+    "next_session": None,
     "started_at": None,
     "next_run_at": None,
     "last_triggered_at": None,
@@ -79,7 +81,7 @@ def next_slot_datetime(
     tz = ZoneInfo(timezone)
     now = now.astimezone(tz) if now else datetime.now(tz)
     candidates: List[datetime] = []
-    for t in times or ["05:00", "16:00", "20:00"]:
+    for t in times or ["09:00", "15:00", "20:00"]:
         try:
             h, m = _parse_hhmm(t)
         except (TypeError, ValueError):
@@ -91,6 +93,45 @@ def next_slot_datetime(
     if not candidates:
         return now + timedelta(hours=1)
     return min(candidates)
+
+
+def next_session_datetime(
+    sessions: List[Dict[str, str]],
+    now: Optional[datetime] = None,
+) -> Tuple[datetime, str]:
+    """Return the next named market session, preserving its local timezone."""
+    now_utc = (
+        now.astimezone(ZoneInfo("UTC"))
+        if now is not None and now.tzinfo is not None
+        else (
+            now.replace(tzinfo=ZoneInfo("UTC"))
+            if now is not None
+            else datetime.now(ZoneInfo("UTC"))
+        )
+    )
+    candidates: List[Tuple[datetime, str]] = []
+    for session in sessions or []:
+        try:
+            name = str(session.get("name") or "Trading session")
+            tz_name = str(session.get("timezone") or "UTC")
+            hour, minute = _parse_hhmm(str(session.get("time") or "00:00"))
+            tz = ZoneInfo(tz_name)
+        except (AttributeError, TypeError, ValueError, KeyError):
+            continue
+        local_now = now_utc.astimezone(tz)
+        candidate = local_now.replace(
+            hour=hour,
+            minute=minute,
+            second=0,
+            microsecond=0,
+        )
+        if candidate <= local_now:
+            candidate += timedelta(days=1)
+        candidates.append((candidate, name))
+    if not candidates:
+        fallback = now_utc + timedelta(hours=1)
+        return fallback, "Fallback scan"
+    return min(candidates, key=lambda item: item[0].astimezone(ZoneInfo("UTC")))
 
 
 def filter_high_confidence(
@@ -179,6 +220,8 @@ def run_scheduled_scan_once(
         min_signal_confidence=float(
             getattr(cfg.analysis, "directional_confidence_threshold", 68.0)
         ),
+        scanned_count=len(watchlist),
+        ranked_count=len(ranked),
     )
     sent = False
     delivery: Optional[Dict[str, Any]] = None
@@ -346,13 +389,15 @@ def run_scheduler_loop(
     """
     cfg = config or load_config()
     stop = stop_event or Event()
-    times = list(cfg.scheduler.times or ["05:00", "16:00", "20:00"])
+    times = list(cfg.scheduler.times or ["09:00", "15:00", "20:00"])
+    sessions = list(getattr(cfg.scheduler, "sessions", None) or [])
     tz_name = cfg.scheduler.timezone or "Africa/Lagos"
     _status_update(
         enabled=bool(cfg.scheduler.enabled),
         running=True,
         timezone=tz_name,
         times=times,
+        sessions=sessions,
         started_at=datetime.now(ZoneInfo("UTC")).isoformat(),
         last_error=None,
     )
@@ -370,7 +415,7 @@ def run_scheduler_loop(
             logger.exception("Manual scheduled scan failed: {}", exc)
             raise
         finally:
-            _status_update(running=False, next_run_at=None)
+            _status_update(running=False, next_run_at=None, next_session=None)
         return
 
     iterations = 0
@@ -383,19 +428,42 @@ def run_scheduler_loop(
         logger.info("Telegram credentials loaded from environment (token redacted)")
     logger.info(
         "Scheduler loop started: times={} timezone={} high-confidence-only=true",
-        times,
+        (
+            [
+                f"{session.get('name')} {session.get('time')} {session.get('timezone')}"
+                for session in sessions
+            ]
+            if sessions
+            else times
+        ),
         tz_name,
     )
     try:
         while not stop.is_set():
-            nxt = next_slot_datetime(times, tz_name)
-            _status_update(next_run_at=nxt.isoformat())
-            now = datetime.now(ZoneInfo(tz_name))
+            if sessions:
+                nxt, session_name = next_session_datetime(sessions)
+            else:
+                nxt = next_slot_datetime(times, tz_name)
+                session_name = "Scheduled scan"
+            _status_update(
+                next_run_at=nxt.isoformat(),
+                next_session=session_name,
+            )
+            now = datetime.now(nxt.tzinfo or ZoneInfo("UTC"))
             sleep_s = max(0.0, (nxt - now).total_seconds())
-            logger.info("Next scheduled scan: {} (in {:.0f}s)", nxt.isoformat(), sleep_s)
+            logger.info(
+                "Next scheduled scan: {} · {} (in {:.0f}s)",
+                session_name,
+                nxt.isoformat(),
+                sleep_s,
+            )
             if stop.wait(timeout=sleep_s):
                 break
-            label = nxt.strftime("%H:%M %Z")
+            wat = nxt.astimezone(ZoneInfo(tz_name))
+            label = (
+                f"{session_name} · {nxt.strftime('%H:%M %Z')} "
+                f"({wat.strftime('%H:%M %Z')})"
+            )
             triggered_at = datetime.now(ZoneInfo("UTC")).isoformat()
             _status_update(last_triggered_at=triggered_at, last_error=None)
             try:
@@ -416,7 +484,7 @@ def run_scheduler_loop(
             if max_iterations is not None and iterations >= max_iterations:
                 break
     finally:
-        _status_update(running=False, next_run_at=None)
+        _status_update(running=False, next_run_at=None, next_session=None)
         logger.info("Scheduler loop stopped")
 
 
@@ -430,6 +498,7 @@ def start_scheduler_background(config: Optional[AppConfig] = None) -> bool:
             running=False,
             timezone=cfg.scheduler.timezone,
             times=list(cfg.scheduler.times),
+            sessions=list(getattr(cfg.scheduler, "sessions", None) or []),
         )
         logger.warning("Scheduler disabled by configuration (scheduler.enabled=false)")
         return False
@@ -449,6 +518,7 @@ def start_scheduler_background(config: Optional[AppConfig] = None) -> bool:
         thread_alive=True,
         timezone=cfg.scheduler.timezone,
         times=list(cfg.scheduler.times),
+        sessions=list(getattr(cfg.scheduler, "sessions", None) or []),
     )
     logger.info("Scheduler background thread started")
     return True
@@ -462,7 +532,12 @@ def stop_scheduler_background(timeout: float = 5.0) -> None:
     if _BACKGROUND_THREAD is not None and _BACKGROUND_THREAD.is_alive():
         _BACKGROUND_THREAD.join(timeout=max(0.0, timeout))
     alive = bool(_BACKGROUND_THREAD and _BACKGROUND_THREAD.is_alive())
-    _status_update(thread_alive=alive, running=alive, next_run_at=None)
+    _status_update(
+        thread_alive=alive,
+        running=alive,
+        next_run_at=None,
+        next_session=None,
+    )
     if alive:
         logger.warning("Scheduler thread did not stop within {:.1f}s", timeout)
     else:
