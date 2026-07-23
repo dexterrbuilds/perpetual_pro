@@ -144,6 +144,7 @@ def configure_telegram_webhook(config: AppConfig, timeout: int = 15) -> bool:
                         {"command": "scan", "description": "Scan for qualified setups"},
                         {"command": "status", "description": "Show bot and scan status"},
                         {"command": "help", "description": "Show command examples"},
+                        {"command": "chatid", "description": "Show this chat's numeric ID"},
                     ]
                 },
                 timeout=(5, timeout),
@@ -181,6 +182,7 @@ def _command_help() -> str:
         "<code>/scan BTC ETH SOL</code> — scan selected markets\n"
         "<code>/scan 1h BTC ETH</code> — scan selected markets on 1h\n"
         "<code>/status</code> — show scan availability\n"
+        "<code>/chatid</code> — show this chat's numeric ID\n"
         "<code>/help</code> — show this guide\n\n"
         "Only qualified, prop-safe setups are returned. If none pass, "
         "the bot will tell you to stand aside."
@@ -206,31 +208,96 @@ def parse_scan_command(text: str) -> Tuple[Optional[str], List[str], Optional[st
     return timeframe, symbols, None
 
 
+def get_telegram_command_chat_ids(
+    configured_chat_id: Optional[str] = None,
+) -> List[str]:
+    """Return explicit command chats, falling back to the alert destination."""
+    raw = (os.getenv("TELEGRAM_COMMAND_CHAT_IDS") or "").strip()
+    if raw:
+        candidates = re.split(r"[\s,;]+", raw)
+    else:
+        fallback = configured_chat_id
+        if fallback is None:
+            _, fallback = get_telegram_credentials()
+        candidates = [fallback or ""]
+
+    command_chats: List[str] = []
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value and value not in command_chats:
+            command_chats.append(value)
+    return command_chats
+
+
+def _message_from_update(update: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return None
+    return message if isinstance(message.get("chat"), dict) else None
+
+
 def _authorized_message(
     update: Dict[str, Any],
     configured_chat_id: str,
 ) -> Optional[Dict[str, Any]]:
-    message = update.get("message")
-    if not isinstance(message, dict):
+    message = _message_from_update(update)
+    if message is None:
         return None
     chat = message.get("chat")
-    if not isinstance(chat, dict):
-        return None
-    configured = (configured_chat_id or "").strip()
+    assert isinstance(chat, dict)
     incoming_id = str(chat.get("id") or "")
     username = str(chat.get("username") or "")
-    if configured.startswith("@"):
-        authorized = username.lower() == configured[1:].lower()
-    else:
-        authorized = bool(configured and incoming_id == configured)
+    allowed_chats = get_telegram_command_chat_ids(configured_chat_id)
+    authorized = any(
+        (
+            allowed.startswith("@")
+            and username
+            and username.lower() == allowed[1:].lower()
+        )
+        or (not allowed.startswith("@") and incoming_id == allowed)
+        for allowed in allowed_chats
+    )
     if not authorized:
-        logger.warning("Ignored Telegram command from an unauthorized chat")
+        masked = f"…{incoming_id[-4:]}" if incoming_id else "missing"
+        logger.warning(
+            "Ignored Telegram command from unauthorized chat={} allowed_count={}",
+            masked,
+            len(allowed_chats),
+        )
         return None
     return message
 
 
 def process_telegram_update(update: Dict[str, Any], config: AppConfig) -> Dict[str, Any]:
     """Handle one authorized Telegram update after the webhook response returns."""
+    incoming_message = _message_from_update(update)
+    if incoming_message is None:
+        return {"ok": True, "handled": False, "reason": "unsupported_update"}
+    incoming_chat = incoming_message.get("chat")
+    assert isinstance(incoming_chat, dict)
+    incoming_chat_id = str(incoming_chat.get("id") or "").strip()
+    incoming_text = str(incoming_message.get("text") or "").strip()
+    incoming_command = (
+        incoming_text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+        if incoming_text.startswith("/")
+        else ""
+    )
+
+    # Safe bootstrap command: it only reveals the requesting chat's own ID.
+    if incoming_command == "/chatid" and incoming_chat_id:
+        delivery = send_telegram_message_detailed(
+            "🆔 This chat ID is:\n"
+            f"<code>{html.escape(incoming_chat_id)}</code>\n\n"
+            "Set it in <code>TELEGRAM_COMMAND_CHAT_IDS</code> to authorize commands.",
+            chat_id=incoming_chat_id,
+            parse_mode="HTML",
+        )
+        return {
+            "ok": bool(delivery.get("ok")),
+            "handled": True,
+            "command": incoming_command,
+        }
+
     _, configured_chat = get_telegram_credentials()
     message = _authorized_message(update, configured_chat)
     if message is None:
@@ -241,7 +308,11 @@ def process_telegram_update(update: Dict[str, Any], config: AppConfig) -> Dict[s
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
 
     if command in {"/start", "/help"}:
-        delivery = send_telegram_message_detailed(_command_help(), parse_mode="HTML")
+        delivery = send_telegram_message_detailed(
+            _command_help(),
+            chat_id=incoming_chat_id,
+            parse_mode="HTML",
+        )
         return {"ok": bool(delivery.get("ok")), "handled": True, "command": command}
 
     if command == "/status":
@@ -255,12 +326,17 @@ def process_telegram_update(update: Dict[str, Any], config: AppConfig) -> Dict[s
             f"Webhook: <b>{'active' if webhook.get('configured') else 'inactive'}</b>\n"
             f"Next scheduled scan: <code>{html.escape(str(next_run))}</code>"
         )
-        delivery = send_telegram_message_detailed(message_text, parse_mode="HTML")
+        delivery = send_telegram_message_detailed(
+            message_text,
+            chat_id=incoming_chat_id,
+            parse_mode="HTML",
+        )
         return {"ok": bool(delivery.get("ok")), "handled": True, "command": command}
 
     if command != "/scan":
         delivery = send_telegram_message_detailed(
             "Unknown command.\n\n" + _command_help(),
+            chat_id=incoming_chat_id,
             parse_mode="HTML",
         )
         return {"ok": bool(delivery.get("ok")), "handled": True, "command": command}
@@ -269,12 +345,14 @@ def process_telegram_update(update: Dict[str, Any], config: AppConfig) -> Dict[s
     if error:
         delivery = send_telegram_message_detailed(
             f"⚠️ {html.escape(error)}\n\n{_command_help()}",
+            chat_id=incoming_chat_id,
             parse_mode="HTML",
         )
         return {"ok": bool(delivery.get("ok")), "handled": True, "command": command}
     if scan_in_progress():
         delivery = send_telegram_message_detailed(
             "⏳ A scan is already running. Try <code>/scan</code> again shortly.",
+            chat_id=incoming_chat_id,
             parse_mode="HTML",
         )
         return {
@@ -291,6 +369,7 @@ def process_telegram_update(update: Dict[str, Any], config: AppConfig) -> Dict[s
         f"Markets: {html.escape(requested)}\n"
         f"Timeframe: <b>{html.escape(selected_tf)}</b>\n"
         "I’ll send qualified chart setups—or a stand-aside result—when it finishes.",
+        chat_id=incoming_chat_id,
         parse_mode="HTML",
     )
     try:
@@ -307,6 +386,7 @@ def process_telegram_update(update: Dict[str, Any], config: AppConfig) -> Dict[s
         send_telegram_message_detailed(
             "❌ <b>Scan failed</b>\nThe market data request did not complete. "
             "Please try again shortly.",
+            chat_id=incoming_chat_id,
             parse_mode="HTML",
         )
         return {
@@ -318,11 +398,13 @@ def process_telegram_update(update: Dict[str, Any], config: AppConfig) -> Dict[s
     if result.get("error") == "scan_in_progress":
         send_telegram_message_detailed(
             "⏳ Another scan started first. Try <code>/scan</code> again shortly.",
+            chat_id=incoming_chat_id,
             parse_mode="HTML",
         )
     elif not result.get("ok") and not result.get("telegram_sent"):
         send_telegram_message_detailed(
             "❌ <b>Scan could not complete</b>\nPlease try again shortly.",
+            chat_id=incoming_chat_id,
             parse_mode="HTML",
         )
     return {

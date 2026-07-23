@@ -55,7 +55,8 @@ Built to feel like a senior prop trader sitting next to you.
 ```bash
 # Copy .env.example → .env (gitignored) and fill:
 export TELEGRAM_BOT_TOKEN="your-bot-token-from-BotFather"
-export TELEGRAM_CHAT_ID="your-chat-id"
+export TELEGRAM_CHAT_ID="your-alert-group-id"
+export TELEGRAM_COMMAND_CHAT_IDS="your-private-chat-id"
 export TELEGRAM_TEST_KEY="a-long-random-admin-key"
 # Optional outside Render; may be a base URL or the full webhook endpoint:
 export TELEGRAM_WEBHOOK_URL="https://your-api.example.com"
@@ -82,21 +83,25 @@ curl -X POST https://your-host/telegram/test-scan \
 
 The API registers a secured Telegram webhook at startup. On Render it uses
 `RENDER_EXTERNAL_URL` automatically; other hosts can set `TELEGRAM_WEBHOOK_URL`.
-Only `TELEGRAM_CHAT_ID` is allowed to run commands:
+Set `TELEGRAM_CHAT_ID` to the group/channel that receives alerts. Optionally set
+comma/space-separated `TELEGRAM_COMMAND_CHAT_IDS` to accept commands from
+different private chats; when omitted, commands fall back to `TELEGRAM_CHAT_ID`.
 
 ```text
 /scan                 configured watchlist on the configured timeframe
 /scan BTC ETH SOL     selected markets
 /scan 1h BTC ETH      selected markets on 1h
 /status               bot, scan-worker, and next-schedule status
+/chatid               show the current chat's numeric ID
 /help                 command guide
 ```
 
-The bot immediately acknowledges `/scan`, then sends qualified chart alerts or
-the no-quality-setup confirmation. Overlapping scheduled/on-demand scans are
-blocked. The bot must be started by the user for a private chat, added to a
-group, or made an administrator with posting permission for a channel. Telegram
-numeric group/channel IDs commonly begin with `-100`.
+Command replies and scan acknowledgements return to the authorized command chat.
+Qualified chart alerts and the no-quality-setup confirmation continue to use the
+group/channel in `TELEGRAM_CHAT_ID`. Overlapping scheduled/on-demand scans are
+blocked. The bot must be started by the user for a private chat, added to a group,
+or made an administrator with posting permission for a channel. Telegram numeric
+group/channel IDs commonly begin with `-100`.
 
 > A scheduler embedded in a web service runs only while that process is awake.
 > On hosts that suspend free services, use an always-on instance or run

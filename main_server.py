@@ -46,6 +46,7 @@ from src.notify.telegram import (
 )
 from src.notify.telegram_bot import (
     configure_telegram_webhook,
+    get_telegram_command_chat_ids,
     get_telegram_webhook_status,
     process_telegram_update,
     telegram_webhook_secret,
@@ -156,6 +157,7 @@ def telegram_status() -> Dict[str, Any]:
     """Redacted configuration and scheduler state; does not call Telegram."""
     cfg = get_config()
     token, chat = get_telegram_credentials()
+    command_chats = get_telegram_command_chat_ids(chat)
     return {
         "ok": True,
         "telegram": {
@@ -164,6 +166,10 @@ def telegram_status() -> Dict[str, Any]:
             "token_configured": bool(token),
             "chat_id_configured": bool(chat),
             "chat_id_suffix": chat[-4:] if chat else None,
+            "command_chat_ids_explicit": bool(
+                (os.getenv("TELEGRAM_COMMAND_CHAT_IDS") or "").strip()
+            ),
+            "command_chat_count": len(command_chats),
             "test_endpoint_secured": bool(
                 (os.getenv("TELEGRAM_TEST_KEY") or "").strip()
             ),

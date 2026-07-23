@@ -17,5 +17,7 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      - key: TELEGRAM_COMMAND_CHAT_IDS
+        sync: false
       - key: TELEGRAM_TEST_KEY
         sync: false
