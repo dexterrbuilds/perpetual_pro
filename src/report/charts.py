@@ -328,7 +328,7 @@ def render_signal_chart_png(
     draw.text((left, volume_top - 25), "VOLUME", fill="#91a4bb", font=font_small)
     draw.text(
         (left, height - 28),
-        "Perpetual Pro • 15m execution / 1h + 4h confirmation • educational only",
+        "Perpetual Pro • 15m execution / 1h + 4h confirmation ",
         fill="#60758e",
         font=font_small,
     )

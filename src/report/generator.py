@@ -21,7 +21,7 @@ from src.utils.helpers import ensure_dir, format_price, slugify, utc_now_iso
 
 
 DISCLAIMER = (
-    "NOT FINANCIAL ADVICE. This tool is for educational and research purposes only. "
+    "NOT FINANCIAL ADVICE. "
     "Crypto perpetual futures are highly leveraged and risky. You can lose more than "
     "your initial margin. Always do your own research and never risk capital you cannot "
     "afford to lose."

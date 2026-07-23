@@ -244,7 +244,7 @@ def send_telegram_photo_detailed(
         }
     if len(caption) > 1024:
         logger.warning("Telegram photo caption truncated from {} characters", len(caption))
-        caption = caption[:1000] + "\nEducational only."
+        caption = caption[:1000] + "\nNot Financial Advice."
 
     url = f"{TELEGRAM_API_ROOT}/bot{token}/sendPhoto"
     data: Dict[str, Any] = {

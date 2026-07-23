@@ -271,7 +271,7 @@ export function renderResults(container, result) {
     }
 
     <section class="disclaimer">
-      ${escapeHtml(result.disclaimer || "NOT FINANCIAL ADVICE. Educational / research only. High leverage perps can liquidate quickly.")}
+      ${escapeHtml(result.disclaimer || "NOT FINANCIAL ADVICE. High leverage perps can liquidate quickly.")}
     </section>
   `;
 }

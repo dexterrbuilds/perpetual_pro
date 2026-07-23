@@ -135,7 +135,7 @@ def root() -> Dict[str, Any]:
             ),
             "telegram_commands": "/scan · /status · /help",
         },
-        "disclaimer": "Not financial advice. For research/education only.",
+        "disclaimer": "Not financial advice. High leverage perps can liquidate quickly.",
     }
 
 
