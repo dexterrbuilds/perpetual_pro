@@ -23,7 +23,16 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
@@ -34,6 +43,12 @@ from src.notify.telegram import (
     get_telegram_credentials,
     is_telegram_ready,
     send_test_telegram_alert,
+)
+from src.notify.telegram_bot import (
+    configure_telegram_webhook,
+    get_telegram_webhook_status,
+    process_telegram_update,
+    telegram_webhook_secret,
 )
 from src.scheduler.scan_job import (
     get_scheduler_status,
@@ -63,10 +78,13 @@ async def lifespan(app: FastAPI):
     cfg = get_config()
     logger.info("perpetual_pro API v{} starting (exchange={})", __version__, cfg.exchange.default)
     scheduler_started = start_scheduler_background(cfg)
+    webhook_started = configure_telegram_webhook(cfg)
     logger.info(
-        "Scheduler startup result: enabled={} started={} times={} timezone={}",
-        cfg.scheduler.enabled,
+        "Background services: scheduler_started={} webhook_started={} "
+        "scheduler_enabled={} times={} timezone={}",
         scheduler_started,
+        webhook_started,
+        cfg.scheduler.enabled,
         cfg.scheduler.times,
         cfg.scheduler.timezone,
     )
@@ -114,6 +132,7 @@ def root() -> Dict[str, Any]:
                 "POST /telegram/test-scan (run watchlist now; "
                 "X-Telegram-Test-Key required)"
             ),
+            "telegram_commands": "/scan · /status · /help",
         },
         "disclaimer": "Not financial advice. For research/education only.",
     }
@@ -149,8 +168,37 @@ def telegram_status() -> Dict[str, Any]:
                 (os.getenv("TELEGRAM_TEST_KEY") or "").strip()
             ),
         },
+        "webhook": get_telegram_webhook_status(),
         "scheduler": get_scheduler_status(),
     }
+
+
+@app.post("/telegram/webhook", include_in_schema=False)
+async def telegram_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(
+        None,
+        alias="X-Telegram-Bot-Api-Secret-Token",
+    ),
+) -> Dict[str, Any]:
+    """Accept Telegram commands quickly, then process scans after responding."""
+    cfg = get_config()
+    token, _ = get_telegram_credentials()
+    expected = telegram_webhook_secret(token)
+    provided = (x_telegram_bot_api_secret_token or "").strip()
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        logger.warning("Rejected Telegram webhook request with invalid secret")
+        raise HTTPException(status_code=403, detail="Invalid Telegram webhook secret")
+    try:
+        update = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ignored malformed Telegram webhook payload: {}", type(exc).__name__)
+        return {"ok": True, "accepted": False}
+    if not isinstance(update, dict):
+        return {"ok": True, "accepted": False}
+    background_tasks.add_task(process_telegram_update, update, cfg)
+    return {"ok": True, "accepted": True}
 
 
 def _authorize_telegram_test(provided_key: Optional[str]) -> None:

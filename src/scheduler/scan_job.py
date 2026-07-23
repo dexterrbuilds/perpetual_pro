@@ -45,6 +45,7 @@ _SCHEDULER_STATUS: Dict[str, Any] = {
 }
 _BACKGROUND_THREAD: Optional[Thread] = None
 _BACKGROUND_STOP: Optional[Event] = None
+_SCAN_RUN_LOCK = Lock()
 
 
 def _status_update(**values: Any) -> None:
@@ -173,18 +174,21 @@ def filter_high_confidence(
     return out
 
 
-def run_scheduled_scan_once(
+def _run_scheduled_scan_once_unlocked(
     config: Optional[AppConfig] = None,
     *,
     slot_label: str = "",
     send: bool = True,
+    symbols: Optional[List[str]] = None,
+    timeframe: Optional[str] = None,
+    notify_on_empty: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Run one watchlist scan and optionally Telegram high-conf results."""
     cfg = config or load_config()
     started_at = datetime.now(ZoneInfo("UTC")).isoformat()
-    watchlist = list(cfg.scheduler.watchlist or []) or list(DEFAULT_WATCHLIST)
+    watchlist = list(symbols or cfg.scheduler.watchlist or []) or list(DEFAULT_WATCHLIST)
     req = AnalyzeRequest(
-        timeframe=cfg.scheduler.timeframe or cfg.timeframes.primary,
+        timeframe=timeframe or cfg.scheduler.timeframe or cfg.timeframes.primary,
         exchange=cfg.scheduler.exchange or cfg.exchange.default,
         no_news=bool(cfg.scheduler.no_news),
         simulated_capital=cfg.risk.simulated_capital,
@@ -312,7 +316,11 @@ def run_scheduled_scan_once(
                         "Telegram chart and text fallback both failed: slot={}",
                         slot_label or "scan",
                     )
-        elif cfg.telegram.notify_on_empty:
+        elif (
+            bool(notify_on_empty)
+            if notify_on_empty is not None
+            else cfg.telegram.notify_on_empty
+        ):
             delivery = send_telegram_message_detailed(
                 report,
                 parse_mode=cfg.telegram.parse_mode or "HTML",
@@ -373,6 +381,53 @@ def run_scheduled_scan_once(
         "telegram_delivery": delivery,
         "slot_label": slot_label,
     }
+
+
+def scan_in_progress() -> bool:
+    """Whether a scheduled or on-demand watchlist scan currently owns the worker."""
+    return _SCAN_RUN_LOCK.locked()
+
+
+def run_scheduled_scan_once(
+    config: Optional[AppConfig] = None,
+    *,
+    slot_label: str = "",
+    send: bool = True,
+    symbols: Optional[List[str]] = None,
+    timeframe: Optional[str] = None,
+    notify_on_empty: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Run one scan without overlapping another scheduler, API, or bot request."""
+    started_at = datetime.now(ZoneInfo("UTC")).isoformat()
+    if not _SCAN_RUN_LOCK.acquire(blocking=False):
+        logger.warning("Scan request skipped because another scan is already running")
+        return {
+            "ok": False,
+            "error": "scan_in_progress",
+            "started_at": started_at,
+            "completed_at": started_at,
+            "scanned": 0,
+            "ranked_count": 0,
+            "alert_count": 0,
+            "filtered": [],
+            "report": "",
+            "telegram_sent": False,
+            "telegram_ready": is_telegram_ready(config),
+            "telegram_delivery_status": "scan_in_progress",
+            "telegram_delivery": None,
+            "slot_label": slot_label,
+        }
+    try:
+        return _run_scheduled_scan_once_unlocked(
+            config,
+            slot_label=slot_label,
+            send=send,
+            symbols=symbols,
+            timeframe=timeframe,
+            notify_on_empty=notify_on_empty,
+        )
+    finally:
+        _SCAN_RUN_LOCK.release()
 
 
 def run_scheduler_loop(

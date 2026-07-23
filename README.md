@@ -57,6 +57,8 @@ Built to feel like a senior prop trader sitting next to you.
 export TELEGRAM_BOT_TOKEN="your-bot-token-from-BotFather"
 export TELEGRAM_CHAT_ID="your-chat-id"
 export TELEGRAM_TEST_KEY="a-long-random-admin-key"
+# Optional outside Render; may be a base URL or the full webhook endpoint:
+export TELEGRAM_WEBHOOK_URL="https://your-api.example.com"
 
 python scripts/run_scheduled_scans.py --once   # test one high-conf report now
 python scripts/run_scheduled_scans.py          # DST-aware market-session loop
@@ -78,13 +80,23 @@ curl -X POST https://your-host/telegram/test-scan \
   -H "X-Telegram-Test-Key: $TELEGRAM_TEST_KEY"
 ```
 
-The Streamlit sidebar also has **Telegram diagnostics → Send Test Telegram
-Alert** plus **Run Test Scan & Send Alert**. The latter runs the full production
-watchlist/filter/chart workflow immediately, so it sends either qualified chart
-alerts or the no-quality-setup confirmation. The bot must be started by the user
-for a private chat, added to a group, or made an administrator with posting
-permission for a channel. Telegram numeric group/channel IDs commonly begin
-with `-100`.
+The API registers a secured Telegram webhook at startup. On Render it uses
+`RENDER_EXTERNAL_URL` automatically; other hosts can set `TELEGRAM_WEBHOOK_URL`.
+Only `TELEGRAM_CHAT_ID` is allowed to run commands:
+
+```text
+/scan                 configured watchlist on the configured timeframe
+/scan BTC ETH SOL     selected markets
+/scan 1h BTC ETH      selected markets on 1h
+/status               bot, scan-worker, and next-schedule status
+/help                 command guide
+```
+
+The bot immediately acknowledges `/scan`, then sends qualified chart alerts or
+the no-quality-setup confirmation. Overlapping scheduled/on-demand scans are
+blocked. The bot must be started by the user for a private chat, added to a
+group, or made an administrator with posting permission for a channel. Telegram
+numeric group/channel IDs commonly begin with `-100`.
 
 > A scheduler embedded in a web service runs only while that process is awake.
 > On hosts that suspend free services, use an always-on instance or run
