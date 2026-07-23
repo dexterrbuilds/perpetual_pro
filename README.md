@@ -41,7 +41,11 @@ Built to feel like a senior prop trader sitting next to you.
 - **Prop risk** (default): **0.5–1% risk per trade**, **max 5x leverage**, flags for high drawdown / wide stop / low R:R
 - **LLM confidence** with supporting vs opposing factors in reports
 - **Backtest**: `python main.py BTC --backtest --bars 500` (pending retest fills, fees/slippage, unfilled signals, stop-out rate, MFE/MAE, win rate, profit factor, max DD)
-- **Scheduled scans** at **05:00 / 16:00 / 20:00 WAT** + **Telegram** high-confidence alerts
+- **Scheduled scans** at **05:00 / 16:00 / 20:00 WAT** + high-confidence
+  **Telegram chart alerts**. Each actionable alert includes a plotted closed-candle
+  chart (EMA/VWAP, structure, entry, SL, TP1–TP4) and a compact signal call with
+  confidence, execution status, reason, risk, funding/OI context, and hold window.
+  Text delivery remains as an automatic fallback if media rendering/upload fails.
 
 **Telegram secrets are env-only** (never put tokens in `config.yaml` or commit them):
 

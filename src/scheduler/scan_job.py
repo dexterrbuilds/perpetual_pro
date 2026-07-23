@@ -11,10 +11,13 @@ from loguru import logger
 
 from src.api.service import AnalyzeRequest, scan_symbols
 from src.notify.telegram import (
+    format_signal_photo_caption,
     format_prop_scan_report,
     is_telegram_ready,
     send_telegram_message_detailed,
+    send_telegram_photo_detailed,
 )
+from src.report.charts import render_signal_chart_png
 from src.utils.config import AppConfig, load_config
 
 # Fallback watchlist when scheduler.watchlist is empty
@@ -183,26 +186,107 @@ def run_scheduled_scan_once(
     # Credentials from env only (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — never YAML
     tg_ready = is_telegram_ready(cfg)
     if send and tg_ready:
-        if filtered or cfg.telegram.notify_on_empty:
+        if filtered:
+            chart_items: List[Dict[str, Any]] = []
+            # Each actionable signal is self-contained: plotted chart + concise call.
+            for index, row in enumerate(filtered[:6], 1):
+                symbol = str(row.get("symbol") or f"signal-{index}")
+                try:
+                    chart_png = render_signal_chart_png(row)
+                    caption = format_signal_photo_caption(
+                        row,
+                        slot_label=slot_label or "scan",
+                    )
+                    item = send_telegram_photo_detailed(
+                        chart_png,
+                        caption,
+                        filename=f"{symbol.split('/')[0].lower()}-signal.png",
+                        parse_mode=cfg.telegram.parse_mode or "HTML",
+                    )
+                    item["symbol"] = symbol
+                    item["mode"] = "photo"
+                    chart_items.append(item)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "Telegram chart alert failed before upload: symbol={} error_type={}",
+                        symbol,
+                        type(exc).__name__,
+                    )
+                    chart_items.append(
+                        {
+                            "ok": False,
+                            "symbol": symbol,
+                            "mode": "photo",
+                            "error": "chart_render_failed",
+                            "description": type(exc).__name__,
+                        }
+                    )
+
+            chart_sent = sum(1 for item in chart_items if item.get("ok"))
+            chart_failed = len(chart_items) - chart_sent
+            all_covered = len(filtered) <= len(chart_items)
+            photo_ok = bool(chart_items) and chart_failed == 0 and all_covered
+            delivery = {
+                "ok": photo_ok,
+                "mode": "photo",
+                "sent_count": chart_sent,
+                "failed_count": chart_failed,
+                "total_actionable": len(filtered),
+                "items": chart_items,
+            }
+            if photo_ok:
+                sent = True
+                delivery_status = "sent_chart_alerts"
+                logger.info(
+                    "Scheduled Telegram chart alerts succeeded: slot={} sent={}",
+                    slot_label or "scan",
+                    chart_sent,
+                )
+            else:
+                # A clean text report is a dependable fallback for rendering,
+                # Telegram media, or six-photo limit failures.
+                fallback = send_telegram_message_detailed(
+                    report,
+                    parse_mode=cfg.telegram.parse_mode or "HTML",
+                )
+                delivery["text_fallback"] = fallback
+                sent = bool(fallback.get("ok")) or chart_sent > 0
+                delivery["ok"] = sent
+                delivery_status = (
+                    "sent_with_text_fallback" if sent else "failed"
+                )
+                if sent:
+                    logger.warning(
+                        "Telegram chart delivery incomplete: slot={} photos={}/{}; "
+                        "text fallback sent={}",
+                        slot_label or "scan",
+                        chart_sent,
+                        len(chart_items),
+                        bool(fallback.get("ok")),
+                    )
+                else:
+                    logger.error(
+                        "Telegram chart and text fallback both failed: slot={}",
+                        slot_label or "scan",
+                    )
+        elif cfg.telegram.notify_on_empty:
             delivery = send_telegram_message_detailed(
                 report,
                 parse_mode=cfg.telegram.parse_mode or "HTML",
             )
             sent = bool(delivery.get("ok"))
             if sent:
-                delivery_status = "sent"
+                delivery_status = "sent_empty_report"
                 logger.info(
-                    "Scheduled Telegram alert succeeded: slot={} signals={} message_id={}",
+                    "Scheduled empty Telegram report succeeded: slot={} message_id={}",
                     slot_label or "scan",
-                    len(filtered),
                     delivery.get("message_id"),
                 )
             else:
                 delivery_status = "failed"
                 logger.error(
-                    "Scheduled Telegram alert failed: slot={} signals={} error={} description={}",
+                    "Scheduled empty Telegram report failed: slot={} error={} description={}",
                     slot_label or "scan",
-                    len(filtered),
                     delivery.get("error"),
                     delivery.get("description"),
                 )

@@ -738,6 +738,21 @@ def scan_symbols(
                     "order_flow_score": round(
                         float(execution.get("order_flow_score") or 0), 3
                     ),
+                    "funding_rate": (
+                        analysis.snapshot.funding_rate
+                        if analysis.snapshot is not None
+                        else None
+                    ),
+                    "funding_average_24h": (
+                        analysis.snapshot.funding_average_24h
+                        if analysis.snapshot is not None
+                        else None
+                    ),
+                    "open_interest_change_pct_24h": (
+                        analysis.snapshot.open_interest_change_pct_24h
+                        if analysis.snapshot is not None
+                        else None
+                    ),
                     "payload": {
                         "bias": analysis.bias,
                         "direction": analysis.direction,

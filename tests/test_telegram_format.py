@@ -12,9 +12,11 @@ if str(ROOT) not in sys.path:
 from src.notify.telegram import (
     diagnose_telegram,
     format_prop_scan_report,
+    format_signal_photo_caption,
     get_telegram_credentials,
     is_telegram_ready,
     send_telegram_message_detailed,
+    send_telegram_photo_detailed,
 )
 from src.scheduler.scan_job import (
     filter_high_confidence,
@@ -210,6 +212,73 @@ def test_detailed_sender_reports_message_id(monkeypatch):
     assert result["message_id"] == 77
 
 
+def test_photo_sender_uploads_png_and_caption(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "123456")
+    captured = {}
+
+    def fake_post(url, data, files, timeout):
+        captured["url"] = url
+        captured["data"] = data
+        captured["files"] = files
+        return _FakeTelegramResponse(
+            200,
+            {"ok": True, "result": {"message_id": 91}},
+        )
+
+    monkeypatch.setattr("src.notify.telegram.requests.post", fake_post)
+    result = send_telegram_photo_detailed(
+        b"\x89PNG\r\n\x1a\nfake",
+        "<b>BTC LONG</b>",
+    )
+    assert result["ok"] is True
+    assert result["message_id"] == 91
+    assert captured["data"]["caption"] == "<b>BTC LONG</b>"
+    assert captured["files"]["photo"][2] == "image/png"
+
+
+def test_signal_photo_caption_is_clean_and_actionable():
+    row = {
+        "symbol": "BTC/USDT:USDT",
+        "direction": "long",
+        "primary_tf": "15m",
+        "confidence": 78,
+        "technical_confidence": 75,
+        "llm_confidence": 80,
+        "entry_status": "wait_retest",
+        "execution_score": 76,
+        "entry_low": 112300,
+        "entry_high": 112500,
+        "stop_loss": 111900,
+        "take_profits": [113200, 113900, 114800, 116000],
+        "leverage": 5,
+        "risk_pct": 1,
+        "immediate_sl_risk": 24,
+        "order_flow_score": 0.42,
+        "funding_rate": 0.0001,
+        "open_interest_change_pct_24h": 4.2,
+        "llm_confidence_reason": "1h and 4h momentum align with expanding volume.",
+        "payload": {
+            "execution": {
+                "status": "wait_retest",
+                "entry_reason": "Wait for the demand-zone retest; do not enter at market.",
+            },
+            "chart": {"timeframe": "15m"},
+        },
+    }
+    caption = format_signal_photo_caption(row, slot_label="16:00 WAT")
+    assert "BTC LONG RETEST" in caption
+    assert "DO NOT CHASE" in caption
+    assert "CONFIDENCE 78%" in caption
+    assert "Entry" in caption
+    assert "Stop" in caption
+    assert "TP1" in caption
+    assert "Why:" in caption
+    assert "funding" in caption
+    assert "OI 24h" in caption
+    assert len(caption) <= 1024
+
+
 def test_telegram_diagnostics_checks_bot_chat_and_membership(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1001234567890")
@@ -307,5 +376,54 @@ def test_scheduled_scan_calls_detailed_sender(monkeypatch):
     result = scan_job.run_scheduled_scan_once(cfg, slot_label="test", send=True)
     assert sent
     assert result["telegram_sent"] is True
-    assert result["telegram_delivery_status"] == "sent"
-    assert result["telegram_delivery"]["message_id"] == 42
+    assert result["telegram_delivery_status"] == "sent_with_text_fallback"
+    assert result["telegram_delivery"]["text_fallback"]["message_id"] == 42
+
+
+def test_scheduled_scan_sends_chart_alert_without_text_fallback(monkeypatch):
+    from src.scheduler import scan_job
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "123456")
+    cfg = load_config(ROOT / "config.yaml")
+    row = {
+        "symbol": "BTC/USDT:USDT",
+        "direction": "long",
+        "confidence": 78,
+        "llm_confidence": 80,
+        "rank_score": 72,
+        "prop_safe": True,
+        "signal_eligible": True,
+        "entry_status": "wait_retest",
+        "execution_score": 76,
+        "payload": {"chart": {"candles": [{}] * 10}},
+    }
+    monkeypatch.setattr(
+        scan_job,
+        "scan_symbols",
+        lambda *a, **k: {"ok": True, "ranked_results": [row]},
+    )
+    monkeypatch.setattr(scan_job, "render_signal_chart_png", lambda row: b"png")
+    monkeypatch.setattr(
+        scan_job,
+        "format_signal_photo_caption",
+        lambda row, slot_label="": "<b>BTC LONG</b>",
+    )
+    photo_calls = []
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_photo_detailed",
+        lambda photo, caption, **kwargs: photo_calls.append((photo, caption, kwargs))
+        or {"ok": True, "message_id": 99},
+    )
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_message_detailed",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("text fallback called")),
+    )
+
+    result = scan_job.run_scheduled_scan_once(cfg, slot_label="test", send=True)
+    assert photo_calls
+    assert result["telegram_sent"] is True
+    assert result["telegram_delivery_status"] == "sent_chart_alerts"
+    assert result["telegram_delivery"]["items"][0]["message_id"] == 99

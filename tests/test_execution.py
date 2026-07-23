@@ -16,7 +16,7 @@ from src.analysis.execution import analyze_candles, build_execution_profile
 from src.analysis.indicators import IndicatorSuite
 from src.analysis.market_structure import StructureLevel, StructureReport
 from src.analysis.risk import RiskManager
-from src.report.charts import build_market_chart_payload
+from src.report.charts import build_market_chart_payload, render_signal_chart_png
 from src.utils.config import RiskConfig
 
 
@@ -113,6 +113,19 @@ def test_execution_profile_waits_for_retest_and_uses_structure_targets():
     assert chart["trade"]["entry_status"] == profile.status
     assert chart["trade"]["take_profits"] == profile.targets
     assert any(level["kind"] == "order_block" for level in chart["levels"])
+
+    png = render_signal_chart_png(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "direction": "long",
+            "primary_tf": "15m",
+            "confidence": 78,
+            "entry_status": profile.status,
+            "payload": {"chart": chart},
+        }
+    )
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(png) > 10_000
 
 
 def test_adverse_rejection_wick_is_detected():

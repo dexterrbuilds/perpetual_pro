@@ -211,6 +211,264 @@ def send_telegram_message(
     )
 
 
+def send_telegram_photo_detailed(
+    photo: bytes,
+    caption: str,
+    *,
+    filename: str = "perpetual-pro-signal.png",
+    bot_token: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    parse_mode: str = "HTML",
+    timeout: int = 35,
+) -> Dict[str, Any]:
+    """Upload a plotted signal chart with a concise Telegram caption."""
+    token, chat = get_telegram_credentials(bot_token=bot_token, chat_id=chat_id)
+    masked_chat = _masked_chat_id(chat)
+    if not token or not chat:
+        description = "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+        logger.error("Telegram photo delivery failed: {}", description)
+        return {
+            "ok": False,
+            "error": "not_configured",
+            "description": description,
+            "chat_id_masked": masked_chat,
+            "message_id": None,
+        }
+    if not photo:
+        return {
+            "ok": False,
+            "error": "empty_photo",
+            "description": "Rendered chart image is empty",
+            "chat_id_masked": masked_chat,
+            "message_id": None,
+        }
+    if len(caption) > 1024:
+        logger.warning("Telegram photo caption truncated from {} characters", len(caption))
+        caption = caption[:1000] + "\nEducational only."
+
+    url = f"{TELEGRAM_API_ROOT}/bot{token}/sendPhoto"
+    data: Dict[str, Any] = {
+        "chat_id": chat,
+        "caption": caption,
+    }
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+    files = {"photo": (filename, photo, "image/png")}
+    logger.info(
+        "Telegram photo attempt: chat={} bytes={} caption_chars={}",
+        masked_chat,
+        len(photo),
+        len(caption),
+    )
+    try:
+        response = requests.post(
+            url,
+            data=data,
+            files=files,
+            timeout=(5, timeout),
+        )
+        detail = _response_detail(response)
+        body = detail.pop("response")
+        if response.ok and body.get("ok") is True:
+            message = body.get("result") if isinstance(body.get("result"), dict) else {}
+            message_id = message.get("message_id")
+            logger.info(
+                "Telegram photo succeeded: chat={} message_id={}",
+                masked_chat,
+                message_id,
+            )
+            return {
+                "ok": True,
+                "error": None,
+                "description": "Chart alert delivered",
+                "chat_id_masked": masked_chat,
+                "message_id": message_id,
+                "photo_bytes": len(photo),
+                **detail,
+            }
+        logger.error(
+            "Telegram photo failed: chat={} http={} telegram_code={} description={}",
+            masked_chat,
+            detail.get("http_status"),
+            detail.get("telegram_error_code"),
+            detail.get("description"),
+        )
+        return {
+            "ok": False,
+            "error": "telegram_api_error",
+            "chat_id_masked": masked_chat,
+            "message_id": None,
+            **detail,
+        }
+    except requests.RequestException as exc:
+        logger.error(
+            "Telegram photo failed: chat={} network_error={} (token redacted)",
+            masked_chat,
+            type(exc).__name__,
+        )
+        return {
+            "ok": False,
+            "error": "network_error",
+            "description": type(exc).__name__,
+            "chat_id_masked": masked_chat,
+            "message_id": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Telegram photo failed unexpectedly: chat={} error_type={}",
+            masked_chat,
+            type(exc).__name__,
+        )
+        return {
+            "ok": False,
+            "error": "unexpected_error",
+            "description": type(exc).__name__,
+            "chat_id_masked": masked_chat,
+            "message_id": None,
+        }
+
+
+def format_signal_photo_caption(
+    row: Dict[str, Any],
+    *,
+    slot_label: str = "",
+) -> str:
+    """Build a clean, actionable caption that stays within Telegram's limit."""
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    primary = (
+        payload.get("primary_setup")
+        if isinstance(payload.get("primary_setup"), dict)
+        else {}
+    )
+    execution = (
+        payload.get("execution")
+        if isinstance(payload.get("execution"), dict)
+        else {}
+    )
+    chart = payload.get("chart") if isinstance(payload.get("chart"), dict) else {}
+
+    direction = str(row.get("direction") or "flat").upper()
+    icon = "🟢" if direction == "LONG" else "🔴"
+    symbol = str(row.get("symbol") or "—").split("/")[0].split(":")[0]
+    confidence = _number(row.get("confidence"))
+    technical = _number(row.get("technical_confidence"))
+    llm = _number(row.get("llm_confidence"))
+    execution_score = _number(row.get("execution_score") or execution.get("score"))
+    status = str(row.get("entry_status") or execution.get("status") or "blocked")
+    timeframe = str(row.get("primary_tf") or chart.get("timeframe") or "15m")
+    setup_name = str(row.get("setup_name") or payload.get("setup_name") or "").strip()
+    risk_rewards = list(primary.get("risk_reward") or [])
+    confidence_label = (
+        "VERY HIGH" if confidence >= 80 else ("HIGH" if confidence >= 72 else "QUALIFIED")
+    )
+    if status == "wait_retest":
+        call = f"{direction} RETEST — DO NOT CHASE"
+    elif status == "ready":
+        call = f"{direction} — CONFIRMATION READY"
+    else:
+        call = f"{direction} — CONDITIONAL"
+
+    reason = (
+        row.get("llm_confidence_reason")
+        or row.get("reason")
+        or ((payload.get("key_reasons") or [""])[0])
+        or "Multi-timeframe confluence passed"
+    )
+    reason = str(reason).strip()
+    if len(reason) > 175:
+        reason = reason[:172].rstrip() + "…"
+    entry_reason = str(execution.get("entry_reason") or "").strip()
+    if len(entry_reason) > 130:
+        entry_reason = entry_reason[:127].rstrip() + "…"
+
+    entry_low = row.get("entry_low")
+    entry_high = row.get("entry_high")
+    stop = row.get("stop_loss")
+    targets = list(row.get("take_profits") or [])
+    leverage = row.get("leverage") or row.get("display_leverage") or 5
+    risk_pct = _number(row.get("risk_pct"), 1.0)
+    immediate_risk = _number(row.get("immediate_sl_risk"))
+    order_flow = _number(row.get("order_flow_score"))
+    hold = str(row.get("hold_label") or primary.get("hold_detail") or "30m–24h")
+
+    lines = [
+        f"{icon} <b>{html.escape(symbol)} {call}</b>",
+        (
+            f"<b>{confidence_label} CONFIDENCE {confidence:.0f}%</b> · "
+            f"Tech {technical:.0f}% · LLM {llm:.0f}% · Exec {execution_score:.0f}/100"
+        ),
+        f"⏱ {html.escape(timeframe)} entry · 1h/4h confirmation"
+        + (f" · {html.escape(slot_label)}" if slot_label else ""),
+    ]
+    if setup_name or risk_rewards:
+        setup_bits = []
+        if setup_name:
+            setup_bits.append(html.escape(setup_name))
+        if len(risk_rewards) > 1:
+            setup_bits.append(f"TP2 R:R {_number(risk_rewards[1]):.2f}")
+        lines.append("📐 " + " · ".join(setup_bits))
+    lines += [
+        "",
+        f"🎯 <b>Entry</b> {_caption_price(entry_low)} – {_caption_price(entry_high)}",
+        f"🛑 <b>Stop</b> {_caption_price(stop)} · risk {risk_pct:.2f}% · ≤{leverage}x",
+    ]
+    if targets:
+        lines.append(
+            "✅ "
+            + " · ".join(
+                f"<b>TP{index}</b> {_caption_price(target)}"
+                for index, target in enumerate(targets[:4], 1)
+            )
+        )
+    lines += [
+        f"📊 Immediate-SL risk {immediate_risk:.0f}% · flow {order_flow:+.2f}",
+        f"🧠 <b>Why:</b> {html.escape(reason)}",
+    ]
+    if entry_reason:
+        lines.append(f"📌 <b>Execution:</b> {html.escape(entry_reason)}")
+    funding = row.get("funding_rate")
+    oi_change = row.get("open_interest_change_pct_24h")
+    derivatives = []
+    if funding is not None:
+        derivatives.append(f"funding {_number(funding) * 100:+.4f}%")
+    if oi_change is not None:
+        derivatives.append(f"OI 24h {_number(oi_change):+.2f}%")
+    if derivatives:
+        lines.append("⚙ " + " · ".join(derivatives))
+    lines += [
+        f"⌛ Hold {html.escape(hold)}",
+        "<i>Wait for the stated entry condition. Educational only.</i>",
+    ]
+    caption = "\n".join(lines)
+    # Optional details are removed before any hard truncation, preserving HTML.
+    if len(caption) > 1024 and entry_reason:
+        lines = [line for line in lines if not line.startswith("📌")]
+        caption = "\n".join(lines)
+    if len(caption) > 1024:
+        lines = [line for line in lines if not line.startswith("⚙")]
+        caption = "\n".join(lines)
+    return caption
+
+
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _caption_price(value: Any) -> str:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if price >= 1000:
+        return f"${price:,.2f}"
+    if price >= 1:
+        return f"${price:.4f}".rstrip("0").rstrip(".")
+    return f"${price:.8f}".rstrip("0").rstrip(".")
+
+
 def diagnose_telegram(timeout: int = 10) -> Dict[str, Any]:
     """Validate token, chat access, and bot membership without sending a message."""
     token, chat = get_telegram_credentials()
