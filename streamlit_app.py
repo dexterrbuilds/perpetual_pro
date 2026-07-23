@@ -636,14 +636,20 @@ def format_ticker_price(symbol: Any, price: Any) -> str:
     return f"{base} ${p:.8f}".rstrip("0").rstrip(".")
 
 
+def _resolved_chart_height(requested: int, expanded: bool) -> int:
+    """Keep charts readable by default and substantially larger on demand."""
+    base_height = max(600, int(requested or 600))
+    return max(840, base_height + 240) if expanded else base_height
+
+
 def render_market_chart(
     chart: Dict[str, Any],
     *,
     title: str,
     key: str,
-    height: int = 520,
+    height: int = 600,
 ) -> None:
-    """Render closed candles, volume, structure, and the proposed execution plan."""
+    """Render an expandable interactive execution chart."""
     candles = (chart or {}).get("candles") or []
     if not candles:
         st.caption("Candle plot unavailable.")
@@ -690,7 +696,8 @@ def render_market_chart(
                     y=frame[column],
                     mode="lines",
                     name=label,
-                    line={"width": 1.3, "color": color},
+                    line={"width": 1.6, "color": color},
+                    hovertemplate=f"{label}: %{{y:,.6g}}<extra></extra>",
                 ),
                 row=1,
                 col=1,
@@ -706,27 +713,45 @@ def render_market_chart(
             name="Volume",
             marker_color=volume_colors,
             opacity=0.55,
+            hovertemplate="Volume: %{y:,.4~s}<extra></extra>",
         ),
         row=2,
         col=1,
     )
 
-    for level in ((chart or {}).get("levels") or [])[:12]:
+    annotated_level_types = set()
+    annotation_positions = ("top left", "bottom left", "top right", "bottom right")
+    for level_index, level in enumerate(((chart or {}).get("levels") or [])[:12]):
         value = level.get("mid")
         if value is None:
             continue
         side = level.get("side")
+        kind = str(level.get("kind") or "level").replace("_", " ").title()
         color = "#22c55e" if side == "bullish" else ("#ef4444" if side == "bearish" else "#94a3b8")
-        fig.add_hline(
-            y=float(value),
-            line_width=0.7,
-            line_dash="dot",
-            line_color=color,
-            annotation_text=str(level.get("kind") or ""),
-            annotation_position="right",
-            row=1,
-            col=1,
-        )
+        level_signature = (kind, side)
+        show_label = level_signature not in annotated_level_types
+        if show_label:
+            annotated_level_types.add(level_signature)
+        level_line = {
+            "y": float(value),
+            "line_width": 1.05,
+            "line_dash": "dot",
+            "line_color": color,
+            "row": 1,
+            "col": 1,
+        }
+        if show_label:
+            fig.add_hline(
+                **level_line,
+                annotation_text=kind,
+                annotation_position=annotation_positions[
+                    level_index % len(annotation_positions)
+                ],
+                annotation_font_color=color,
+                annotation_font_size=10,
+            )
+        else:
+            fig.add_hline(**level_line)
 
     trade = (chart or {}).get("trade") or {}
     if trade.get("entry_low") is not None and trade.get("entry_high") is not None:
@@ -734,9 +759,14 @@ def render_market_chart(
             y0=float(trade["entry_low"]),
             y1=float(trade["entry_high"]),
             fillcolor="#eab308",
-            opacity=0.18,
-            line_width=0,
+            opacity=0.2,
+            line_color="#facc15",
+            line_width=1.4,
             annotation_text=f"Entry · {trade.get('entry_status', '')}",
+            annotation_font_color="#111827",
+            annotation_font_size=11,
+            annotation_bgcolor="rgba(250, 204, 21, 0.92)",
+            annotation_borderpad=4,
             row=1,
             col=1,
         )
@@ -744,8 +774,12 @@ def render_market_chart(
         fig.add_hline(
             y=float(trade["stop_loss"]),
             line_color="#f43f5e",
-            line_width=1.5,
+            line_width=2.2,
             annotation_text="SL",
+            annotation_font_color="#ffffff",
+            annotation_font_size=11,
+            annotation_bgcolor="rgba(244, 63, 94, 0.92)",
+            annotation_borderpad=4,
             row=1,
             col=1,
         )
@@ -753,31 +787,96 @@ def render_market_chart(
         fig.add_hline(
             y=float(target),
             line_color="#10b981",
-            line_width=0.9,
+            line_width=1.55,
             line_dash="dash",
             annotation_text=f"TP{index}",
+            annotation_font_color="#ffffff",
+            annotation_font_size=11,
+            annotation_bgcolor="rgba(16, 185, 129, 0.9)",
+            annotation_borderpad=4,
             row=1,
             col=1,
         )
-    fig.update_layout(
-        title=title,
-        height=height,
-        xaxis_rangeslider_visible=False,
-        margin={"l": 10, "r": 10, "t": 45, "b": 10},
-        legend={"orientation": "h", "y": 1.02, "x": 0},
-    )
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Volume", row=2, col=1)
-    st.plotly_chart(fig, use_container_width=True, key=key, theme="streamlit")
-    patterns = (chart or {}).get("patterns") or []
-    if patterns:
-        st.caption(
-            "Closed-candle patterns: "
-            + " · ".join(
-                f"{p.get('name')} ({p.get('bias')}, {float(p.get('confidence') or 0):.0f}%)"
-                for p in patterns[:4]
+    with st.container(border=True):
+        control_text, control_toggle = st.columns([4, 1])
+        with control_text:
+            st.caption("Drag to pan · scroll to zoom · hover for values · double-click to reset")
+        with control_toggle:
+            expanded = st.toggle(
+                "Large view",
+                value=False,
+                key=f"{key}_large_view",
+                help="Increase chart height for detailed structure and candle review.",
             )
+        chart_height = _resolved_chart_height(height, expanded)
+        fig.update_layout(
+            title={
+                "text": title,
+                "x": 0.01,
+                "xanchor": "left",
+                "font": {"size": 17},
+            },
+            height=chart_height,
+            xaxis_rangeslider_visible=False,
+            margin={"l": 14, "r": 28, "t": 58, "b": 76},
+            legend={
+                "orientation": "h",
+                "y": -0.12,
+                "x": 0,
+                "xanchor": "left",
+                "yanchor": "top",
+            },
+            hovermode="x unified",
+            dragmode="pan",
+            hoverlabel={"namelength": -1},
+            uirevision=f"{key}:{'large' if expanded else 'standard'}",
         )
+        fig.update_xaxes(
+            showspikes=True,
+            spikemode="across",
+            spikesnap="cursor",
+            spikedash="dot",
+            showline=True,
+            fixedrange=False,
+        )
+        fig.update_yaxes(
+            title_text="Price",
+            showspikes=True,
+            spikemode="across",
+            spikedash="dot",
+            fixedrange=False,
+            row=1,
+            col=1,
+        )
+        fig.update_yaxes(title_text="Volume", fixedrange=False, row=2, col=1)
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            key=key,
+            theme="streamlit",
+            config={
+                "displayModeBar": True,
+                "displaylogo": False,
+                "scrollZoom": True,
+                "responsive": True,
+                "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+                "toImageButtonOptions": {
+                    "format": "png",
+                    "filename": f"{key}_chart",
+                    "scale": 2,
+                },
+            },
+        )
+        patterns = (chart or {}).get("patterns") or []
+        if patterns:
+            st.caption(
+                "Candle patterns · "
+                + " · ".join(
+                    f"{p.get('name')} ({p.get('bias')}, "
+                    f"{float(p.get('confidence') or 0):.0f}%)"
+                    for p in patterns[:4]
+                )
+            )
 
 
 def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") -> None:
@@ -897,7 +996,7 @@ def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") ->
                 row_payload.get("chart") or {},
                 title=f"{ticker} · execution chart",
                 key=f"{key_prefix}_chart_{i}",
-                height=440,
+                height=600,
             )
             render_trade_setup_card(row_payload)
 

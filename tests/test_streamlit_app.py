@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
 
 from streamlit_app import (
     _app_css,
+    _resolved_chart_height,
     build_report_markdown,
     format_ticker_price,
     main,
@@ -35,6 +36,12 @@ def test_app_styles_follow_streamlit_light_and_dark_theme():
     assert "var(--secondary-background-color)" in css
     assert "var(--text-color)" in css
     assert "var(--primary-color)" in css
+
+
+def test_chart_height_is_readable_and_expands_substantially():
+    assert _resolved_chart_height(440, False) == 600
+    assert _resolved_chart_height(600, False) == 600
+    assert _resolved_chart_height(600, True) == 840
 
 
 def test_main_trading_workspace_hides_operational_controls():
