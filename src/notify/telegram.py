@@ -20,6 +20,18 @@ from loguru import logger
 
 from src.utils.config import AppConfig, TelegramConfig
 
+TELEGRAM_API_ROOT = "https://api.telegram.org"
+
+
+def _masked_chat_id(chat_id: str) -> str:
+    """Return a useful diagnostic identifier without exposing the full chat id."""
+    value = (chat_id or "").strip()
+    if not value:
+        return "missing"
+    if value.startswith("@"):
+        return f"@…{value[-4:]}" if len(value) > 5 else "@…"
+    return f"…{value[-4:]}" if len(value) > 4 else "…"
+
 
 def get_telegram_credentials(
     bot_token: Optional[str] = None,
@@ -36,6 +48,149 @@ def get_telegram_credentials(
     return token, chat
 
 
+def _response_detail(response: requests.Response) -> Dict[str, Any]:
+    """Extract Telegram's safe error fields without logging request URLs/tokens."""
+    try:
+        body = response.json()
+    except (TypeError, ValueError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    parameters = body.get("parameters") if isinstance(body.get("parameters"), dict) else {}
+    return {
+        "http_status": response.status_code,
+        "telegram_error_code": body.get("error_code"),
+        "description": str(
+            body.get("description") or f"Telegram HTTP {response.status_code}"
+        )[:300],
+        "retry_after": parameters.get("retry_after"),
+        "response": body,
+    }
+
+
+def send_telegram_message_detailed(
+    text: str,
+    *,
+    bot_token: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    parse_mode: str = "HTML",
+    timeout: int = 20,
+) -> Dict[str, Any]:
+    """Send a message and return redacted delivery diagnostics."""
+    token, chat = get_telegram_credentials(bot_token=bot_token, chat_id=chat_id)
+    masked_chat = _masked_chat_id(chat)
+    if not token or not chat:
+        missing = [
+            name
+            for name, value in (
+                ("TELEGRAM_BOT_TOKEN", token),
+                ("TELEGRAM_CHAT_ID", chat),
+            )
+            if not value
+        ]
+        description = f"Missing environment variable(s): {', '.join(missing)}"
+        logger.error("Telegram delivery failed: {}", description)
+        return {
+            "ok": False,
+            "error": "not_configured",
+            "description": description,
+            "chat_id_masked": masked_chat,
+            "message_id": None,
+        }
+    if not (text or "").strip():
+        logger.error("Telegram delivery failed: empty message")
+        return {
+            "ok": False,
+            "error": "empty_message",
+            "description": "Message text is empty",
+            "chat_id_masked": masked_chat,
+            "message_id": None,
+        }
+
+    # The token is used only in the request URL. Never log this URL.
+    url = f"{TELEGRAM_API_ROOT}/bot{token}/sendMessage"
+    payload: Dict[str, Any] = {
+        "chat_id": chat,
+        "text": text[:4000],
+        "disable_web_page_preview": True,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    logger.info(
+        "Telegram delivery attempt: chat={} chars={} parse_mode={}",
+        masked_chat,
+        len(payload["text"]),
+        parse_mode or "none",
+    )
+    try:
+        response = requests.post(url, json=payload, timeout=(5, timeout))
+        detail = _response_detail(response)
+        body = detail.pop("response")
+        if response.ok and body.get("ok") is True:
+            message = body.get("result") if isinstance(body.get("result"), dict) else {}
+            message_id = message.get("message_id")
+            logger.info(
+                "Telegram delivery succeeded: chat={} message_id={}",
+                masked_chat,
+                message_id,
+            )
+            return {
+                "ok": True,
+                "error": None,
+                "description": "Message delivered",
+                "chat_id_masked": masked_chat,
+                "message_id": message_id,
+                **detail,
+            }
+        retry_note = (
+            f" retry_after={detail['retry_after']}s"
+            if detail.get("retry_after")
+            else ""
+        )
+        logger.error(
+            "Telegram delivery failed: chat={} http={} telegram_code={} description={}{}",
+            masked_chat,
+            detail.get("http_status"),
+            detail.get("telegram_error_code"),
+            detail.get("description"),
+            retry_note,
+        )
+        return {
+            "ok": False,
+            "error": "telegram_api_error",
+            "chat_id_masked": masked_chat,
+            "message_id": None,
+            **detail,
+        }
+    except requests.RequestException as exc:
+        # Exception strings can contain the tokenized URL, so log only the type.
+        logger.error(
+            "Telegram delivery failed: chat={} network_error={} (token redacted)",
+            masked_chat,
+            type(exc).__name__,
+        )
+        return {
+            "ok": False,
+            "error": "network_error",
+            "description": type(exc).__name__,
+            "chat_id_masked": masked_chat,
+            "message_id": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Telegram delivery failed unexpectedly: chat={} error_type={}",
+            masked_chat,
+            type(exc).__name__,
+        )
+        return {
+            "ok": False,
+            "error": "unexpected_error",
+            "description": type(exc).__name__,
+            "chat_id_masked": masked_chat,
+            "message_id": None,
+        }
+
+
 def send_telegram_message(
     text: str,
     *,
@@ -44,35 +199,186 @@ def send_telegram_message(
     parse_mode: str = "HTML",
     timeout: int = 20,
 ) -> bool:
-    """Send a message via Telegram Bot API. Returns True on success."""
-    token, chat = get_telegram_credentials(bot_token=bot_token, chat_id=chat_id)
-    if not token or not chat:
-        logger.warning(
-            "Telegram not configured — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the environment"
-        )
-        return False
-    # Use token only in the request URL; never include it in log messages
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat,
-        "text": text[:4000],
-        "disable_web_page_preview": True,
+    """Backward-compatible boolean wrapper around detailed delivery."""
+    return bool(
+        send_telegram_message_detailed(
+            text,
+            bot_token=bot_token,
+            chat_id=chat_id,
+            parse_mode=parse_mode,
+            timeout=timeout,
+        ).get("ok")
+    )
+
+
+def diagnose_telegram(timeout: int = 10) -> Dict[str, Any]:
+    """Validate token, chat access, and bot membership without sending a message."""
+    token, chat = get_telegram_credentials()
+    result: Dict[str, Any] = {
+        "ok": False,
+        "token_configured": bool(token),
+        "chat_id_configured": bool(chat),
+        "chat_id_masked": _masked_chat_id(chat),
+        "bot_identity_ok": False,
+        "chat_access_ok": False,
+        "membership_ok": False,
+        "can_send_inferred": False,
+        "bot_username": None,
+        "chat_type": None,
+        "membership_status": None,
+        "checks": [],
     }
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    try:
-        resp = requests.post(url, json=payload, timeout=timeout)
-        if not resp.ok:
-            # Do not log response body if it might echo the token
-            logger.warning(
-                "Telegram API error status={} (token redacted)",
-                resp.status_code,
+    if not token or not chat:
+        result["error"] = "not_configured"
+        result["description"] = (
+            "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the running process environment"
+        )
+        return result
+
+    def telegram_get(method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        try:
+            response = requests.get(
+                f"{TELEGRAM_API_ROOT}/bot{token}/{method}",
+                params=params,
+                timeout=(5, timeout),
             )
-            return False
-        return True
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Telegram send failed: {}", type(exc).__name__)
-        return False
+            detail = _response_detail(response)
+            body = detail.pop("response")
+            if response.ok and body.get("ok") is True:
+                return {"ok": True, "result": body.get("result"), **detail}
+            return {"ok": False, **detail}
+        except requests.RequestException as exc:
+            return {
+                "ok": False,
+                "description": type(exc).__name__,
+                "error": "network_error",
+            }
+
+    me = telegram_get("getMe")
+    result["checks"].append(
+        {
+            "name": "getMe",
+            "ok": bool(me.get("ok")),
+            "description": me.get("description"),
+        }
+    )
+    if not me.get("ok"):
+        result["error"] = "invalid_token_or_network"
+        result["description"] = me.get("description") or "Telegram getMe failed"
+        logger.error(
+            "Telegram diagnostics failed at getMe: {}",
+            result["description"],
+        )
+        return result
+
+    bot = me.get("result") if isinstance(me.get("result"), dict) else {}
+    bot_id = bot.get("id")
+    result["bot_identity_ok"] = True
+    result["bot_username"] = bot.get("username")
+
+    chat_result = telegram_get("getChat", {"chat_id": chat})
+    result["checks"].append(
+        {
+            "name": "getChat",
+            "ok": bool(chat_result.get("ok")),
+            "description": chat_result.get("description"),
+        }
+    )
+    if not chat_result.get("ok"):
+        result["error"] = "chat_unavailable"
+        result["description"] = chat_result.get("description") or "Telegram getChat failed"
+        logger.error(
+            "Telegram diagnostics failed at getChat: chat={} description={}",
+            result["chat_id_masked"],
+            result["description"],
+        )
+        return result
+
+    chat_info = (
+        chat_result.get("result")
+        if isinstance(chat_result.get("result"), dict)
+        else {}
+    )
+    result["chat_access_ok"] = True
+    result["chat_type"] = chat_info.get("type")
+
+    member_result = telegram_get(
+        "getChatMember",
+        {"chat_id": chat, "user_id": bot_id},
+    )
+    result["checks"].append(
+        {
+            "name": "getChatMember",
+            "ok": bool(member_result.get("ok")),
+            "description": member_result.get("description"),
+        }
+    )
+    if member_result.get("ok"):
+        membership = (
+            member_result.get("result")
+            if isinstance(member_result.get("result"), dict)
+            else {}
+        )
+        status = str(membership.get("status") or "")
+        result["membership_status"] = status
+        result["membership_ok"] = status not in ("left", "kicked", "")
+        if result["chat_type"] == "channel":
+            result["can_send_inferred"] = bool(
+                status == "creator" or membership.get("can_post_messages")
+            )
+        elif status == "restricted":
+            result["can_send_inferred"] = bool(membership.get("can_send_messages"))
+        else:
+            result["can_send_inferred"] = result["membership_ok"]
+    else:
+        result["description"] = (
+            member_result.get("description")
+            or "Could not verify bot membership; sendMessage is the definitive test"
+        )
+
+    result["ok"] = bool(
+        result["bot_identity_ok"]
+        and result["chat_access_ok"]
+        and result["membership_ok"]
+        and result["can_send_inferred"]
+    )
+    if not result["ok"] and not result.get("error"):
+        result["error"] = "permission_check_failed"
+    logger.info(
+        "Telegram diagnostics: chat={} bot=@{} chat_type={} membership={} can_send={}",
+        result["chat_id_masked"],
+        result.get("bot_username") or "unknown",
+        result.get("chat_type") or "unknown",
+        result.get("membership_status") or "unknown",
+        result["can_send_inferred"],
+    )
+    return result
+
+
+def send_test_telegram_alert(source: str = "manual") -> Dict[str, Any]:
+    """Run permission diagnostics and send a fixed manual test message."""
+    diagnostics = diagnose_telegram()
+    if not diagnostics.get("token_configured") or not diagnostics.get("chat_id_configured"):
+        return {
+            "ok": False,
+            "source": source,
+            "diagnostics": diagnostics,
+            "delivery": None,
+        }
+    when = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S UTC")
+    message = (
+        "✅ <b>Perpetual Pro Telegram test</b>\n"
+        f"Source: {html.escape(source)}\n"
+        f"Time: {when}\n"
+        "Credentials, chat access, and message delivery are working."
+    )
+    delivery = send_telegram_message_detailed(message, parse_mode="HTML")
+    return {
+        "ok": bool(delivery.get("ok")),
+        "source": source,
+        "diagnostics": diagnostics,
+        "delivery": delivery,
+    }
 
 
 def format_prop_scan_report(

@@ -10,11 +10,18 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.notify.telegram import (
+    diagnose_telegram,
     format_prop_scan_report,
     get_telegram_credentials,
     is_telegram_ready,
+    send_telegram_message_detailed,
 )
-from src.scheduler.scan_job import filter_high_confidence, next_slot_datetime
+from src.scheduler.scan_job import (
+    filter_high_confidence,
+    get_scheduler_status,
+    next_slot_datetime,
+    run_scheduler_loop,
+)
 from src.utils.config import load_config
 
 
@@ -151,3 +158,154 @@ def test_credentials_from_env_only(monkeypatch):
     assert "bot_token:" not in raw
     assert "chat_id:" not in raw
     assert "TELEGRAM_BOT_TOKEN" in raw  # documentation comment only
+
+
+class _FakeTelegramResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+        self.ok = 200 <= status_code < 300
+
+    def json(self):
+        return self._payload
+
+
+def test_detailed_sender_returns_telegram_error_without_token(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1001234567890")
+
+    def fake_post(url, json, timeout):
+        assert "123456:secret-token" in url
+        assert json["chat_id"] == "-1001234567890"
+        return _FakeTelegramResponse(
+            403,
+            {
+                "ok": False,
+                "error_code": 403,
+                "description": "Forbidden: bot is not a member of the channel chat",
+            },
+        )
+
+    monkeypatch.setattr("src.notify.telegram.requests.post", fake_post)
+    result = send_telegram_message_detailed("test")
+    assert result["ok"] is False
+    assert result["telegram_error_code"] == 403
+    assert "not a member" in result["description"]
+    assert "secret-token" not in str(result)
+    assert result["chat_id_masked"].endswith("7890")
+
+
+def test_detailed_sender_reports_message_id(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "123456")
+    monkeypatch.setattr(
+        "src.notify.telegram.requests.post",
+        lambda *a, **k: _FakeTelegramResponse(
+            200,
+            {"ok": True, "result": {"message_id": 77}},
+        ),
+    )
+    result = send_telegram_message_detailed("test")
+    assert result["ok"] is True
+    assert result["message_id"] == 77
+
+
+def test_telegram_diagnostics_checks_bot_chat_and_membership(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1001234567890")
+
+    def fake_get(url, params=None, timeout=None):
+        method = url.rsplit("/", 1)[-1]
+        if method == "getMe":
+            return _FakeTelegramResponse(
+                200,
+                {"ok": True, "result": {"id": 99, "username": "perp_test_bot"}},
+            )
+        if method == "getChat":
+            return _FakeTelegramResponse(
+                200,
+                {"ok": True, "result": {"id": -1001234567890, "type": "channel"}},
+            )
+        assert method == "getChatMember"
+        assert params["user_id"] == 99
+        return _FakeTelegramResponse(
+            200,
+            {
+                "ok": True,
+                "result": {
+                    "status": "administrator",
+                    "can_post_messages": True,
+                },
+            },
+        )
+
+    monkeypatch.setattr("src.notify.telegram.requests.get", fake_get)
+    result = diagnose_telegram()
+    assert result["ok"] is True
+    assert result["bot_username"] == "perp_test_bot"
+    assert result["chat_type"] == "channel"
+    assert result["membership_status"] == "administrator"
+    assert result["can_send_inferred"] is True
+
+
+def test_scheduler_loop_triggers_due_slot(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from src.scheduler import scan_job
+
+    cfg = load_config(ROOT / "config.yaml")
+    calls = []
+    due = datetime.now(ZoneInfo(cfg.scheduler.timezone))
+    monkeypatch.setattr(scan_job, "next_slot_datetime", lambda *a, **k: due)
+    monkeypatch.setattr(
+        scan_job,
+        "run_scheduled_scan_once",
+        lambda *a, **k: calls.append(k.get("slot_label")) or {
+            "completed_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+            "telegram_delivery_status": "sent",
+            "alert_count": 1,
+        },
+    )
+
+    run_scheduler_loop(cfg, max_iterations=1)
+    status = get_scheduler_status()
+    assert calls
+    assert status["last_delivery_status"] == "sent"
+    assert status["last_alert_count"] == 1
+    assert status["running"] is False
+
+
+def test_scheduled_scan_calls_detailed_sender(monkeypatch):
+    from src.scheduler import scan_job
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "123456")
+    cfg = load_config(ROOT / "config.yaml")
+    row = {
+        "direction": "long",
+        "confidence": 76,
+        "llm_confidence": 78,
+        "rank_score": 72,
+        "prop_safe": True,
+        "signal_eligible": True,
+        "entry_status": "wait_retest",
+        "execution_score": 75,
+    }
+    monkeypatch.setattr(
+        scan_job,
+        "scan_symbols",
+        lambda *a, **k: {"ok": True, "ranked_results": [row]},
+    )
+    sent = []
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_message_detailed",
+        lambda text, **kwargs: sent.append((text, kwargs))
+        or {"ok": True, "message_id": 42, "description": "Message delivered"},
+    )
+
+    result = scan_job.run_scheduled_scan_once(cfg, slot_label="test", send=True)
+    assert sent
+    assert result["telegram_sent"] is True
+    assert result["telegram_delivery_status"] == "sent"
+    assert result["telegram_delivery"]["message_id"] == 42

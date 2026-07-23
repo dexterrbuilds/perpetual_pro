@@ -386,3 +386,32 @@ def test_fastapi_analyze_endpoint(monkeypatch):
     assert body["ok"] is True
     assert body["bias"] == "bullish"
     assert "trade_plan" in body
+
+
+def test_fastapi_telegram_test_endpoint_is_secured_and_reports_result(monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    import main_server
+
+    monkeypatch.setenv("TELEGRAM_TEST_KEY", "test-admin-key")
+    monkeypatch.setattr(
+        main_server,
+        "send_test_telegram_alert",
+        lambda source: {
+            "ok": True,
+            "source": source,
+            "diagnostics": {"ok": True},
+            "delivery": {"ok": True, "message_id": 88},
+        },
+    )
+    client = TestClient(main_server.app)
+
+    forbidden = client.post("/telegram/test")
+    assert forbidden.status_code == 403
+
+    response = client.post(
+        "/telegram/test",
+        headers={"X-Telegram-Test-Key": "test-admin-key"},
+    )
+    assert response.status_code == 200
+    assert response.json()["delivery"]["message_id"] == 88

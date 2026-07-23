@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import time
 from datetime import datetime, timedelta
+from threading import Event, Lock, Thread
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -13,7 +13,7 @@ from src.api.service import AnalyzeRequest, scan_symbols
 from src.notify.telegram import (
     format_prop_scan_report,
     is_telegram_ready,
-    send_telegram_message,
+    send_telegram_message_detailed,
 )
 from src.utils.config import AppConfig, load_config
 
@@ -22,6 +22,42 @@ DEFAULT_WATCHLIST = [
     "BTC", "ETH", "SOL", "BNB", "AAVE", "ARB", "NEAR", "INJ", "SEI", "TIA",
     "SUI", "APT", "AVAX", "TRX", "UNI",
 ]
+
+_STATUS_LOCK = Lock()
+_SCHEDULER_STATUS: Dict[str, Any] = {
+    "enabled": False,
+    "running": False,
+    "thread_alive": False,
+    "timezone": None,
+    "times": [],
+    "started_at": None,
+    "next_run_at": None,
+    "last_triggered_at": None,
+    "last_completed_at": None,
+    "last_error": None,
+    "last_delivery_status": None,
+    "last_alert_count": None,
+}
+_BACKGROUND_THREAD: Optional[Thread] = None
+_BACKGROUND_STOP: Optional[Event] = None
+
+
+def _status_update(**values: Any) -> None:
+    with _STATUS_LOCK:
+        _SCHEDULER_STATUS.update(values)
+        _SCHEDULER_STATUS["thread_alive"] = bool(
+            _BACKGROUND_THREAD and _BACKGROUND_THREAD.is_alive()
+        )
+
+
+def get_scheduler_status() -> Dict[str, Any]:
+    """Return a JSON-safe snapshot for health checks and the webapp."""
+    with _STATUS_LOCK:
+        status = dict(_SCHEDULER_STATUS)
+    status["thread_alive"] = bool(
+        _BACKGROUND_THREAD and _BACKGROUND_THREAD.is_alive()
+    )
+    return status
 
 
 def _parse_hhmm(s: str) -> Tuple[int, int]:
@@ -101,6 +137,7 @@ def run_scheduled_scan_once(
 ) -> Dict[str, Any]:
     """Run one watchlist scan and optionally Telegram high-conf results."""
     cfg = config or load_config()
+    started_at = datetime.now(ZoneInfo("UTC")).isoformat()
     watchlist = list(cfg.scheduler.watchlist or []) or list(DEFAULT_WATCHLIST)
     req = AnalyzeRequest(
         timeframe=cfg.scheduler.timeframe or cfg.timeframes.primary,
@@ -111,10 +148,12 @@ def run_scheduled_scan_once(
         use_llm=True,
     )
     logger.info(
-        "Scheduled scan: {} symbols · {} · {}",
+        "Scheduled scan triggered: slot={} symbols={} timeframe={} exchange={} send={}",
+        slot_label or "manual",
         len(watchlist),
         req.timeframe,
         req.exchange,
+        send,
     )
     result = scan_symbols(watchlist, request=req, config=cfg)
     ranked = result.get("ranked_results") or []
@@ -139,28 +178,63 @@ def run_scheduled_scan_once(
         ),
     )
     sent = False
+    delivery: Optional[Dict[str, Any]] = None
+    delivery_status = "not_requested"
     # Credentials from env only (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — never YAML
     tg_ready = is_telegram_ready(cfg)
     if send and tg_ready:
         if filtered or cfg.telegram.notify_on_empty:
-            sent = send_telegram_message(
+            delivery = send_telegram_message_detailed(
                 report,
                 parse_mode=cfg.telegram.parse_mode or "HTML",
             )
+            sent = bool(delivery.get("ok"))
             if sent:
+                delivery_status = "sent"
                 logger.info(
-                    "Telegram alert sent for {} high-confidence signal(s) ({})",
-                    len(filtered),
+                    "Scheduled Telegram alert succeeded: slot={} signals={} message_id={}",
                     slot_label or "scan",
+                    len(filtered),
+                    delivery.get("message_id"),
+                )
+            else:
+                delivery_status = "failed"
+                logger.error(
+                    "Scheduled Telegram alert failed: slot={} signals={} error={} description={}",
+                    slot_label or "scan",
+                    len(filtered),
+                    delivery.get("error"),
+                    delivery.get("description"),
                 )
         else:
-            logger.info("No high-confidence signals — Telegram quiet (notify_on_empty=false)")
+            delivery_status = "skipped_no_actionable_signals"
+            logger.info(
+                "Scheduled Telegram alert skipped: slot={} no actionable signals and "
+                "notify_on_empty=false",
+                slot_label or "scan",
+            )
     elif send and not tg_ready:
+        delivery_status = "failed_not_configured"
         logger.warning(
-            "Telegram skip: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the environment"
+            "Scheduled Telegram alert failed before send: credentials disabled or missing. "
+            "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the running process environment."
         )
+    elif not send:
+        delivery_status = "disabled_for_run"
+    completed_at = datetime.now(ZoneInfo("UTC")).isoformat()
+    logger.info(
+        "Scheduled scan completed: slot={} scanned={} ranked={} actionable={} "
+        "delivery_status={}",
+        slot_label or "scan",
+        len(watchlist),
+        len(ranked),
+        len(filtered),
+        delivery_status,
+    )
     return {
         "ok": bool(result.get("ok")),
+        "started_at": started_at,
+        "completed_at": completed_at,
         "scanned": len(watchlist),
         "ranked_count": len(ranked),
         "alert_count": len(filtered),
@@ -168,6 +242,8 @@ def run_scheduled_scan_once(
         "report": report,
         "telegram_sent": sent,
         "telegram_ready": tg_ready,
+        "telegram_delivery_status": delivery_status,
+        "telegram_delivery": delivery,
         "slot_label": slot_label,
     }
 
@@ -177,6 +253,7 @@ def run_scheduler_loop(
     *,
     once: bool = False,
     max_iterations: Optional[int] = None,
+    stop_event: Optional[Event] = None,
 ) -> None:
     """
     Sleep until next WAT slot, run scan, repeat.
@@ -184,12 +261,34 @@ def run_scheduler_loop(
     ``once=True`` runs a single scan immediately (for cron / CLI).
     """
     cfg = config or load_config()
-    if once:
-        run_scheduled_scan_once(cfg, slot_label="manual")
-        return
-
+    stop = stop_event or Event()
     times = list(cfg.scheduler.times or ["05:00", "16:00", "20:00"])
     tz_name = cfg.scheduler.timezone or "Africa/Lagos"
+    _status_update(
+        enabled=bool(cfg.scheduler.enabled),
+        running=True,
+        timezone=tz_name,
+        times=times,
+        started_at=datetime.now(ZoneInfo("UTC")).isoformat(),
+        last_error=None,
+    )
+    if once:
+        try:
+            _status_update(last_triggered_at=datetime.now(ZoneInfo("UTC")).isoformat())
+            outcome = run_scheduled_scan_once(cfg, slot_label="manual")
+            _status_update(
+                last_completed_at=outcome.get("completed_at"),
+                last_delivery_status=outcome.get("telegram_delivery_status"),
+                last_alert_count=outcome.get("alert_count"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _status_update(last_error=f"{type(exc).__name__}: {exc}")
+            logger.exception("Manual scheduled scan failed: {}", exc)
+            raise
+        finally:
+            _status_update(running=False, next_run_at=None)
+        return
+
     iterations = 0
     if not is_telegram_ready(cfg):
         logger.warning(
@@ -199,24 +298,90 @@ def run_scheduler_loop(
     else:
         logger.info("Telegram credentials loaded from environment (token redacted)")
     logger.info(
-        "Scheduler loop started · times={} WAT · tz={} · high-confidence only",
+        "Scheduler loop started: times={} timezone={} high-confidence-only=true",
         times,
         tz_name,
     )
-    while True:
-        nxt = next_slot_datetime(times, tz_name)
-        now = datetime.now(ZoneInfo(tz_name))
-        sleep_s = max(1.0, (nxt - now).total_seconds())
-        logger.info("Next scan at {} (sleep {:.0f}s)", nxt.isoformat(), sleep_s)
-        # Sleep in chunks so SIGINT is responsive
-        end = time.time() + sleep_s
-        while time.time() < end:
-            time.sleep(min(30.0, end - time.time()))
-        label = nxt.strftime("%H:%M WAT")
-        try:
-            run_scheduled_scan_once(cfg, slot_label=label, send=True)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Scheduled scan failed: {}", exc)
-        iterations += 1
-        if max_iterations is not None and iterations >= max_iterations:
-            break
+    try:
+        while not stop.is_set():
+            nxt = next_slot_datetime(times, tz_name)
+            _status_update(next_run_at=nxt.isoformat())
+            now = datetime.now(ZoneInfo(tz_name))
+            sleep_s = max(0.0, (nxt - now).total_seconds())
+            logger.info("Next scheduled scan: {} (in {:.0f}s)", nxt.isoformat(), sleep_s)
+            if stop.wait(timeout=sleep_s):
+                break
+            label = nxt.strftime("%H:%M %Z")
+            triggered_at = datetime.now(ZoneInfo("UTC")).isoformat()
+            _status_update(last_triggered_at=triggered_at, last_error=None)
+            try:
+                outcome = run_scheduled_scan_once(cfg, slot_label=label, send=True)
+                _status_update(
+                    last_completed_at=outcome.get("completed_at"),
+                    last_delivery_status=outcome.get("telegram_delivery_status"),
+                    last_alert_count=outcome.get("alert_count"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                _status_update(
+                    last_completed_at=datetime.now(ZoneInfo("UTC")).isoformat(),
+                    last_error=f"{type(exc).__name__}: {exc}",
+                    last_delivery_status="scan_failed",
+                )
+                logger.exception("Scheduled scan failed: {}", exc)
+            iterations += 1
+            if max_iterations is not None and iterations >= max_iterations:
+                break
+    finally:
+        _status_update(running=False, next_run_at=None)
+        logger.info("Scheduler loop stopped")
+
+
+def start_scheduler_background(config: Optional[AppConfig] = None) -> bool:
+    """Start one daemon scheduler thread for the API process."""
+    global _BACKGROUND_THREAD, _BACKGROUND_STOP
+    cfg = config or load_config()
+    if not cfg.scheduler.enabled:
+        _status_update(
+            enabled=False,
+            running=False,
+            timezone=cfg.scheduler.timezone,
+            times=list(cfg.scheduler.times),
+        )
+        logger.warning("Scheduler disabled by configuration (scheduler.enabled=false)")
+        return False
+    if _BACKGROUND_THREAD and _BACKGROUND_THREAD.is_alive():
+        logger.info("Scheduler background thread already running")
+        return True
+    _BACKGROUND_STOP = Event()
+    _BACKGROUND_THREAD = Thread(
+        target=run_scheduler_loop,
+        kwargs={"config": cfg, "stop_event": _BACKGROUND_STOP},
+        name="perpetual-pro-scheduler",
+        daemon=True,
+    )
+    _BACKGROUND_THREAD.start()
+    _status_update(
+        enabled=True,
+        thread_alive=True,
+        timezone=cfg.scheduler.timezone,
+        times=list(cfg.scheduler.times),
+    )
+    logger.info("Scheduler background thread started")
+    return True
+
+
+def stop_scheduler_background(timeout: float = 5.0) -> None:
+    """Request scheduler shutdown when the API process exits."""
+    global _BACKGROUND_THREAD, _BACKGROUND_STOP
+    if _BACKGROUND_STOP is not None:
+        _BACKGROUND_STOP.set()
+    if _BACKGROUND_THREAD is not None and _BACKGROUND_THREAD.is_alive():
+        _BACKGROUND_THREAD.join(timeout=max(0.0, timeout))
+    alive = bool(_BACKGROUND_THREAD and _BACKGROUND_THREAD.is_alive())
+    _status_update(thread_alive=alive, running=alive, next_run_at=None)
+    if alive:
+        logger.warning("Scheduler thread did not stop within {:.1f}s", timeout)
+    else:
+        logger.info("Scheduler background thread stopped")
+        _BACKGROUND_THREAD = None
+        _BACKGROUND_STOP = None

@@ -11,6 +11,8 @@ Or:
 
 from __future__ import annotations
 
+import hmac
+import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,13 +23,23 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
 
 from src import __version__
 from src.api.service import AnalyzeRequest, analyze_from_image, scan_symbols
+from src.notify.telegram import (
+    get_telegram_credentials,
+    is_telegram_ready,
+    send_test_telegram_alert,
+)
+from src.scheduler.scan_job import (
+    get_scheduler_status,
+    start_scheduler_background,
+    stop_scheduler_background,
+)
 from src.utils.config import load_config, setup_logging
 
 # ---------------------------------------------------------------------------
@@ -49,7 +61,19 @@ def get_config():
 async def lifespan(app: FastAPI):
     cfg = get_config()
     logger.info("perpetual_pro API v{} starting (exchange={})", __version__, cfg.exchange.default)
-    yield
+    scheduler_started = start_scheduler_background(cfg)
+    logger.info(
+        "Scheduler startup result: enabled={} started={} times={} timezone={}",
+        cfg.scheduler.enabled,
+        scheduler_started,
+        cfg.scheduler.times,
+        cfg.scheduler.timezone,
+    )
+    try:
+        yield
+    finally:
+        stop_scheduler_background()
+        logger.info("perpetual_pro API shutdown complete")
 
 
 app = FastAPI(
@@ -83,6 +107,8 @@ def root() -> Dict[str, Any]:
         "endpoints": {
             "health": "GET /health",
             "analyze": "POST /analyze (multipart: image + optional symbol/timeframe)",
+            "telegram_status": "GET /telegram/status",
+            "telegram_test": "POST /telegram/test (X-Telegram-Test-Key required)",
         },
         "disclaimer": "Not financial advice. For research/education only.",
     }
@@ -96,7 +122,73 @@ def health() -> Dict[str, Any]:
         "version": __version__,
         "default_exchange": cfg.exchange.default,
         "default_timeframe": cfg.timeframes.primary,
+        "telegram_ready": is_telegram_ready(cfg),
+        "scheduler": get_scheduler_status(),
     }
+
+
+@app.get("/telegram/status")
+def telegram_status() -> Dict[str, Any]:
+    """Redacted configuration and scheduler state; does not call Telegram."""
+    cfg = get_config()
+    token, chat = get_telegram_credentials()
+    return {
+        "ok": True,
+        "telegram": {
+            "enabled": bool(cfg.telegram.enabled),
+            "ready": is_telegram_ready(cfg),
+            "token_configured": bool(token),
+            "chat_id_configured": bool(chat),
+            "chat_id_suffix": chat[-4:] if chat else None,
+            "test_endpoint_secured": bool(
+                (os.getenv("TELEGRAM_TEST_KEY") or "").strip()
+            ),
+        },
+        "scheduler": get_scheduler_status(),
+    }
+
+
+def _authorize_telegram_test(provided_key: Optional[str]) -> None:
+    expected = (os.getenv("TELEGRAM_TEST_KEY") or "").strip()
+    if not expected:
+        logger.error(
+            "Telegram test endpoint blocked: TELEGRAM_TEST_KEY is not configured"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Set TELEGRAM_TEST_KEY in the API environment, then send it as "
+                "X-Telegram-Test-Key"
+            ),
+        )
+    if not provided_key or not hmac.compare_digest(provided_key, expected):
+        logger.warning("Telegram test endpoint rejected an invalid admin key")
+        raise HTTPException(status_code=403, detail="Invalid Telegram test key")
+
+
+@app.post("/telegram/test")
+def telegram_test(
+    x_telegram_test_key: Optional[str] = Header(
+        None,
+        alias="X-Telegram-Test-Key",
+        description="Must match the TELEGRAM_TEST_KEY environment variable",
+    ),
+) -> JSONResponse:
+    """Run live bot/chat permission checks and send one fixed test alert."""
+    _authorize_telegram_test(x_telegram_test_key)
+    logger.info("Manual Telegram test requested via API")
+    result = send_test_telegram_alert(source="FastAPI /telegram/test")
+    if result.get("ok"):
+        logger.info("Manual Telegram test succeeded via API")
+        return JSONResponse(status_code=200, content=result)
+    delivery = result.get("delivery") or {}
+    diagnostics = result.get("diagnostics") or {}
+    logger.error(
+        "Manual Telegram test failed via API: delivery_error={} diagnostics_error={}",
+        delivery.get("error"),
+        diagnostics.get("error"),
+    )
+    return JSONResponse(status_code=502, content=result)
 
 
 @app.post("/scan")

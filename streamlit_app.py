@@ -346,6 +346,38 @@ def call_backend(endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Dic
         return {"ok": False, "error": str(exc)}
 
 
+def send_manual_telegram_test() -> Dict[str, Any]:
+    """Prefer the secured API test endpoint, with a local Streamlit fallback."""
+    test_key = (os.getenv("TELEGRAM_TEST_KEY") or "").strip()
+    if test_key:
+        url = f"{BACKEND_URL.rstrip('/')}/telegram/test"
+        try:
+            response = requests.post(
+                url,
+                headers={"X-Telegram-Test-Key": test_key},
+                timeout=45,
+            )
+            try:
+                result = response.json()
+            except (TypeError, ValueError):
+                result = {
+                    "ok": False,
+                    "error": "invalid_backend_response",
+                    "description": f"Backend returned HTTP {response.status_code}",
+                }
+            result["test_path"] = "backend"
+            return result
+        except requests.RequestException:
+            # Local-only Streamlit deployments may not run FastAPI.
+            pass
+
+    from src.notify.telegram import send_test_telegram_alert
+
+    result = send_test_telegram_alert(source="Streamlit test button")
+    result["test_path"] = "streamlit_process"
+    return result
+
+
 def analyze_symbol(symbol: str, timeframe: str, exchange: str, no_news: bool) -> Dict[str, Any]:
     """Run a fresh single-symbol analysis (no Streamlit cache)."""
     from src.api.service import analyze_market_data
@@ -1081,6 +1113,41 @@ def main() -> None:
                 f"Schedule (WAT): {', '.join(cfg.scheduler.times)} · "
                 f"tz={cfg.scheduler.timezone} · high-confidence only"
             )
+        with st.expander("Telegram diagnostics"):
+            st.caption(
+                "Runs live bot identity/chat permission checks, then sends one fixed test message."
+            )
+            if st.button(
+                "Send Test Telegram Alert",
+                key="btn_test_telegram",
+                disabled=not tg_ok,
+            ):
+                with st.spinner("Checking Telegram and sending test…"):
+                    telegram_test_result = send_manual_telegram_test()
+                if telegram_test_result.get("ok"):
+                    delivery = telegram_test_result.get("delivery") or {}
+                    st.success(
+                        "Telegram test delivered"
+                        + (
+                            f" (message ID {delivery.get('message_id')})"
+                            if delivery.get("message_id") is not None
+                            else ""
+                        )
+                    )
+                else:
+                    delivery = telegram_test_result.get("delivery") or {}
+                    diagnostics = telegram_test_result.get("diagnostics") or {}
+                    description = (
+                        delivery.get("description")
+                        or diagnostics.get("description")
+                        or telegram_test_result.get("description")
+                        or telegram_test_result.get("error")
+                        or "Unknown Telegram failure"
+                    )
+                    st.error(f"Telegram test failed: {description}")
+                st.json(telegram_test_result)
+            if st.button("Refresh scheduler status", key="btn_scheduler_status"):
+                st.json(call_backend("/telegram/status"))
         symbol = st.text_input(
             "Symbol",
             value="BTC",

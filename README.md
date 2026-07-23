@@ -49,6 +49,7 @@ Built to feel like a senior prop trader sitting next to you.
 # Copy .env.example → .env (gitignored) and fill:
 export TELEGRAM_BOT_TOKEN="your-bot-token-from-BotFather"
 export TELEGRAM_CHAT_ID="your-chat-id"
+export TELEGRAM_TEST_KEY="a-long-random-admin-key"
 
 python scripts/run_scheduled_scans.py --once   # test one high-conf report now
 python scripts/run_scheduled_scans.py          # loop: 05:00 / 16:00 / 20:00 WAT
@@ -56,6 +57,24 @@ python scripts/run_scheduled_scans.py          # loop: 05:00 / 16:00 / 20:00 WAT
 ```
 
 Streamlit: **Scan & analyze** with interactive closed-candle/volume/entry charts + **Backtest** tabs.
+
+The FastAPI deployment starts the scheduler in-process when
+`SCHEDULER_ENABLED=1` (the default in `render.yaml`). Check `GET /telegram/status`,
+or send a live permission/delivery test with:
+
+```bash
+curl -X POST https://your-host/telegram/test \
+  -H "X-Telegram-Test-Key: $TELEGRAM_TEST_KEY"
+```
+
+The Streamlit sidebar also has **Telegram diagnostics → Send Test Telegram
+Alert**. The bot must be started by the user for a private chat, added to a
+group, or made an administrator with posting permission for a channel. Telegram
+numeric group/channel IDs commonly begin with `-100`.
+
+> A scheduler embedded in a web service runs only while that process is awake.
+> On hosts that suspend free services, use an always-on instance or run
+> `scripts/run_scheduled_scans.py` in a dedicated worker/cron process.
 
 ---
 

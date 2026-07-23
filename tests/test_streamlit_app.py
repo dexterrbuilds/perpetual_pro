@@ -7,7 +7,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from streamlit_app import build_report_markdown, format_ticker_price, normalize_symbol_list
+from streamlit_app import (
+    build_report_markdown,
+    format_ticker_price,
+    normalize_symbol_list,
+    send_manual_telegram_test,
+)
 
 
 def test_normalize_symbol_list_filters_empty_entries():
@@ -18,6 +23,17 @@ def test_format_ticker_price_shows_base_and_price():
     assert format_ticker_price("BTC/USDT:USDT", 112450.25) == "BTC $112,450"
     assert format_ticker_price("ETH", 3456.78).startswith("ETH $")
     assert format_ticker_price("SOL", None) == "SOL —"
+
+
+def test_manual_telegram_button_uses_local_fallback(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_TEST_KEY", raising=False)
+    monkeypatch.setattr(
+        "src.notify.telegram.send_test_telegram_alert",
+        lambda source: {"ok": True, "source": source, "delivery": {"message_id": 9}},
+    )
+    result = send_manual_telegram_test()
+    assert result["ok"] is True
+    assert result["test_path"] == "streamlit_process"
 
 
 def test_build_report_markdown_contains_key_sections():
