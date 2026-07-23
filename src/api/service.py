@@ -19,6 +19,7 @@ from src.analysis.risk import RiskManager
 from src.data.exchange import EXCHANGE_MAP, normalize_exchange_id
 from src.data.multi_tf import fetch_multi_timeframe_with_fallback
 from src.data.news import NewsAnalyzer
+from src.report.charts import build_market_chart_payload
 from src.report.generator import ReportGenerator
 from src.utils.config import AppConfig, load_config
 from src.utils.helpers import clamp, normalize_symbol
@@ -156,8 +157,10 @@ def _build_analysis_payload(
             "index": analysis.snapshot.index,
             "percentage_24h": analysis.snapshot.percentage_24h,
             "funding_rate": analysis.snapshot.funding_rate,
+            "funding_average_24h": analysis.snapshot.funding_average_24h,
             "open_interest": analysis.snapshot.open_interest,
             "open_interest_value": analysis.snapshot.open_interest_value,
+            "open_interest_change_pct_24h": analysis.snapshot.open_interest_change_pct_24h,
         }
     if analysis.news:
         payload["news"] = {
@@ -426,6 +429,14 @@ def analyze_from_image(
 
         reporter = ReportGenerator(cfg)
         payload = reporter.to_dict(analysis, extra={"vision": vision_payload})
+        payload["chart"] = build_market_chart_payload(
+            mtf.primary,
+            analysis.indicators,
+            analysis.structure,
+            analysis.patterns,
+            analysis.trade_plan,
+            timeframe=primary_tf,
+        )
         payload["ok"] = True
         payload["data_mode"] = data_mode
         payload["vision"] = vision_payload
@@ -515,6 +526,14 @@ def analyze_market_data(
         )
         reporter = ReportGenerator(cfg)
         payload = reporter.to_dict(analysis)
+        payload["chart"] = build_market_chart_payload(
+            mtf.primary,
+            analysis.indicators,
+            analysis.structure,
+            analysis.patterns,
+            analysis.trade_plan,
+            timeframe=primary_tf,
+        )
         payload["ok"] = True
         payload["data_mode"] = "full"
         payload["exchange"] = fetch.exchange_used
@@ -627,8 +646,11 @@ def scan_symbols(
                     ) if sample_ok else 50.0
                     backtest_summary = {
                         "sample_ok": sample_ok,
+                        "n_signals": bt.n_signals,
                         "n_trades": bt.n_trades,
+                        "unfilled_signals": bt.unfilled_signals,
                         "win_rate": bt.win_rate,
+                        "stop_out_rate": bt.stop_out_rate,
                         "profit_factor": bt.profit_factor,
                         "max_drawdown_pct": bt.max_drawdown_pct,
                         "net_pnl_pct": bt.net_pnl_pct,
@@ -650,6 +672,20 @@ def scan_symbols(
                 primary = plan.to_primary_setup() if plan else None
                 prop_safe = bool(getattr(plan, "prop_safe", True)) if plan else True
                 prop_flags = list(getattr(plan, "prop_flags", None) or []) if plan else []
+                execution = (
+                    analysis.execution.to_dict()
+                    if getattr(analysis, "execution", None)
+                    else {}
+                )
+                chart = build_market_chart_payload(
+                    mtf.primary,
+                    analysis.indicators,
+                    analysis.structure,
+                    analysis.patterns,
+                    plan,
+                    timeframe=primary_tf,
+                    limit=100,
+                )
                 live_rank_score = float(analysis.rank_score)
                 scan_rank_score = (
                     0.90 * live_rank_score + 0.10 * validation_score
@@ -688,8 +724,20 @@ def scan_symbols(
                     "entry_low": getattr(plan, "entry_low", None) if plan else None,
                     "entry_high": getattr(plan, "entry_high", None) if plan else None,
                     "stop_loss": getattr(plan, "stop_loss", None) if plan else None,
+                    "take_profits": list(getattr(plan, "take_profits", None) or []),
                     "hold_label": getattr(plan, "hold_label", "") if plan else "",
                     "backtest": backtest_summary,
+                    "entry_status": execution.get("status", "blocked"),
+                    "execution_score": round(float(execution.get("score") or 0), 1),
+                    "immediate_sl_risk": round(
+                        float(execution.get("immediate_sl_risk") or 100), 1
+                    ),
+                    "chase_distance_atr": round(
+                        float(execution.get("chase_distance_atr") or 0), 2
+                    ),
+                    "order_flow_score": round(
+                        float(execution.get("order_flow_score") or 0), 3
+                    ),
                     "payload": {
                         "bias": analysis.bias,
                         "direction": analysis.direction,
@@ -701,6 +749,8 @@ def scan_symbols(
                         "rank_score": scan_rank_score,
                         "live_rank_score": live_rank_score,
                         "backtest": backtest_summary,
+                        "execution": execution,
+                        "chart": chart,
                         "setup_name": analysis.setup_name,
                         "confluence_total": analysis.confluence_total,
                         "key_levels": analysis.key_levels[:4],
@@ -762,7 +812,10 @@ def scan_symbols(
         "timeframe": primary_tf,
         "exchange": ex_id,
         "leverage_display_cap": SCAN_LEVERAGE_CAP,
-        "ranking": "90% live confluence/LLM + 10% same-data backtest validation (flat excluded)",
+        "ranking": (
+            "90% live closed-candle confluence/execution + 10% pending-fill "
+            "backtest validation (no-trade setups excluded)"
+        ),
         "prop_mode": bool(getattr(cfg.risk, "prop_mode", True)),
     }
 

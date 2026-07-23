@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+from src.analysis.execution import ExecutionProfile, build_execution_profile
 from src.analysis.indicators import IndicatorSuite, compute_indicators
 from src.analysis.llm import (
     LLMNarrative,
@@ -64,6 +65,7 @@ class FullAnalysis:
     patterns: Optional[PatternReport] = None
     structure: Optional[StructureReport] = None
     trade_plan: Optional[TradePlan] = None
+    execution: Optional[ExecutionProfile] = None
     scenarios: Optional[ScenarioSet] = None
     news: Optional[NewsBundle] = None
     snapshot: Optional[MarketSnapshot] = None
@@ -254,8 +256,17 @@ class ConfluenceEngine:
         # Key levels for plan
         support, resistance = self._nearest_levels(struct, price)
         result.key_levels = self._collect_levels(struct, price)
+        execution = build_execution_profile(
+            primary,
+            ind,
+            struct,
+            direction=direction,
+            price=price,
+            atr=atr,
+        )
+        result.execution = execution
 
-        # Trade plan — aggressive perp leverage + multi-TP + hold window
+        # Trade plan — structure-clustered retest entry, stop, and targets.
         funding = mtf.snapshot.funding_rate if mtf.snapshot else None
         plan = self.risk.build_plan(
             direction=direction,
@@ -267,6 +278,7 @@ class ConfluenceEngine:
             primary_tf=mtf.primary_tf,
             setup_name=result.setup_name,
             strategy_tags=result.strategy_tags,
+            execution=execution.to_dict(),
         )
         result.trade_plan = plan
         result.scenarios = self.risk.scenarios(
@@ -281,6 +293,8 @@ class ConfluenceEngine:
         # Deterministic reasons first
         result.key_reasons = self._key_reasons(result, ind, struct, pat)
         result.key_risks = self._key_risks(result, atr, price, funding)
+        result.key_reasons.extend(execution.reasons)
+        result.key_risks.extend(execution.risks)
 
         funding_pct = (funding * 100.0) if funding is not None else None
 
@@ -308,6 +322,7 @@ class ConfluenceEngine:
                     "funding_rate_pct": funding_pct,
                     "primary_setup": plan.to_primary_setup(),
                     "position_simulation": plan.to_position_simulation(),
+                    "execution": execution.to_dict(),
                 }
                 narrative = NarrativeLLM(self.config).generate(llm_ctx)
                 result.llm = narrative
@@ -396,16 +411,72 @@ class ConfluenceEngine:
             result.llm_confidence = min(float(result.llm_confidence or 0.0), 25.0)
             result.confidence = min(conf, 30.0)
 
+        # Prop eligibility is based on the final blended confidence, not the
+        # earlier technical-only estimate used to draft the initial plan.
+        confidence_floor = float(
+            getattr(self.config.analysis, "directional_confidence_threshold", 68.0)
+        )
+        score_floor = float(
+            getattr(self.config.analysis, "directional_score_threshold", 0.20)
+        )
+        execution_floor = float(
+            getattr(self.config.analysis, "execution_min_score", 65.0)
+        )
+        self.risk.apply_prop_confidence_gate(
+            plan, result.confidence, minimum=confidence_floor
+        )
+        signal_eligible = bool(
+            direction in ("long", "short")
+            and result.confidence >= confidence_floor
+            and abs(result.confluence_total) >= score_floor
+            and execution.score >= execution_floor
+            and execution.status in ("ready", "wait_retest")
+            and getattr(plan, "prop_safe", True)
+        )
+        if direction in ("long", "short") and not signal_eligible:
+            gate_reasons: List[str] = []
+            if result.confidence < confidence_floor:
+                gate_reasons.append(
+                    f"confidence {result.confidence:.0f}% < {confidence_floor:.0f}%"
+                )
+            if abs(result.confluence_total) < score_floor:
+                gate_reasons.append(
+                    f"confluence {abs(result.confluence_total):.2f} < {score_floor:.2f}"
+                )
+            if execution.score < execution_floor:
+                gate_reasons.append(
+                    f"execution {execution.score:.0f} < {execution_floor:.0f}"
+                )
+            if execution.status not in ("ready", "wait_retest"):
+                gate_reasons.append(execution.status.replace("_", " "))
+            if not plan.prop_safe:
+                gate_reasons.append("prop risk gate")
+            result.direction = "flat"
+            result.setup_name = "No Trade / Wait for Confirmation"
+            plan.direction = "flat"
+            plan.entry_status = "blocked"
+            plan.entry_reason = "Signal blocked: " + ", ".join(gate_reasons)
+            plan.prop_safe = False
+            plan.prop_flags = list(dict.fromkeys([*plan.prop_flags, "SIGNAL_GATE"]))
+            result.warnings.append(plan.entry_reason)
+            result.trader_commentary = (
+                f"{result.bias.title()} bias only — no trade. {plan.entry_reason}. "
+                f"{execution.entry_reason}"
+            )
+
+        for reason in execution.reasons:
+            if reason not in result.key_reasons:
+                result.key_reasons.append(reason)
+        for risk in execution.risks:
+            if risk not in result.key_risks:
+                result.key_risks.append(risk)
+
         result.rank_score = combined_rank_score(
-            direction=direction,
+            direction=result.direction,
             llm_confidence=result.llm_confidence,
             technical_confidence=result.technical_confidence,
             confluence_total=result.confluence_total,
         )
-
-        # Prop eligibility is based on the final blended confidence, not the
-        # earlier technical-only estimate used to draft the initial plan.
-        self.risk.apply_prop_confidence_gate(plan, result.confidence, minimum=60.0)
 
         result.meta = {
             "price": price,
@@ -431,11 +502,8 @@ class ConfluenceEngine:
             "rank_score": result.rank_score,
             "prop_safe": bool(getattr(plan, "prop_safe", True)),
             "prop_flags": list(getattr(plan, "prop_flags", None) or []),
-            "signal_eligible": bool(
-                direction in ("long", "short")
-                and result.confidence >= 60.0
-                and getattr(plan, "prop_safe", True)
-            ),
+            "signal_eligible": signal_eligible,
+            "execution": execution.to_dict(),
             "holding_window": "30m–24h",
             "indicator_timeframes_computed": sorted(indicator_suites),
         }
@@ -553,6 +621,22 @@ class ConfluenceEngine:
 
         if snap.open_interest is not None:
             notes.append(f"OI {snap.open_interest:,.0f}")
+        if snap.open_interest_change_pct_24h is not None:
+            oi_change = snap.open_interest_change_pct_24h
+            notes.append(f"OI 24h {oi_change:+.2f}%")
+            price_change = snap.percentage_24h or 0.0
+            if oi_change >= 4.0:
+                if price_change > 1.0:
+                    score += 0.16
+                    notes.append("Rising OI confirms upside participation")
+                elif price_change < -1.0:
+                    score -= 0.16
+                    notes.append("Rising OI confirms downside participation")
+            elif oi_change <= -4.0:
+                score *= 0.82
+                notes.append("Falling OI weakens continuation conviction")
+        if snap.funding_average_24h is not None:
+            notes.append(f"Avg funding 24h {snap.funding_average_24h * 100:+.4f}%")
         if snap.long_short_ratio is not None:
             lsr = snap.long_short_ratio
             notes.append(f"L/S ratio {lsr:.3f}")
@@ -581,10 +665,13 @@ class ConfluenceEngine:
         ind: IndicatorSuite,
         struct: StructureReport,
     ) -> Tuple[str, str, float]:
-        # Slightly tighter thresholds for faster day-trade decisions
-        if total >= 0.10:
+        # Directional calls require a meaningful edge; weaker scores remain bias-only.
+        threshold = float(
+            getattr(self.config.analysis, "directional_score_threshold", 0.20)
+        )
+        if total >= threshold:
             bias, direction = "bullish", "long"
-        elif total <= -0.10:
+        elif total <= -threshold:
             bias, direction = "bearish", "short"
         else:
             bias, direction = "neutral", "flat"

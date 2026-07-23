@@ -34,12 +34,18 @@ def test_format_prop_scan_report_with_rows():
                 "entry_low": 112300,
                 "entry_high": 112500,
                 "stop_loss": 111900,
+                "take_profits": [113200, 113900, 114800, 116000],
+                "entry_status": "wait_retest",
+                "execution_score": 76,
+                "immediate_sl_risk": 24,
                 "hold_label": "2–8h day trade",
                 "backtest": {
                     "sample_ok": True,
+                    "n_signals": 14,
                     "win_rate": 60,
                     "profit_factor": 1.4,
                     "n_trades": 10,
+                    "stop_out_rate": 30,
                 },
             }
         ],
@@ -51,6 +57,11 @@ def test_format_prop_scan_report_with_rows():
     assert "LLM 78%" in text
     assert "MTF aligned" in text
     assert "Entry" in text
+    assert "Wait Retest" in text
+    assert "execution 76/100" in text
+    assert "immediate-SL risk 24%" in text
+    assert "TP1" in text
+    assert "10/14 fills" in text
     assert "PF 1.40" in text
 
 
@@ -69,6 +80,45 @@ def test_filter_high_confidence():
     out = filter_high_confidence(rows, min_llm=65, min_rank=50, only_prop_safe=True)
     assert len(out) == 1
     assert out[0]["llm_confidence"] == 80
+
+
+def test_filter_rejects_weak_execution_and_signal_gate():
+    rows = [
+        {
+            "direction": "long",
+            "confidence": 75,
+            "llm_confidence": 80,
+            "rank_score": 70,
+            "prop_safe": True,
+            "signal_eligible": True,
+            "entry_status": "avoid_chase",
+            "execution_score": 80,
+        },
+        {
+            "direction": "short",
+            "confidence": 75,
+            "llm_confidence": 80,
+            "rank_score": 70,
+            "prop_safe": True,
+            "signal_eligible": True,
+            "entry_status": "wait_retest",
+            "execution_score": 50,
+        },
+        {
+            "direction": "short",
+            "confidence": 75,
+            "llm_confidence": 80,
+            "rank_score": 70,
+            "prop_safe": True,
+            "signal_eligible": False,
+            "entry_status": "ready",
+            "execution_score": 80,
+        },
+    ]
+    assert (
+        filter_high_confidence(rows, min_llm=65, min_rank=50, only_prop_safe=True)
+        == []
+    )
 
 
 def test_next_slot_datetime_future():

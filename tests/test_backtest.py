@@ -59,4 +59,14 @@ def test_backtest_returns_core_metrics():
     assert isinstance(result.equity_curve, list)
     d = result.to_dict()
     assert "n_trades" in d
+    assert result.n_signals >= result.n_trades
+    assert result.unfilled_signals >= 0
+    assert 0 <= result.stop_out_rate <= 100
+    assert d["prop_settings"]["entry_wait_bars"] == 4
+    assert d["prop_settings"]["fee_rate"] > 0
+    for trade in d["trades"]:
+        assert trade["entry_wait_bars"] >= 0
+        assert trade["fees"] >= 0
+        assert trade["mfe_r"] >= 0
+        assert trade["mae_r"] >= 0
     assert d["prop_settings"]["max_leverage"] <= 5

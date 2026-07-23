@@ -60,6 +60,8 @@ def filter_high_confidence(
     min_llm: float,
     min_rank: float,
     only_prop_safe: bool,
+    min_confidence: float = 68.0,
+    min_execution_score: float = 65.0,
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for row in ranked or []:
@@ -69,12 +71,17 @@ def filter_high_confidence(
         llm = float(row.get("llm_confidence") or 0)
         rank = float(row.get("rank_score") or 0)
         blended = row.get("confidence")
-        if blended is not None and float(blended or 0) < 60.0:
+        if blended is not None and float(blended or 0) < min_confidence:
             continue
-        if llm < min_llm and rank < min_rank:
-            # Require meeting at least one threshold when both set; prefer both
+        if llm < min_llm or rank < min_rank:
             continue
-        if llm < min_llm:
+        if row.get("signal_eligible") is False:
+            continue
+        execution_score = row.get("execution_score")
+        if execution_score is not None and float(execution_score or 0) < min_execution_score:
+            continue
+        entry_status = row.get("entry_status")
+        if entry_status is not None and entry_status not in ("ready", "wait_retest"):
             continue
         if only_prop_safe and row.get("prop_safe") is False:
             continue
@@ -116,11 +123,20 @@ def run_scheduled_scan_once(
         min_llm=float(cfg.telegram.min_llm_confidence or 65),
         min_rank=float(cfg.telegram.min_rank_score or 50),
         only_prop_safe=bool(cfg.scheduler.only_prop_safe),
+        min_confidence=float(
+            getattr(cfg.analysis, "directional_confidence_threshold", 68.0)
+        ),
+        min_execution_score=float(
+            getattr(cfg.analysis, "execution_min_score", 65.0)
+        ),
     )
     report = format_prop_scan_report(
         filtered,
         slot_label=slot_label or "scan",
         timezone=cfg.scheduler.timezone or "Africa/Lagos",
+        min_signal_confidence=float(
+            getattr(cfg.analysis, "directional_confidence_threshold", 68.0)
+        ),
     )
     sent = False
     # Credentials from env only (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — never YAML

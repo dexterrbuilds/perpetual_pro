@@ -16,6 +16,7 @@ from src.analysis.confluence import ConfluenceEngine
 from src.analysis.indicators import compute_indicators
 from src.data.exchange import MarketSnapshot
 from src.data.multi_tf import MultiTimeframeData
+from src.data.multi_tf import closed_candles
 from src.data.news import NewsBundle, NewsItem
 from src.report.generator import ReportGenerator
 from src.utils.config import load_config
@@ -41,6 +42,26 @@ def test_indicator_fallback_count():
     assert suite.indicator_count >= 40
     assert "trend_score" in suite.summary
     assert suite.summary.get("atr") is not None or suite.summary.get("close")
+
+
+def test_incomplete_exchange_candle_is_removed():
+    forming = pd.Timestamp.now(tz="UTC").floor("15min")
+    idx = pd.date_range(end=forming, periods=4, freq="15min")
+    df = pd.DataFrame(
+        {
+            "open": [1.0] * 4,
+            "high": [2.0] * 4,
+            "low": [0.5] * 4,
+            "close": [1.5] * 4,
+            "volume": [100.0] * 4,
+        },
+        index=idx,
+    )
+    assert len(closed_candles(df, "15m")) == 3
+
+    historical = df.copy()
+    historical.index = historical.index - pd.Timedelta(days=2)
+    assert len(closed_candles(historical, "15m")) == 4
 
 
 def test_full_confluence_pipeline(tmp_path):
@@ -93,6 +114,13 @@ def test_full_confluence_pipeline(tmp_path):
     assert analysis.patterns is not None
     assert analysis.trader_commentary
     assert analysis.scenarios is not None
+    assert analysis.execution is not None
+    assert analysis.trade_plan.entry_status in (
+        "ready",
+        "wait_retest",
+        "avoid_chase",
+        "blocked",
+    )
     assert analysis.trade_plan.is_simulation
     assert analysis.key_reasons is not None
 

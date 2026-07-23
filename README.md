@@ -1,6 +1,6 @@
 # perpetual_pro
 
-**Professional-grade crypto perpetual futures analysis CLI** — live market data, derivatives metrics, multi-timeframe confluence, market structure (OB / FVG / BOS / CHoCH), pattern recognition, news sentiment, and optional **screen capture → OCR + computer vision** mode.
+**Crypto perpetual futures day-trading analysis webapp + CLI** — live market data, derivatives metrics, multi-timeframe confluence, market structure (OB / FVG / BOS / CHoCH), pattern recognition, news sentiment, and optional **screen capture → OCR + computer vision** mode.
 
 Built to feel like a senior prop trader sitting next to you.
 
@@ -12,15 +12,17 @@ Built to feel like a senior prop trader sitting next to you.
 
 ### Data Mode (primary)
 - Exchanges via **ccxt**: Binance USDM, Bybit, OKX, Bitget
-- OHLCV + **funding rate**, **open interest**, **long/short ratio** (when available)
-- Multi-timeframe analysis (primary + higher TFs)
+- Closed OHLCV + current/24h **funding**, **open interest change**, and **long/short ratio** (when available)
+- Day-trade stack: **15m execution + 1h drive + 4h confirmation**, with five-minute market-data caching and parallel fetches
 - **80+ indicators** via pandas-ta (trend, momentum, volatility, volume, Ichimoku, squeeze, etc.)
 - Market structure: Order Blocks, Fair Value Gaps, liquidity pools, BOS / CHoCH, volume profile approx
 - Candlestick + classical chart patterns with confidence scores
 - RSI / MACD / Stochastic **divergences**
 - News + lexicon sentiment (CryptoCompare / CoinGecko; CryptoPanic with token)
 - Weighted **confluence engine** (trend, momentum, structure, patterns, derivatives, MTF, volume, news)
-- Risk engine: entry zone, SL, TP1–TP3, R:R, position size from account risk %
+- Execution engine: compact OB/FVG/EMA/VWAP/volume-profile retest zones, wick/body/order-flow approximation, anti-chase filtering, structure/volatility SL, and TP1–TP4
+- Strict directional gate: low-confluence, poor-execution, and extended setups remain **bias only / no trade**
+- Risk engine: entry zone, SL, TP1–TP4, R:R, position size from account risk %
 
 ### Screen Mode (`--screen`)
 - Interactive region select, full-screen, fixed region, or image file
@@ -38,7 +40,7 @@ Built to feel like a senior prop trader sitting next to you.
 ### Prop account toolkit
 - **Prop risk** (default): **0.5–1% risk per trade**, **max 5x leverage**, flags for high drawdown / wide stop / low R:R
 - **LLM confidence** with supporting vs opposing factors in reports
-- **Backtest**: `python main.py BTC --backtest --bars 500` (win rate, profit factor, max DD, equity curve)
+- **Backtest**: `python main.py BTC --backtest --bars 500` (pending retest fills, fees/slippage, unfilled signals, stop-out rate, MFE/MAE, win rate, profit factor, max DD)
 - **Scheduled scans** at **05:00 / 16:00 / 20:00 WAT** + **Telegram** high-confidence alerts
 
 **Telegram secrets are env-only** (never put tokens in `config.yaml` or commit them):
@@ -53,7 +55,7 @@ python scripts/run_scheduled_scans.py          # loop: 05:00 / 16:00 / 20:00 WAT
 # or: python main.py --scheduled-scan
 ```
 
-Streamlit: **Scan & analyze** (manual, always fresh) + **Backtest** tabs.
+Streamlit: **Scan & analyze** with interactive closed-candle/volume/entry charts + **Backtest** tabs.
 
 ---
 
@@ -171,8 +173,8 @@ curl -s -X POST "http://127.0.0.1:8000/analyze" \
   -F "exchange=bybit" | python -m json.tool
 ```
 
-Response JSON includes `ok`, `bias`, `confidence`, `trade_plan`, `factors`, `patterns`,
-`structure`, `news`, `scenarios`, `vision` (OCR/CV), and a disclaimer.
+Response JSON includes `ok`, `bias`, `confidence`, `execution`, `chart`, `trade_plan`,
+`factors`, `patterns`, `structure`, `news`, `scenarios`, `vision` (OCR/CV), and a disclaimer.
 
 Health: `GET /health`
 
@@ -181,6 +183,8 @@ Health: `GET /health`
 A private-friendly Streamlit companion app lives in [streamlit_app.py](./streamlit_app.py). It can:
 - run single-symbol analysis
 - scan a watchlist of symbols and rank setups
+- inspect closed-candle/volume charts with EMA, VWAP, structure, entry, SL, and TP overlays
+- distinguish ready entries from wait-for-retest and avoid-chase setups
 - upload a chart image for analysis
 - export markdown reports
 

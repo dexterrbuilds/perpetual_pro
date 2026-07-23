@@ -253,6 +253,21 @@ def build_report_markdown(payload: Dict[str, Any]) -> str:
         lines.append(
             f"- **Fallback:** requested {payload.get('exchange_requested')} → used {exchange}"
         )
+    execution = payload.get("execution") or (payload.get("meta") or {}).get("execution") or {}
+    if execution:
+        lines += [
+            "",
+            "## Entry quality",
+            "",
+            f"- **Status:** {str(execution.get('status') or 'blocked').replace('_', ' ').title()}",
+            f"- **Execution score:** {_safe_float(execution.get('score')):.1f}/100",
+            f"- **Immediate-SL risk:** {_safe_float(execution.get('immediate_sl_risk')):.1f}%",
+            f"- **Distance to entry:** {_safe_float(execution.get('chase_distance_atr')):.2f} ATR",
+            f"- **Order-flow approximation:** {_safe_float(execution.get('order_flow_score')):+.2f}",
+            f"- **Rule:** {execution.get('entry_reason') or '—'}",
+        ]
+        for note in ((execution.get("candle") or {}).get("notes") or [])[:5]:
+            lines.append(f"- {note}")
     lines += [
         "",
         "## Trade setup",
@@ -387,6 +402,151 @@ def format_ticker_price(symbol: Any, price: Any) -> str:
     return f"{base} ${p:.8f}".rstrip("0").rstrip(".")
 
 
+def render_market_chart(
+    chart: Dict[str, Any],
+    *,
+    title: str,
+    key: str,
+    height: int = 520,
+) -> None:
+    """Render closed candles, volume, structure, and the proposed execution plan."""
+    candles = (chart or {}).get("candles") or []
+    if not candles:
+        st.caption("Candle plot unavailable.")
+        return
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except Exception:  # noqa: BLE001
+        st.caption("Install plotly to display candle charts.")
+        return
+
+    frame = pd.DataFrame(candles)
+    frame["t"] = pd.to_datetime(frame["t"], utc=True)
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.76, 0.24],
+    )
+    fig.add_trace(
+        go.Candlestick(
+            x=frame["t"],
+            open=frame["open"],
+            high=frame["high"],
+            low=frame["low"],
+            close=frame["close"],
+            name="Closed candles",
+            increasing_line_color="#16a34a",
+            decreasing_line_color="#dc2626",
+        ),
+        row=1,
+        col=1,
+    )
+    for column, label, color in (
+        ("ema_fast", "EMA 9", "#f59e0b"),
+        ("ema_mid", "EMA 21", "#38bdf8"),
+        ("vwap", "VWAP", "#a78bfa"),
+    ):
+        if column in frame and frame[column].notna().any():
+            fig.add_trace(
+                go.Scatter(
+                    x=frame["t"],
+                    y=frame[column],
+                    mode="lines",
+                    name=label,
+                    line={"width": 1.3, "color": color},
+                ),
+                row=1,
+                col=1,
+            )
+    volume_colors = [
+        "#16a34a" if close >= open_ else "#dc2626"
+        for open_, close in zip(frame["open"], frame["close"])
+    ]
+    fig.add_trace(
+        go.Bar(
+            x=frame["t"],
+            y=frame["volume"],
+            name="Volume",
+            marker_color=volume_colors,
+            opacity=0.55,
+        ),
+        row=2,
+        col=1,
+    )
+
+    for level in ((chart or {}).get("levels") or [])[:12]:
+        value = level.get("mid")
+        if value is None:
+            continue
+        side = level.get("side")
+        color = "#22c55e" if side == "bullish" else ("#ef4444" if side == "bearish" else "#94a3b8")
+        fig.add_hline(
+            y=float(value),
+            line_width=0.7,
+            line_dash="dot",
+            line_color=color,
+            annotation_text=str(level.get("kind") or ""),
+            annotation_position="right",
+            row=1,
+            col=1,
+        )
+
+    trade = (chart or {}).get("trade") or {}
+    if trade.get("entry_low") is not None and trade.get("entry_high") is not None:
+        fig.add_hrect(
+            y0=float(trade["entry_low"]),
+            y1=float(trade["entry_high"]),
+            fillcolor="#eab308",
+            opacity=0.18,
+            line_width=0,
+            annotation_text=f"Entry · {trade.get('entry_status', '')}",
+            row=1,
+            col=1,
+        )
+    if trade.get("stop_loss") is not None:
+        fig.add_hline(
+            y=float(trade["stop_loss"]),
+            line_color="#f43f5e",
+            line_width=1.5,
+            annotation_text="SL",
+            row=1,
+            col=1,
+        )
+    for index, target in enumerate((trade.get("take_profits") or [])[:4], 1):
+        fig.add_hline(
+            y=float(target),
+            line_color="#10b981",
+            line_width=0.9,
+            line_dash="dash",
+            annotation_text=f"TP{index}",
+            row=1,
+            col=1,
+        )
+    fig.update_layout(
+        title=title,
+        height=height,
+        template="plotly_dark",
+        xaxis_rangeslider_visible=False,
+        margin={"l": 10, "r": 10, "t": 45, "b": 10},
+        legend={"orientation": "h", "y": 1.02, "x": 0},
+    )
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    st.plotly_chart(fig, use_container_width=True, key=key)
+    patterns = (chart or {}).get("patterns") or []
+    if patterns:
+        st.caption(
+            "Closed-candle patterns: "
+            + " · ".join(
+                f"{p.get('name')} ({p.get('bias')}, {float(p.get('confidence') or 0):.0f}%)"
+                for p in patterns[:4]
+            )
+        )
+
+
 def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") -> None:
     """Render ranked scan table + detail cards. ``key_prefix`` keeps widget IDs unique."""
     rows = payload.get("ranked_results", [])
@@ -410,6 +570,9 @@ def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") ->
             "llm_confidence",
             "rank_score",
             "prop_safe",
+            "entry_status",
+            "execution_score",
+            "immediate_sl_risk",
             "risk_pct",
             "confidence",
             "technical_confidence",
@@ -485,6 +648,23 @@ def render_scan_results(payload: Dict[str, Any], *, key_prefix: str = "scan") ->
                 st.caption(
                     f"Fallback used: requested {row.get('exchange_requested')} → {row.get('exchange')}"
                 )
+            execution = (row.get("payload") or {}).get("execution") or {}
+            if execution:
+                status = str(execution.get("status") or "blocked").replace("_", " ").upper()
+                st.write(
+                    f"**Entry status:** {status} · "
+                    f"**Execution:** {_safe_float(execution.get('score')):.0f}/100 · "
+                    f"**Immediate-SL risk:** {_safe_float(execution.get('immediate_sl_risk')):.0f}/100 · "
+                    f"**Order flow:** {_safe_float(execution.get('order_flow_score')):+.2f}"
+                )
+                if execution.get("entry_reason"):
+                    st.warning(execution["entry_reason"])
+            render_market_chart(
+                (row.get("payload") or {}).get("chart") or {},
+                title=f"{ticker} · closed-candle execution view",
+                key=f"{key_prefix}_chart_{i}",
+                height=440,
+            )
             plan = (row.get("payload") or {}).get("trade_plan") or {}
             if plan:
                 ez = plan.get("entry_zone") or {}
@@ -598,7 +778,7 @@ def render_trade_setup_card(payload: Dict[str, Any]) -> None:
 """
     )
     if model_lev is not None and model_lev != lev:
-        st.caption(f"Model suggested leverage: {model_lev}x (aggressive band 20–100x).")
+        st.caption(f"Model suggested leverage: {model_lev}x (day-trade band 10–30x).")
 
     alt_low = plan.get("alternative_entry_low")
     alt_high = plan.get("alternative_entry_high")
@@ -732,6 +912,29 @@ def render_single_analysis(symbol: str, timeframe: str, exchange: str, no_news: 
     if meta_bits:
         st.caption(" · ".join(meta_bits))
 
+    execution = payload.get("execution") or (payload.get("meta") or {}).get("execution") or {}
+    if execution:
+        status = str(execution.get("status") or "blocked").replace("_", " ").upper()
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Entry status", status)
+        e2.metric("Execution score", f"{_safe_float(execution.get('score')):.0f}/100")
+        e3.metric(
+            "Immediate-SL risk",
+            f"{_safe_float(execution.get('immediate_sl_risk')):.0f}/100",
+        )
+        e4.metric("Order-flow proxy", f"{_safe_float(execution.get('order_flow_score')):+.2f}")
+        if execution.get("entry_reason"):
+            if status == "READY":
+                st.success(execution["entry_reason"])
+            else:
+                st.warning(execution["entry_reason"])
+
+    render_market_chart(
+        payload.get("chart") or {},
+        title=f"{format_ticker_price(payload.get('symbol') or symbol, (payload.get('meta') or {}).get('price'))} · closed candles",
+        key=f"single_chart_{symbol.replace('/', '_').replace(':', '_')}",
+    )
+
     render_trade_setup_card(payload)
     st.divider()
     render_simulation_card(payload)
@@ -782,8 +985,8 @@ def render_single_analysis(symbol: str, timeframe: str, exchange: str, no_news: 
 def render_backtest_panel(symbol: str, timeframe: str, exchange: str) -> None:
     st.subheader("Prop backtest")
     st.caption(
-        "Historical EMA/RSI/ATR signal test with prop rules (0.5–1% risk, ≤5x leverage). "
-        "Approximation of the live stack — educational only."
+        "Closed-candle confluence test with pending retest entries, conservative intrabar "
+        "stop ordering, fees/slippage, 0.5–1% risk, and ≤5x leverage."
     )
     bars = st.slider("Bars", min_value=150, max_value=1000, value=500, step=50, key="bt_bars")
     if st.button("Run backtest", key="btn_run_backtest"):
@@ -813,7 +1016,9 @@ def render_backtest_panel(symbol: str, timeframe: str, exchange: str) -> None:
     m3.metric("Max drawdown", f"{_safe_float(result.get('max_drawdown_pct')):.2f}%")
     m4.metric("Net P/L", f"{_safe_float(result.get('net_pnl')):+.2f}")
     st.caption(
-        f"Trades: {result.get('n_trades', 0)} · "
+        f"Signals: {result.get('n_signals', 0)} · trades: {result.get('n_trades', 0)} · "
+        f"unfilled/cancelled: {result.get('unfilled_signals', 0)} · "
+        f"stop-out rate: {_safe_float(result.get('stop_out_rate')):.1f}% · "
         f"Final equity: ${_safe_float(result.get('final_equity')):,.2f} · "
         f"Start: ${_safe_float(result.get('starting_equity')):,.2f}"
     )

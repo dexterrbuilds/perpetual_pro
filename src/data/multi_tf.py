@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -44,6 +45,21 @@ class MultiTimeframeData:
 
     def all_timeframes(self) -> List[str]:
         return sorted(self.frames.keys(), key=timeframe_to_minutes)
+
+
+def closed_candles(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """Exclude the exchange's still-forming candle from signal calculations."""
+    if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        return df
+    last_ts = df.index[-1]
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.tz_localize("UTC")
+    closes_at = last_ts + pd.Timedelta(minutes=timeframe_to_minutes(timeframe))
+    now = pd.Timestamp(datetime.now(timezone.utc))
+    if closes_at > now and len(df) > 1:
+        logger.debug("Excluded incomplete {} candle at {}", timeframe, last_ts)
+        return df.iloc[:-1].copy()
+    return df
 
 
 def fetch_multi_timeframe(
@@ -107,8 +123,9 @@ def fetch_multi_timeframe(
             try:
                 value = future.result()
                 if kind == "ohlcv":
+                    value = closed_candles(value, label)
                     result.frames[label] = value
-                    logger.info("Loaded {} · {} · {} bars", symbol, label, len(value))
+                    logger.info("Loaded {} · {} · {} closed bars", symbol, label, len(value))
                 else:
                     result.snapshot = value
                     if value and value.symbol:

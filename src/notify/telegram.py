@@ -81,6 +81,7 @@ def format_prop_scan_report(
     slot_label: str = "",
     timezone: str = "Africa/Lagos",
     max_rows: int = 6,
+    min_signal_confidence: float = 68.0,
 ) -> str:
     """Compact Telegram report for actionable, prop-safe intraday signals."""
     try:
@@ -138,26 +139,54 @@ def format_prop_scan_report(
             if entry_low is not None and entry_high is not None
             else price_s
         )
+        entry_status = str(row.get("entry_status") or "ready").replace("_", " ").title()
+        execution_score = row.get("execution_score")
+        execution_s = (
+            f"{float(execution_score):.0f}/100"
+            if execution_score is not None
+            else "—"
+        )
+        immediate_risk = row.get("immediate_sl_risk")
+        immediate_risk_s = (
+            f"{float(immediate_risk):.0f}%"
+            if immediate_risk is not None
+            else "—"
+        )
+        targets = list(row.get("take_profits") or [])
+        target_line = ""
+        if targets:
+            shown = " · ".join(
+                f"TP{j} {fmt_price(target)}"
+                for j, target in enumerate(targets[:2], 1)
+            )
+            target_line = f"\n   {shown}"
         hold = html.escape(str(row.get("hold_label") or "intraday"))
         bt = row.get("backtest") or {}
         bt_line = ""
         if bt.get("sample_ok"):
+            filled = int(bt.get("n_trades") or 0)
+            signals = int(bt.get("n_signals") or filled)
             bt_line = (
                 f"\n   BT {float(bt.get('win_rate') or 0):.0f}% WR · "
                 f"PF {float(bt.get('profit_factor') or 0):.2f} · "
-                f"{int(bt.get('n_trades') or 0)} trades"
+                f"{filled}/{signals} fills · "
+                f"{float(bt.get('stop_out_rate') or 0):.0f}% stopped"
             )
         safe_reason = html.escape(str(reason))
         lines.append(
             f"{side_icon} <b>{i}. {html.escape(base)} {direction}</b> · LLM {llm_s}\n"
-            f"   Price {price_s} · Entry {entry_s}\n"
+            f"   {entry_status} · execution {execution_s} · immediate-SL risk {immediate_risk_s}\n"
+            f"   Price {price_s} · Entry {entry_s}{target_line}\n"
             f"   SL {fmt_price(row.get('stop_loss'))} · {lev}x · risk {risk_s} · {hold}\n"
             f"   Rank {rank_s}{bt_line}"
             + (f"\n   Why: {safe_reason}" if safe_reason else "")
             + (f"\n   ⚠ {html.escape(', '.join(flags))}" if flags else "")
         )
         lines.append("")
-    lines.append("🛡 Prop gate: <b>≥60% blended confidence</b> · 0.5–1% risk · ≤5x")
+    lines.append(
+        f"🛡 Prop gate: <b>≥{min_signal_confidence:.0f}% blended confidence</b> · "
+        "execution ≥65 · 0.5–1% risk · ≤5x"
+    )
     lines.append("Educational only · honor the stop · close within 24h")
     return "\n".join(lines).strip()
 

@@ -32,6 +32,10 @@ class BacktestTrade:
     pnl_pct: float
     bars_held: int
     reason: str
+    entry_wait_bars: int = 0
+    mfe_r: float = 0.0
+    mae_r: float = 0.0
+    fees: float = 0.0
 
 
 @dataclass
@@ -49,6 +53,9 @@ class BacktestResult:
     net_pnl_pct: float
     final_equity: float
     starting_equity: float
+    n_signals: int = 0
+    unfilled_signals: int = 0
+    stop_out_rate: float = 0.0
     equity_curve: List[Dict[str, Any]] = field(default_factory=list)
     trades: List[Dict[str, Any]] = field(default_factory=list)
     prop_settings: Dict[str, Any] = field(default_factory=dict)
@@ -70,6 +77,9 @@ def run_backtest(
     warmup: int = 80,
     max_hold_bars: Optional[int] = None,
     indicator_suite: Optional[IndicatorSuite] = None,
+    entry_wait_bars: int = 4,
+    fee_rate: float = 0.00055,
+    slippage_rate: float = 0.00020,
 ) -> BacktestResult:
     """
     Run a simple long/short backtest with prop risk rules.
@@ -137,6 +147,9 @@ def run_backtest(
     curve: List[Dict[str, Any]] = []
     trades: List[BacktestTrade] = []
     open_pos: Optional[Dict[str, Any]] = None
+    pending: Optional[Dict[str, Any]] = None
+    n_signals = 0
+    unfilled_signals = 0
 
     def _col(*names: str) -> Optional[str]:
         for n in names:
@@ -180,6 +193,21 @@ def run_backtest(
             hit = None
             hi = float(highs.iloc[i])
             lo = float(lows.iloc[i])
+            risk_unit = max(abs(open_pos["entry"] - open_pos["stop"]), price * 1e-9)
+            if direction == "long":
+                open_pos["mfe_r"] = max(
+                    open_pos["mfe_r"], (hi - open_pos["entry"]) / risk_unit
+                )
+                open_pos["mae_r"] = max(
+                    open_pos["mae_r"], (open_pos["entry"] - lo) / risk_unit
+                )
+            else:
+                open_pos["mfe_r"] = max(
+                    open_pos["mfe_r"], (open_pos["entry"] - lo) / risk_unit
+                )
+                open_pos["mae_r"] = max(
+                    open_pos["mae_r"], (hi - open_pos["entry"]) / risk_unit
+                )
             if direction == "long":
                 if lo <= open_pos["stop"]:
                     hit = ("sl", open_pos["stop"])
@@ -195,11 +223,15 @@ def run_backtest(
                 hit = ("time", price)
             if hit is not None:
                 exit_px = float(hit[1])
+                if hit[0] in ("sl", "time"):
+                    exit_px *= 1.0 - slippage_rate if direction == "long" else 1.0 + slippage_rate
                 units = open_pos["units"]
                 if direction == "long":
                     pnl = units * (exit_px - open_pos["entry"])
                 else:
                     pnl = units * (open_pos["entry"] - exit_px)
+                fees = units * (open_pos["entry"] + exit_px) * fee_rate
+                pnl -= fees
                 equity += pnl
                 peak = max(peak, equity)
                 dd = (peak - equity) / peak * 100.0 if peak > 0 else 0.0
@@ -217,12 +249,56 @@ def run_backtest(
                         pnl_pct=float(pnl / capital0 * 100.0),
                         bars_held=held,
                         reason=hit[0],
+                        entry_wait_bars=open_pos["entry_wait_bars"],
+                        mfe_r=float(open_pos["mfe_r"]),
+                        mae_r=float(open_pos["mae_r"]),
+                        fees=float(fees),
                     )
                 )
                 open_pos = None
                 curve.append({"t": str(ts), "equity": round(equity, 4)})
             i += 1
             continue
+
+        # Signals create a pending pullback/retest order. If price runs without
+        # touching it, the order is cancelled instead of inventing a fill.
+        if pending is not None:
+            if i > pending["expires_i"]:
+                unfilled_signals += 1
+                pending = None
+            else:
+                hi = float(highs.iloc[i])
+                lo = float(lows.iloc[i])
+                if lo <= pending["limit"] <= hi:
+                    direction = pending["direction"]
+                    fill = pending["limit"] * (
+                        1.0 + slippage_rate if direction == "long" else 1.0 - slippage_rate
+                    )
+                    risk_per_unit = max(abs(fill - pending["stop"]), fill * 1e-6)
+                    risk_amount = equity * (risk_pct / 100.0)
+                    units = risk_amount / risk_per_unit
+                    notional = units * fill
+                    margin = notional / max(max_lev, 1e-9)
+                    if margin > equity:
+                        notional = equity * max_lev
+                        units = notional / fill
+                    open_pos = {
+                        "direction": direction,
+                        "entry": fill,
+                        "stop": pending["stop"],
+                        "tp": pending["tp"],
+                        "units": units,
+                        "entry_i": i,
+                        "entry_time": work.index[i],
+                        "entry_wait_bars": i - pending["signal_i"],
+                        "mfe_r": 0.0,
+                        "mae_r": 0.0,
+                    }
+                    pending = None
+                    # Reprocess the fill candle conservatively (stop checked first).
+                    continue
+                i += 1
+                continue
 
         # New signal every `step` bars
         if (i - warmup) % max(1, step) != 0:
@@ -239,38 +315,39 @@ def run_backtest(
             macd_hist_col,
             bb_pos_col,
             vol_ratio_col,
+            atr_col,
         )
         if direction not in ("long", "short"):
             i += 1
             continue
 
+        n_signals += 1
+        ema_anchor = (
+            float(work[ema_f].iloc[i])
+            if ema_f and pd.notna(work[ema_f].iloc[i])
+            else price
+        )
         if direction == "long":
-            stop = price - atr * stop_atr
-            tp = price + atr * tp_atr
-            risk_per_unit = max(price - stop, price * 1e-6)
+            limit_entry = min(price - atr * 0.12, ema_anchor)
+            limit_entry = max(price - atr * 0.65, limit_entry)
+            stop = limit_entry - atr * max(stop_atr, 1.05)
+            risk_per_unit = limit_entry - stop
+            tp = limit_entry + risk_per_unit * 1.5
         else:
-            stop = price + atr * stop_atr
-            tp = price - atr * tp_atr
-            risk_per_unit = max(stop - price, price * 1e-6)
+            limit_entry = max(price + atr * 0.12, ema_anchor)
+            limit_entry = min(price + atr * 0.65, limit_entry)
+            stop = limit_entry + atr * max(stop_atr, 1.05)
+            risk_per_unit = stop - limit_entry
+            tp = limit_entry - risk_per_unit * 1.5
 
-        risk_amount = equity * (risk_pct / 100.0)
-        units = risk_amount / risk_per_unit
-        notional = units * price
-        margin = notional / max(max_lev, 1e-9)
-        if margin > equity:
-            notional = equity * max_lev
-            units = notional / price
-
-        open_pos = {
+        pending = {
             "direction": direction,
-            "entry": price,
+            "limit": limit_entry,
             "stop": stop,
             "tp": tp,
-            "units": units,
-            "entry_i": i,
-            "entry_time": ts,
+            "signal_i": i,
+            "expires_i": min(len(work) - 1, i + max(1, entry_wait_bars)),
         }
-        curve.append({"t": str(ts), "equity": round(equity, 4)})
         i += 1
 
     # Force-close open pos at last bar
@@ -282,6 +359,8 @@ def run_backtest(
             pnl = units * (exit_px - open_pos["entry"])
         else:
             pnl = units * (open_pos["entry"] - exit_px)
+        fees = units * (open_pos["entry"] + exit_px) * fee_rate
+        pnl -= fees
         equity += pnl
         trades.append(
             BacktestTrade(
@@ -296,6 +375,10 @@ def run_backtest(
                 pnl_pct=float(pnl / capital0 * 100.0),
                 bars_held=last_i - open_pos["entry_i"],
                 reason="eod",
+                entry_wait_bars=open_pos["entry_wait_bars"],
+                mfe_r=float(open_pos["mfe_r"]),
+                mae_r=float(open_pos["mae_r"]),
+                fees=float(fees),
             )
         )
         curve.append({"t": str(work.index[last_i]), "equity": round(equity, 4)})
@@ -308,13 +391,16 @@ def run_backtest(
     n = len(trades)
     wr = (wins / n * 100.0) if n else 0.0
     net = equity - capital0
+    stop_outs = sum(1 for t in trades if t.reason == "sl")
+    stop_out_rate = stop_outs / n * 100.0 if n else 0.0
 
-    # Rebuild max DD from curve if empty
+    # Include starting equity so a first-trade loss is not incorrectly treated
+    # as a new peak with zero drawdown.
     if curve:
-        eq = np.array([c["equity"] for c in curve], dtype=float)
+        eq = np.array([capital0, *[c["equity"] for c in curve]], dtype=float)
         peaks = np.maximum.accumulate(eq)
         dds = np.where(peaks > 0, (peaks - eq) / peaks * 100.0, 0.0)
-        max_dd = float(np.max(dds)) if len(dds) else max_dd
+        max_dd = max(max_dd, float(np.max(dds)) if len(dds) else 0.0)
 
     return BacktestResult(
         symbol=sym,
@@ -330,6 +416,9 @@ def run_backtest(
         net_pnl_pct=round(float(net / capital0 * 100.0), 3),
         final_equity=round(float(equity), 4),
         starting_equity=capital0,
+        n_signals=n_signals,
+        unfilled_signals=unfilled_signals + (1 if pending is not None else 0),
+        stop_out_rate=round(stop_out_rate, 2),
         equity_curve=curve,
         trades=[asdict(t) for t in trades[-50:]],
         prop_settings={
@@ -339,9 +428,12 @@ def run_backtest(
             "stop_atr_mult": stop_atr,
             "tp_atr_mult": tp_atr,
             "max_hold_hours": 24,
+            "entry_wait_bars": entry_wait_bars,
+            "fee_rate": fee_rate,
+            "slippage_rate": slippage_rate,
         },
         notes=[
-            "Intraday EMA/Supertrend/RSI/MACD/Bollinger/volume/ATR validator.",
+            "Closed-candle validator with pending retest entries, fees, and slippage.",
             f"Prop rules: risk {risk_pct}% · max lev {max_lev:.0f}x · one position at a time.",
         ],
     )
@@ -357,6 +449,7 @@ def _signal_direction(
     macd_hist_col: Optional[str] = None,
     bb_pos_col: Optional[str] = None,
     vol_ratio_col: Optional[str] = None,
+    atr_col: Optional[str] = None,
 ) -> str:
     """Lightweight historical approximation of the live intraday stack."""
     close = float(df["close"].iloc[i])
@@ -397,8 +490,27 @@ def _signal_direction(
             score *= 1.10
         elif vol_ratio < 0.70:
             score *= 0.85
-    if score >= 1.25:
+    # Reject exhausted closes and adverse wick candles; wait for the retest.
+    candle_range = max(
+        float(df["high"].iloc[i]) - float(df["low"].iloc[i]), close * 1e-9
+    )
+    body_high = max(float(df["open"].iloc[i]), close)
+    body_low = min(float(df["open"].iloc[i]), close)
+    upper_wick = float(df["high"].iloc[i]) - body_high
+    lower_wick = body_low - float(df["low"].iloc[i])
+    if score > 0 and upper_wick / candle_range > 0.48:
+        return "flat"
+    if score < 0 and lower_wick / candle_range > 0.48:
+        return "flat"
+    if atr_col and ema_m and pd.notna(df[atr_col].iloc[i]) and pd.notna(df[ema_m].iloc[i]):
+        atr = max(float(df[atr_col].iloc[i]), close * 1e-9)
+        extension = (close - float(df[ema_m].iloc[i])) / atr
+        if score > 0 and extension > 1.35:
+            return "flat"
+        if score < 0 and extension < -1.35:
+            return "flat"
+    if score >= 1.85:
         return "long"
-    if score <= -1.25:
+    if score <= -1.85:
         return "short"
     return "flat"

@@ -72,7 +72,7 @@ class TimeframesConfig:
 
     primary: str = "15m"
     higher: List[str] = field(default_factory=lambda: ["1h", "4h"])
-    ohlcv_limit: int = 500
+    ohlcv_limit: int = 700
     cache_ttl_seconds: int = 300
     fetch_workers: int = 4
 
@@ -116,6 +116,9 @@ class AnalysisConfig:
     weights: AnalysisWeights = field(default_factory=AnalysisWeights)
     min_confidence: float = 15.0
     max_confidence: float = 92.0
+    directional_score_threshold: float = 0.20
+    directional_confidence_threshold: float = 68.0
+    execution_min_score: float = 65.0
 
 
 @dataclass
@@ -307,7 +310,7 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
         timeframes=TimeframesConfig(
             primary=str(tf.get("primary", "15m")),
             higher=list(tf.get("higher", ["1h", "4h"])),
-            ohlcv_limit=int(tf.get("ohlcv_limit", 500)),
+            ohlcv_limit=int(tf.get("ohlcv_limit", 700)),
             cache_ttl_seconds=max(0, int(tf.get("cache_ttl_seconds", 300))),
             fetch_workers=max(1, min(8, int(tf.get("fetch_workers", 4)))),
         ),
@@ -334,6 +337,11 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             ),
             min_confidence=float(an.get("min_confidence", 15)),
             max_confidence=float(an.get("max_confidence", 92)),
+            directional_score_threshold=float(an.get("directional_score_threshold", 0.20)),
+            directional_confidence_threshold=float(
+                an.get("directional_confidence_threshold", 68)
+            ),
+            execution_min_score=float(an.get("execution_min_score", 65)),
         ),
         news=NewsConfig(
             enabled=bool(news.get("enabled", True)),

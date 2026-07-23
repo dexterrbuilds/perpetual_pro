@@ -52,6 +52,20 @@ def test_build_report_markdown_contains_key_sections():
             "margin_required": 100.0,
             "potential_profits": [50.0, 100.0, 150.0, 200.0],
             "potential_profit_pcts": [5.0, 10.0, 15.0, 20.0],
+            "entry_status": "wait_retest",
+            "entry_reason": "Wait for the demand-zone retest.",
+            "execution_score": 78,
+            "immediate_sl_risk": 22,
+            "chase_distance_atr": 0.6,
+            "order_flow_score": 0.42,
+        },
+        "execution": {
+            "status": "wait_retest",
+            "score": 78,
+            "entry_reason": "Wait for the demand-zone retest.",
+            "immediate_sl_risk": 22,
+            "chase_distance_atr": 0.6,
+            "order_flow_score": 0.42,
         },
         "signal": {"confluence_score": 0.89},
         "key_reasons": ["Momentum aligned"],
@@ -72,3 +86,6 @@ def test_build_report_markdown_contains_key_sections():
     assert "LLM Confidence" in report
     assert "78" in report
     assert "Strong MTF alignment" in report
+    assert "Entry quality" in report
+    assert "Wait Retest" in report
+    assert "Immediate-SL risk" in report

@@ -73,7 +73,7 @@ timeframes:
   higher:
     - "1h"
     - "4h"
-  ohlcv_limit: 500
+  ohlcv_limit: 700
   # Reuse live market data for five minutes and bound concurrent public requests.
   cache_ttl_seconds: 300
   fetch_workers: 4
@@ -102,6 +102,11 @@ analysis:
     news: 0.01
   min_confidence: 15
   max_confidence: 92
+  # A directional signal must pass all three gates. Otherwise the webapp shows
+  # a bias only and explicitly says to stand aside.
+  directional_score_threshold: 0.20
+  directional_confidence_threshold: 68
+  execution_min_score: 65
 
 news:
   enabled: true

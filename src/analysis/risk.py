@@ -48,6 +48,14 @@ class TradePlan:
     prop_safe: bool = True
     prop_flags: List[str] = field(default_factory=list)
     max_leverage_allowed: float = 5.0
+    # Execution quality: prevents treating a directional bias as a market order.
+    entry_status: str = "blocked"  # ready | wait_retest | avoid_chase | blocked
+    entry_reason: str = ""
+    execution_score: float = 0.0
+    immediate_sl_risk: float = 100.0
+    chase_distance_atr: float = 0.0
+    order_flow_score: float = 0.0
+    candle_context: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def entry_mid(self) -> float:
@@ -108,6 +116,13 @@ class TradePlan:
             "prop_flags": list(self.prop_flags),
             "max_leverage_allowed": self.max_leverage_allowed,
             "risk_pct": self.risk_pct,
+            "entry_status": self.entry_status,
+            "entry_reason": self.entry_reason,
+            "execution_score": self.execution_score,
+            "immediate_sl_risk": self.immediate_sl_risk,
+            "chase_distance_atr": self.chase_distance_atr,
+            "order_flow_score": self.order_flow_score,
+            "candle_context": dict(self.candle_context),
         }
 
     def to_position_simulation(self) -> Dict[str, Any]:
@@ -130,6 +145,12 @@ class TradePlan:
             "prop_safe": self.prop_safe,
             "prop_flags": list(self.prop_flags),
             "max_leverage_allowed": self.max_leverage_allowed,
+            "entry_status": self.entry_status,
+            "entry_reason": self.entry_reason,
+            "execution_score": self.execution_score,
+            "immediate_sl_risk": self.immediate_sl_risk,
+            "chase_distance_atr": self.chase_distance_atr,
+            "order_flow_score": self.order_flow_score,
         }
 
     def to_pro_lines(self, symbol: str, price: Optional[float] = None) -> List[str]:
@@ -146,6 +167,7 @@ class TradePlan:
         lines.append(
             f"🎯 Entry Zone: {format_price(self.entry_low, ref)} – {format_price(self.entry_high, ref)}"
         )
+        lines.append(f"🚦 Entry Status: {self.entry_status.upper()} — {self.entry_reason}")
         if self.alternative_entry_low is not None and self.alternative_entry_high is not None:
             lines.append(
                 f"🔄 Alternative Entry: {format_price(self.alternative_entry_low, ref)} – "
@@ -244,6 +266,7 @@ class RiskManager:
         primary_tf: Optional[str] = None,
         setup_name: str = "",
         strategy_tags: Optional[List[str]] = None,
+        execution: Optional[Dict[str, Any]] = None,
     ) -> TradePlan:
         min_rr = min_rr if min_rr is not None else self.risk.min_rr
         atr = max(safe_float(atr), price * 0.001)
@@ -286,6 +309,8 @@ class RiskManager:
                 prop_safe=True,
                 prop_flags=["FLAT_NO_TRADE"],
                 max_leverage_allowed=max_lev,
+                entry_status="blocked",
+                entry_reason="No directional setup passed the signal gate.",
             )
 
         # Tight scalp / day-trade stop (ATR multiples)
@@ -311,8 +336,38 @@ class RiskManager:
         buffer = atr * 0.08  # tighter micro-structure buffer
         alt_low = alt_high = None
         alt_note = ""
+        execution = dict(execution or {})
+        use_execution = bool(
+            execution.get("entry_low") is not None
+            and execution.get("entry_high") is not None
+            and execution.get("stop_loss") is not None
+        )
 
-        if direction == "long":
+        if use_execution:
+            entry_low = safe_float(execution["entry_low"])
+            entry_high = safe_float(execution["entry_high"])
+            stop = safe_float(execution["stop_loss"])
+            tps = [
+                safe_float(x)
+                for x in (execution.get("targets") or [])
+                if safe_float(x) > 0
+            ]
+            if len(tps) < 4:
+                entry_ref = (entry_low + entry_high) / 2.0
+                sign = 1.0 if direction == "long" else -1.0
+                risk_hint = max(abs(entry_ref - stop), atr * 0.7)
+                for rr in (0.8, 1.3, 2.0, 2.8):
+                    candidate = entry_ref + sign * risk_hint * rr
+                    if len(tps) >= 4:
+                        break
+                    if not tps or (
+                        candidate > tps[-1] if direction == "long" else candidate < tps[-1]
+                    ):
+                        tps.append(candidate)
+            tps = tps[:4]
+            alt_note = str(execution.get("entry_reason") or "")
+            invalidation = str(execution.get("invalidation_reason") or "")
+        elif direction == "long":
             # Tight primary zone around price (breakout / momentum entry)
             entry_low = price - atr * 0.06
             entry_high = price + atr * 0.04
@@ -338,7 +393,6 @@ class RiskManager:
                 stop = price - atr * 0.45
             if price - stop > atr * 1.8:
                 stop = price - atr * 1.4
-            risk_per_unit = price - stop
             tps = [price + atr * m for m in tp_mults]
             if resistance and resistance > price:
                 near = resistance - buffer
@@ -370,7 +424,6 @@ class RiskManager:
                 stop = price + atr * 0.45
             if stop - price > atr * 1.8:
                 stop = price + atr * 1.4
-            risk_per_unit = stop - price
             tps = [price - atr * m for m in tp_mults]
             if support and support < price:
                 near = support + buffer
@@ -381,8 +434,9 @@ class RiskManager:
                     tps.append(tps[-1] - atr * 0.55)
             invalidation = f"Close above {format_price(stop, price)} (scalp invalidation)"
 
-        risk_per_unit = max(risk_per_unit, price * 1e-6)
-        rrs = [abs(tp - price) / risk_per_unit for tp in tps]
+        entry_reference = (entry_low + entry_high) / 2.0
+        risk_per_unit = max(abs(entry_reference - stop), entry_reference * 1e-6)
+        rrs = [abs(tp - entry_reference) / risk_per_unit for tp in tps]
 
         lev, lev_reason = self._dynamic_leverage(
             atr_pct=atr_pct,
@@ -404,13 +458,13 @@ class RiskManager:
         risk_amount = capital * (effective_risk_pct / 100.0)
 
         units = risk_amount / risk_per_unit
-        notional = units * price
+        notional = units * entry_reference
         margin_required = notional / max(lev, 1e-9)
 
         if margin_required > capital:
             margin_required = capital
             notional = capital * lev
-            units = notional / price
+            units = notional / entry_reference
             risk_amount = units * risk_per_unit
             effective_risk_pct = (risk_amount / capital) * 100.0
             if self.prop_mode:
@@ -419,10 +473,10 @@ class RiskManager:
                     effective_risk_pct = hi
                     risk_amount = capital * (hi / 100.0)
                     units = risk_amount / risk_per_unit
-                    notional = units * price
+                    notional = units * entry_reference
                     margin_required = notional / max(lev, 1e-9)
 
-        potential_profits = [units * abs(tp - price) for tp in tps]
+        potential_profits = [units * abs(tp - entry_reference) for tp in tps]
         potential_pcts = [(p / capital) * 100.0 for p in potential_profits]
 
         primary_rr = rrs[0] if rrs else 0.0
@@ -442,10 +496,19 @@ class RiskManager:
             effective_risk_pct=effective_risk_pct,
             confidence=confidence,
             lev=lev,
+            entry_status=str(execution.get("status") or "ready"),
+            execution_score=safe_float(execution.get("score"), 100.0),
         )
         prop_safe = not any(
             f in prop_flags
-            for f in ("HIGH_DRAWDOWN_RISK", "WIDE_STOP", "LOW_RR", "LOW_CONFIDENCE")
+            for f in (
+                "HIGH_DRAWDOWN_RISK",
+                "WIDE_STOP",
+                "LOW_RR",
+                "LOW_CONFIDENCE",
+                "POOR_EXECUTION",
+                "AVOID_CHASE",
+            )
         )
 
         mode_note = (
@@ -514,6 +577,13 @@ class RiskManager:
             prop_safe=prop_safe,
             prop_flags=prop_flags,
             max_leverage_allowed=float(max_lev),
+            entry_status=str(execution.get("status") or "ready"),
+            entry_reason=str(execution.get("entry_reason") or "Entry zone validated."),
+            execution_score=safe_float(execution.get("score"), 100.0),
+            immediate_sl_risk=safe_float(execution.get("immediate_sl_risk"), 0.0),
+            chase_distance_atr=safe_float(execution.get("chase_distance_atr"), 0.0),
+            order_flow_score=safe_float(execution.get("order_flow_score"), 0.0),
+            candle_context=dict(execution.get("candle") or {}),
         )
 
     def apply_prop_confidence_gate(
@@ -532,7 +602,14 @@ class RiskManager:
             plan.notes.append(
                 f"Prop gate: {confidence:.0f}% confidence is below the {minimum:.0f}% minimum — no prop signal."
             )
-        unsafe = {"HIGH_DRAWDOWN_RISK", "WIDE_STOP", "LOW_RR", "LOW_CONFIDENCE"}
+        unsafe = {
+            "HIGH_DRAWDOWN_RISK",
+            "WIDE_STOP",
+            "LOW_RR",
+            "LOW_CONFIDENCE",
+            "POOR_EXECUTION",
+            "AVOID_CHASE",
+        }
         plan.prop_flags = list(dict.fromkeys(plan.prop_flags))
         plan.prop_safe = not any(flag in unsafe for flag in plan.prop_flags)
         return plan
@@ -546,6 +623,8 @@ class RiskManager:
         effective_risk_pct: float,
         confidence: float,
         lev: float,
+        entry_status: str = "ready",
+        execution_score: float = 100.0,
     ) -> List[str]:
         flags: List[str] = []
         if not self.prop_mode:
@@ -559,6 +638,10 @@ class RiskManager:
             flags.append("LOW_RR")
         if confidence < self.MIN_PROP_SIGNAL_CONFIDENCE:
             flags.append("LOW_CONFIDENCE")
+        if execution_score < 65:
+            flags.append("POOR_EXECUTION")
+        if entry_status in ("avoid_chase", "blocked"):
+            flags.append("AVOID_CHASE")
         if lev >= self.PROP_LEV_CEILING - 1e-9:
             flags.append("LEV_CAPPED_5X")
         return flags

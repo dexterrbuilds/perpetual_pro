@@ -270,6 +270,11 @@ class ReportGenerator:
             "primary_setup": None,
             "position_simulation": None,
             "trade_plan": None,
+            "execution": (
+                analysis.execution.to_dict()
+                if getattr(analysis, "execution", None)
+                else None
+            ),
             "patterns": [],
             "structure": None,
             "key_levels": analysis.key_levels,
@@ -330,6 +335,13 @@ class ReportGenerator:
                 "prop_safe": getattr(plan, "prop_safe", True),
                 "prop_flags": list(getattr(plan, "prop_flags", None) or []),
                 "max_leverage_allowed": getattr(plan, "max_leverage_allowed", 5.0),
+                "entry_status": getattr(plan, "entry_status", "blocked"),
+                "entry_reason": getattr(plan, "entry_reason", ""),
+                "execution_score": getattr(plan, "execution_score", 0.0),
+                "immediate_sl_risk": getattr(plan, "immediate_sl_risk", 100.0),
+                "chase_distance_atr": getattr(plan, "chase_distance_atr", 0.0),
+                "order_flow_score": getattr(plan, "order_flow_score", 0.0),
+                "candle_context": getattr(plan, "candle_context", {}) or {},
             }
             data["prop_safe"] = getattr(plan, "prop_safe", True)
             data["prop_flags"] = list(getattr(plan, "prop_flags", None) or [])
@@ -420,7 +432,9 @@ class ReportGenerator:
             data["snapshot"] = {
                 "last": snap.last,
                 "funding_rate": snap.funding_rate,
+                "funding_average_24h": snap.funding_average_24h,
                 "open_interest": snap.open_interest,
+                "open_interest_change_pct_24h": snap.open_interest_change_pct_24h,
                 "long_short_ratio": snap.long_short_ratio,
                 "percentage_24h": snap.percentage_24h,
             }
@@ -478,6 +492,23 @@ class ReportGenerator:
                 lines.append("")
         else:
             lines.append("_No trade plan_\n")
+
+        if getattr(analysis, "execution", None):
+            execution = analysis.execution
+            lines += [
+                "## Entry Quality",
+                "",
+                f"- **Status:** {execution.status.replace('_', ' ').title()}",
+                f"- **Execution score:** {execution.score:.1f}/100",
+                f"- **Immediate-SL risk:** {execution.immediate_sl_risk:.1f}%",
+                f"- **Distance to entry:** {execution.chase_distance_atr:.2f} ATR",
+                f"- **Order-flow approximation:** {execution.order_flow_score:+.2f}",
+                f"- **Entry rule:** {execution.entry_reason}",
+                "",
+            ]
+            for note in execution.candle.notes:
+                lines.append(f"- {note}")
+            lines.append("")
 
         lines += ["## Confluence Breakdown", ""]
         lines.append("| Factor | Score | Weight | Weighted | Detail |")

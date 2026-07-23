@@ -151,8 +151,10 @@ class MarketSnapshot:
     funding_rate: Optional[float] = None
     funding_timestamp: Optional[int] = None
     next_funding_rate: Optional[float] = None
+    funding_average_24h: Optional[float] = None
     open_interest: Optional[float] = None
     open_interest_value: Optional[float] = None
+    open_interest_change_pct_24h: Optional[float] = None
     long_short_ratio: Optional[float] = None
     long_account: Optional[float] = None
     short_account: Optional[float] = None
@@ -453,6 +455,34 @@ class ExchangeClient:
             pass
         return {}
 
+    def fetch_open_interest_history(
+        self, symbol: str, timeframe: str = "1h", limit: int = 24
+    ) -> List[Dict[str, Any]]:
+        """Best-effort OI history for participation/confirmation analysis."""
+        resolved = self.resolve_symbol(symbol)
+        try:
+            if self._exchange.has.get("fetchOpenInterestHistory"):
+                rows = self._exchange.fetch_open_interest_history(
+                    resolved, timeframe=timeframe, limit=limit
+                )
+                return list(rows or [])
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("OI history unavailable for {}: {}", resolved, exc)
+        return []
+
+    def fetch_funding_rate_history(
+        self, symbol: str, limit: int = 24
+    ) -> List[Dict[str, Any]]:
+        """Best-effort recent funding history for crowding context."""
+        resolved = self.resolve_symbol(symbol)
+        try:
+            if self._exchange.has.get("fetchFundingRateHistory"):
+                rows = self._exchange.fetch_funding_rate_history(resolved, limit=limit)
+                return list(rows or [])
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Funding history unavailable for {}: {}", resolved, exc)
+        return []
+
     def fetch_long_short_ratio(self, symbol: str) -> Dict[str, Any]:
         """Best-effort global long/short account ratio (venue-dependent)."""
         resolved = self.resolve_symbol(symbol)
@@ -522,8 +552,14 @@ class ExchangeClient:
                 "funding": pool.submit(self.fetch_funding_rate, resolved),
                 "oi": pool.submit(self.fetch_open_interest, resolved),
                 "ls": pool.submit(self.fetch_long_short_ratio, resolved),
+                "oi_history": pool.submit(
+                    self.fetch_open_interest_history, resolved, "1h", 24
+                ),
+                "funding_history": pool.submit(
+                    self.fetch_funding_rate_history, resolved, 24
+                ),
             }
-            fetched: Dict[str, Dict[str, Any]] = {}
+            fetched: Dict[str, Any] = {}
             for name, future in futures.items():
                 try:
                     fetched[name] = future.result() or {}
@@ -569,6 +605,16 @@ class ExchangeClient:
             snap.raw["funding"] = fr
         else:
             errors.append("funding_unavailable")
+        funding_history = fetched["funding_history"]
+        if funding_history:
+            rates = [
+                safe_float(row.get("fundingRate"))
+                for row in funding_history
+                if row.get("fundingRate") is not None
+            ]
+            if rates:
+                snap.funding_average_24h = sum(rates) / len(rates)
+            snap.raw["funding_history"] = funding_history
 
         oi = fetched["oi"]
         if oi:
@@ -586,6 +632,20 @@ class ExchangeClient:
             snap.raw["open_interest"] = oi
         else:
             errors.append("oi_unavailable")
+        oi_history = fetched["oi_history"]
+        if oi_history:
+            amounts: List[float] = []
+            for row in oi_history:
+                amount = row.get("openInterestAmount")
+                if amount is None:
+                    amount = row.get("openInterestValue")
+                if amount is not None:
+                    amounts.append(safe_float(amount))
+            if len(amounts) >= 2 and amounts[0] > 0:
+                snap.open_interest_change_pct_24h = (
+                    (amounts[-1] - amounts[0]) / amounts[0] * 100.0
+                )
+            snap.raw["open_interest_history"] = oi_history
 
         ls = fetched["ls"]
         if ls:
