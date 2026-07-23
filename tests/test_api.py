@@ -415,3 +415,39 @@ def test_fastapi_telegram_test_endpoint_is_secured_and_reports_result(monkeypatc
     )
     assert response.status_code == 200
     assert response.json()["delivery"]["message_id"] == 88
+
+
+def test_fastapi_manual_scheduled_scan_endpoint(monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    import main_server
+
+    monkeypatch.setenv("TELEGRAM_TEST_KEY", "test-admin-key")
+    monkeypatch.setattr(
+        main_server,
+        "run_scheduled_scan_once",
+        lambda *a, **k: {
+            "ok": True,
+            "telegram_sent": True,
+            "telegram_ready": True,
+            "telegram_delivery_status": "sent_empty_report",
+            "telegram_delivery": {"ok": True, "message_id": 101},
+            "scanned": 15,
+            "ranked_count": 0,
+            "alert_count": 0,
+            "started_at": "start",
+            "completed_at": "end",
+            "slot_label": "Manual test scan",
+        },
+    )
+    client = TestClient(main_server.app)
+    response = client.post(
+        "/telegram/test-scan",
+        headers={"X-Telegram-Test-Key": "test-admin-key"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["scanned"] == 15
+    assert body["alert_count"] == 0
+    assert body["delivery_status"] == "sent_empty_report"

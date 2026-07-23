@@ -11,6 +11,7 @@ from streamlit_app import (
     build_report_markdown,
     format_ticker_price,
     normalize_symbol_list,
+    run_manual_telegram_scan_test,
     send_manual_telegram_test,
 )
 
@@ -33,6 +34,31 @@ def test_manual_telegram_button_uses_local_fallback(monkeypatch):
     )
     result = send_manual_telegram_test()
     assert result["ok"] is True
+    assert result["test_path"] == "streamlit_process"
+
+
+def test_manual_scan_button_runs_real_scheduler_workflow(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_TEST_KEY", raising=False)
+    monkeypatch.setattr(
+        "src.scheduler.scan_job.run_scheduled_scan_once",
+        lambda *a, **k: {
+            "ok": True,
+            "telegram_sent": True,
+            "telegram_ready": True,
+            "telegram_delivery_status": "sent_chart_alerts",
+            "telegram_delivery": {"ok": True, "sent_count": 1},
+            "scanned": 15,
+            "ranked_count": 1,
+            "alert_count": 1,
+            "started_at": "start",
+            "completed_at": "end",
+            "slot_label": "Manual test scan",
+        },
+    )
+    result = run_manual_telegram_scan_test()
+    assert result["ok"] is True
+    assert result["alert_count"] == 1
+    assert result["delivery_status"] == "sent_chart_alerts"
     assert result["test_path"] == "streamlit_process"
 
 

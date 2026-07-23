@@ -37,6 +37,7 @@ from src.notify.telegram import (
 )
 from src.scheduler.scan_job import (
     get_scheduler_status,
+    run_scheduled_scan_once,
     start_scheduler_background,
     stop_scheduler_background,
 )
@@ -109,6 +110,10 @@ def root() -> Dict[str, Any]:
             "analyze": "POST /analyze (multipart: image + optional symbol/timeframe)",
             "telegram_status": "GET /telegram/status",
             "telegram_test": "POST /telegram/test (X-Telegram-Test-Key required)",
+            "telegram_test_scan": (
+                "POST /telegram/test-scan (run watchlist now; "
+                "X-Telegram-Test-Key required)"
+            ),
         },
         "disclaimer": "Not financial advice. For research/education only.",
     }
@@ -189,6 +194,60 @@ def telegram_test(
         diagnostics.get("error"),
     )
     return JSONResponse(status_code=502, content=result)
+
+
+@app.post("/telegram/test-scan")
+def telegram_test_scan(
+    x_telegram_test_key: Optional[str] = Header(
+        None,
+        alias="X-Telegram-Test-Key",
+        description="Must match the TELEGRAM_TEST_KEY environment variable",
+    ),
+) -> JSONResponse:
+    """Run the real scheduled watchlist workflow now and send its alert."""
+    _authorize_telegram_test(x_telegram_test_key)
+    cfg = get_config()
+    logger.info("Manual Telegram scheduled-scan test requested via API")
+    try:
+        result = run_scheduled_scan_once(
+            cfg,
+            slot_label="Manual test scan",
+            send=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Manual Telegram scheduled-scan test failed: {}", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Manual scheduled scan failed: {type(exc).__name__}",
+        ) from exc
+
+    compact = {
+        "ok": bool(result.get("ok") and result.get("telegram_sent")),
+        "scan_ok": bool(result.get("ok")),
+        "telegram_sent": bool(result.get("telegram_sent")),
+        "telegram_ready": bool(result.get("telegram_ready")),
+        "delivery_status": result.get("telegram_delivery_status"),
+        "delivery": result.get("telegram_delivery"),
+        "scanned": result.get("scanned"),
+        "ranked_count": result.get("ranked_count"),
+        "alert_count": result.get("alert_count"),
+        "started_at": result.get("started_at"),
+        "completed_at": result.get("completed_at"),
+        "slot_label": result.get("slot_label"),
+    }
+    if compact["ok"]:
+        logger.info(
+            "Manual Telegram scheduled-scan test succeeded: actionable={} status={}",
+            compact["alert_count"],
+            compact["delivery_status"],
+        )
+        return JSONResponse(status_code=200, content=compact)
+    logger.error(
+        "Manual Telegram scheduled-scan test did not deliver: scan_ok={} status={}",
+        compact["scan_ok"],
+        compact["delivery_status"],
+    )
+    return JSONResponse(status_code=502, content=compact)
 
 
 @app.post("/scan")

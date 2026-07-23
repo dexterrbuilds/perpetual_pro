@@ -72,12 +72,19 @@ or send a live permission/delivery test with:
 ```bash
 curl -X POST https://your-host/telegram/test \
   -H "X-Telegram-Test-Key: $TELEGRAM_TEST_KEY"
+
+# Run the real scheduled watchlist immediately and send chart/no-setup output:
+curl -X POST https://your-host/telegram/test-scan \
+  -H "X-Telegram-Test-Key: $TELEGRAM_TEST_KEY"
 ```
 
 The Streamlit sidebar also has **Telegram diagnostics → Send Test Telegram
-Alert**. The bot must be started by the user for a private chat, added to a
-group, or made an administrator with posting permission for a channel. Telegram
-numeric group/channel IDs commonly begin with `-100`.
+Alert** plus **Run Test Scan & Send Alert**. The latter runs the full production
+watchlist/filter/chart workflow immediately, so it sends either qualified chart
+alerts or the no-quality-setup confirmation. The bot must be started by the user
+for a private chat, added to a group, or made an administrator with posting
+permission for a channel. Telegram numeric group/channel IDs commonly begin
+with `-100`.
 
 > A scheduler embedded in a web service runs only while that process is awake.
 > On hosts that suspend free services, use an always-on instance or run

@@ -378,6 +378,55 @@ def send_manual_telegram_test() -> Dict[str, Any]:
     return result
 
 
+def run_manual_telegram_scan_test() -> Dict[str, Any]:
+    """Run the real scheduled scan now and send chart/no-setup Telegram output."""
+    test_key = (os.getenv("TELEGRAM_TEST_KEY") or "").strip()
+    if test_key:
+        url = f"{BACKEND_URL.rstrip('/')}/telegram/test-scan"
+        try:
+            response = requests.post(
+                url,
+                headers={"X-Telegram-Test-Key": test_key},
+                timeout=900,
+            )
+            try:
+                result = response.json()
+            except (TypeError, ValueError):
+                result = {
+                    "ok": False,
+                    "error": "invalid_backend_response",
+                    "description": f"Backend returned HTTP {response.status_code}",
+                }
+            result["test_path"] = "backend"
+            return result
+        except requests.RequestException:
+            # Local-only Streamlit deployments can run the same workflow directly.
+            pass
+
+    from src.scheduler.scan_job import run_scheduled_scan_once
+
+    result = run_scheduled_scan_once(
+        load_config(),
+        slot_label="Manual test scan",
+        send=True,
+    )
+    return {
+        "ok": bool(result.get("ok") and result.get("telegram_sent")),
+        "scan_ok": bool(result.get("ok")),
+        "telegram_sent": bool(result.get("telegram_sent")),
+        "telegram_ready": bool(result.get("telegram_ready")),
+        "delivery_status": result.get("telegram_delivery_status"),
+        "delivery": result.get("telegram_delivery"),
+        "scanned": result.get("scanned"),
+        "ranked_count": result.get("ranked_count"),
+        "alert_count": result.get("alert_count"),
+        "started_at": result.get("started_at"),
+        "completed_at": result.get("completed_at"),
+        "slot_label": result.get("slot_label"),
+        "test_path": "streamlit_process",
+    }
+
+
 def analyze_symbol(symbol: str, timeframe: str, exchange: str, no_news: bool) -> Dict[str, Any]:
     """Run a fresh single-symbol analysis (no Streamlit cache)."""
     from src.api.service import analyze_market_data
@@ -1160,6 +1209,43 @@ def main() -> None:
                     )
                     st.error(f"Telegram test failed: {description}")
                 st.json(telegram_test_result)
+            if st.button(
+                "Run Test Scan & Send Alert",
+                key="btn_test_telegram_scan",
+                disabled=not (
+                    tg_ok or bool((os.getenv("TELEGRAM_TEST_KEY") or "").strip())
+                ),
+                help=(
+                    "Runs the full configured watchlist now. Sends chart alerts "
+                    "for qualified setups, otherwise sends the no-quality-setup message."
+                ),
+            ):
+                with st.spinner(
+                    "Running the full watchlist scan and sending Telegram output…"
+                ):
+                    scan_test_result = run_manual_telegram_scan_test()
+                if scan_test_result.get("ok"):
+                    alert_count = int(scan_test_result.get("alert_count") or 0)
+                    if alert_count:
+                        st.success(
+                            f"Test scan delivered {alert_count} qualified signal alert(s)."
+                        )
+                    else:
+                        st.success(
+                            "Test scan completed; the no-quality-setup message was delivered."
+                        )
+                else:
+                    delivery = scan_test_result.get("delivery") or {}
+                    st.error(
+                        "Test scan did not deliver: "
+                        + str(
+                            delivery.get("description")
+                            or scan_test_result.get("delivery_status")
+                            or scan_test_result.get("error")
+                            or "unknown failure"
+                        )
+                    )
+                st.json(scan_test_result)
             if st.button("Refresh scheduler status", key="btn_scheduler_status"):
                 st.json(call_backend("/telegram/status"))
         symbol = st.text_input(
