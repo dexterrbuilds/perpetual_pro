@@ -13,6 +13,7 @@ from src.api.service import AnalyzeRequest, scan_symbols
 from src.notify.telegram import (
     format_signal_photo_caption,
     format_prop_scan_report,
+    get_telegram_alert_chat_ids,
     is_telegram_ready,
     send_telegram_message_detailed,
     send_telegram_photo_detailed,
@@ -25,6 +26,7 @@ DEFAULT_WATCHLIST = [
     "BTC", "ETH", "SOL", "BNB", "AAVE", "ARB", "NEAR", "INJ", "SEI", "TIA",
     "SUI", "APT", "AVAX", "TRX", "UNI",
 ]
+MIN_TELEGRAM_SIGNAL_CONFIDENCE = 80.0
 
 _STATUS_LOCK = Lock()
 _SCHEDULER_STATUS: Dict[str, Any] = {
@@ -141,9 +143,13 @@ def filter_high_confidence(
     min_llm: float,
     min_rank: float,
     only_prop_safe: bool,
-    min_confidence: float = 68.0,
+    min_confidence: float = MIN_TELEGRAM_SIGNAL_CONFIDENCE,
     min_execution_score: float = 65.0,
 ) -> List[Dict[str, Any]]:
+    confidence_floor = max(
+        MIN_TELEGRAM_SIGNAL_CONFIDENCE,
+        float(min_confidence or 0),
+    )
     out: List[Dict[str, Any]] = []
     for row in ranked or []:
         direction = str(row.get("direction") or "").lower()
@@ -151,8 +157,8 @@ def filter_high_confidence(
             continue
         llm = float(row.get("llm_confidence") or 0)
         rank = float(row.get("rank_score") or 0)
-        blended = row.get("confidence")
-        if blended is not None and float(blended or 0) < min_confidence:
+        overall_confidence = float(row.get("confidence") or 0)
+        if overall_confidence < confidence_floor:
             continue
         if llm < min_llm or rank < min_rank:
             continue
@@ -168,7 +174,11 @@ def filter_high_confidence(
             continue
         out.append(row)
     out.sort(
-        key=lambda r: (float(r.get("rank_score") or 0), float(r.get("llm_confidence") or 0)),
+        key=lambda r: (
+            float(r.get("confidence") or 0),
+            float(r.get("rank_score") or 0),
+            float(r.get("execution_score") or 0),
+        ),
         reverse=True,
     )
     return out
@@ -182,6 +192,7 @@ def _run_scheduled_scan_once_unlocked(
     symbols: Optional[List[str]] = None,
     timeframe: Optional[str] = None,
     notify_on_empty: Optional[bool] = None,
+    telegram_chat_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Run one watchlist scan and optionally Telegram high-conf results."""
     cfg = config or load_config()
@@ -210,8 +221,9 @@ def _run_scheduled_scan_once_unlocked(
         min_llm=float(cfg.telegram.min_llm_confidence or 65),
         min_rank=float(cfg.telegram.min_rank_score or 50),
         only_prop_safe=bool(cfg.scheduler.only_prop_safe),
-        min_confidence=float(
-            getattr(cfg.analysis, "directional_confidence_threshold", 68.0)
+        min_confidence=max(
+            MIN_TELEGRAM_SIGNAL_CONFIDENCE,
+            float(getattr(cfg.analysis, "directional_confidence_threshold", 68.0)),
         ),
         min_execution_score=float(
             getattr(cfg.analysis, "execution_min_score", 65.0)
@@ -221,8 +233,9 @@ def _run_scheduled_scan_once_unlocked(
         filtered,
         slot_label=slot_label or "scan",
         timezone=cfg.scheduler.timezone or "Africa/Lagos",
-        min_signal_confidence=float(
-            getattr(cfg.analysis, "directional_confidence_threshold", 68.0)
+        min_signal_confidence=max(
+            MIN_TELEGRAM_SIGNAL_CONFIDENCE,
+            float(getattr(cfg.analysis, "directional_confidence_threshold", 68.0)),
         ),
         scanned_count=len(watchlist),
         ranked_count=len(ranked),
@@ -230,86 +243,139 @@ def _run_scheduled_scan_once_unlocked(
     sent = False
     delivery: Optional[Dict[str, Any]] = None
     delivery_status = "not_requested"
+    destinations = get_telegram_alert_chat_ids(telegram_chat_ids)
     # Credentials from env only (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — never YAML
-    tg_ready = is_telegram_ready(cfg)
+    tg_ready = is_telegram_ready(cfg) and bool(destinations)
     if send and tg_ready:
         if filtered:
-            chart_items: List[Dict[str, Any]] = []
-            # Each actionable signal is self-contained: plotted chart + concise call.
+            rendered: List[Dict[str, Any]] = []
+            # Render each chart once, then fan the immutable payload out.
             for index, row in enumerate(filtered[:6], 1):
                 symbol = str(row.get("symbol") or f"signal-{index}")
                 try:
-                    chart_png = render_signal_chart_png(row)
-                    caption = format_signal_photo_caption(
-                        row,
-                        slot_label=slot_label or "scan",
+                    rendered.append(
+                        {
+                            "ok": True,
+                            "symbol": symbol,
+                            "photo": render_signal_chart_png(row),
+                            "caption": format_signal_photo_caption(
+                                row,
+                                slot_label=slot_label or "scan",
+                            ),
+                        }
                     )
-                    item = send_telegram_photo_detailed(
-                        chart_png,
-                        caption,
-                        filename=f"{symbol.split('/')[0].lower()}-signal.png",
-                        parse_mode=cfg.telegram.parse_mode or "HTML",
-                    )
-                    item["symbol"] = symbol
-                    item["mode"] = "photo"
-                    chart_items.append(item)
                 except Exception as exc:  # noqa: BLE001
                     logger.error(
                         "Telegram chart alert failed before upload: symbol={} error_type={}",
                         symbol,
                         type(exc).__name__,
                     )
-                    chart_items.append(
+                    rendered.append(
                         {
                             "ok": False,
                             "symbol": symbol,
-                            "mode": "photo",
                             "error": "chart_render_failed",
                             "description": type(exc).__name__,
                         }
                     )
 
+            destination_results: List[Dict[str, Any]] = []
+            chart_items: List[Dict[str, Any]] = []
+            fallback_items: List[Dict[str, Any]] = []
+            for destination in destinations:
+                destination_items: List[Dict[str, Any]] = []
+                for signal in rendered:
+                    symbol = str(signal.get("symbol") or "signal")
+                    if not signal.get("ok"):
+                        item = {
+                            "ok": False,
+                            "symbol": symbol,
+                            "mode": "photo",
+                            "error": signal.get("error"),
+                            "description": signal.get("description"),
+                        }
+                    else:
+                        item = send_telegram_photo_detailed(
+                            signal["photo"],
+                            signal["caption"],
+                            filename=f"{symbol.split('/')[0].lower()}-signal.png",
+                            chat_id=destination,
+                            parse_mode=cfg.telegram.parse_mode or "HTML",
+                        )
+                        item["symbol"] = symbol
+                        item["mode"] = "photo"
+                    destination_items.append(item)
+                    chart_items.append(item)
+
+                destination_photo_ok = bool(destination_items) and all(
+                    item.get("ok") for item in destination_items
+                )
+                fallback: Optional[Dict[str, Any]] = None
+                if not destination_photo_ok:
+                    fallback = send_telegram_message_detailed(
+                        report,
+                        chat_id=destination,
+                        parse_mode=cfg.telegram.parse_mode or "HTML",
+                    )
+                    fallback_items.append(fallback)
+                destination_ok = destination_photo_ok or bool(
+                    fallback and fallback.get("ok")
+                )
+                destination_results.append(
+                    {
+                        "ok": destination_ok,
+                        "photo_ok": destination_photo_ok,
+                        "items": destination_items,
+                        "text_fallback": fallback,
+                    }
+                )
+
             chart_sent = sum(1 for item in chart_items if item.get("ok"))
             chart_failed = len(chart_items) - chart_sent
-            all_covered = len(filtered) <= len(chart_items)
-            photo_ok = bool(chart_items) and chart_failed == 0 and all_covered
+            all_destinations_ok = bool(destination_results) and all(
+                item.get("ok") for item in destination_results
+            )
+            photo_ok = bool(destination_results) and all(
+                item.get("photo_ok") for item in destination_results
+            )
             delivery = {
-                "ok": photo_ok,
+                "ok": all_destinations_ok,
                 "mode": "photo",
                 "sent_count": chart_sent,
                 "failed_count": chart_failed,
                 "total_actionable": len(filtered),
+                "destination_count": len(destinations),
+                "destinations": destination_results,
                 "items": chart_items,
             }
+            if len(fallback_items) == 1:
+                delivery["text_fallback"] = fallback_items[0]
             if photo_ok:
                 sent = True
                 delivery_status = "sent_chart_alerts"
                 logger.info(
-                    "Scheduled Telegram chart alerts succeeded: slot={} sent={}",
+                    "Scheduled Telegram chart alerts succeeded: slot={} sent={} "
+                    "destinations={}",
                     slot_label or "scan",
                     chart_sent,
+                    len(destinations),
                 )
             else:
-                # A clean text report is a dependable fallback for rendering,
-                # Telegram media, or six-photo limit failures.
-                fallback = send_telegram_message_detailed(
-                    report,
-                    parse_mode=cfg.telegram.parse_mode or "HTML",
-                )
-                delivery["text_fallback"] = fallback
-                sent = bool(fallback.get("ok")) or chart_sent > 0
-                delivery["ok"] = sent
+                sent = any(item.get("ok") for item in destination_results)
                 delivery_status = (
-                    "sent_with_text_fallback" if sent else "failed"
+                    "sent_with_text_fallback"
+                    if sent and all_destinations_ok
+                    else ("partial_delivery" if sent else "failed")
                 )
                 if sent:
                     logger.warning(
-                        "Telegram chart delivery incomplete: slot={} photos={}/{}; "
-                        "text fallback sent={}",
+                        "Telegram chart delivery incomplete: slot={} photos={}/{} "
+                        "destinations_ok={}/{}",
                         slot_label or "scan",
                         chart_sent,
                         len(chart_items),
-                        bool(fallback.get("ok")),
+                        sum(1 for item in destination_results if item.get("ok")),
+                        len(destinations),
                     )
                 else:
                     logger.error(
@@ -321,17 +387,38 @@ def _run_scheduled_scan_once_unlocked(
             if notify_on_empty is not None
             else cfg.telegram.notify_on_empty
         ):
-            delivery = send_telegram_message_detailed(
-                report,
-                parse_mode=cfg.telegram.parse_mode or "HTML",
+            destination_results = [
+                send_telegram_message_detailed(
+                    report,
+                    chat_id=destination,
+                    parse_mode=cfg.telegram.parse_mode or "HTML",
+                )
+                for destination in destinations
+            ]
+            sent_count = sum(1 for item in destination_results if item.get("ok"))
+            sent = sent_count > 0
+            delivery = (
+                destination_results[0]
+                if len(destination_results) == 1
+                else {
+                    "ok": sent_count == len(destination_results),
+                    "sent_count": sent_count,
+                    "destination_count": len(destination_results),
+                    "destinations": destination_results,
+                }
             )
-            sent = bool(delivery.get("ok"))
             if sent:
-                delivery_status = "sent_empty_report"
+                delivery_status = (
+                    "sent_empty_report"
+                    if sent_count == len(destination_results)
+                    else "partial_delivery"
+                )
                 logger.info(
-                    "Scheduled empty Telegram report succeeded: slot={} message_id={}",
+                    "Scheduled empty Telegram report succeeded: slot={} "
+                    "destinations={}/{}",
                     slot_label or "scan",
-                    delivery.get("message_id"),
+                    sent_count,
+                    len(destination_results),
                 )
             else:
                 delivery_status = "failed"
@@ -396,6 +483,7 @@ def run_scheduled_scan_once(
     symbols: Optional[List[str]] = None,
     timeframe: Optional[str] = None,
     notify_on_empty: Optional[bool] = None,
+    telegram_chat_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Run one scan without overlapping another scheduler, API, or bot request."""
     started_at = datetime.now(ZoneInfo("UTC")).isoformat()
@@ -425,6 +513,7 @@ def run_scheduled_scan_once(
             symbols=symbols,
             timeframe=timeframe,
             notify_on_empty=notify_on_empty,
+            telegram_chat_ids=telegram_chat_ids,
         )
     finally:
         _SCAN_RUN_LOCK.release()

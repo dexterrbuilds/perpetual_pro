@@ -203,18 +203,23 @@ class SchedulerConfig:
     sessions: List[Dict[str, str]] = field(
         default_factory=lambda: [
             {
-                "name": "London open",
-                "time": "08:00",
+                "name": "London confirmation",
+                "time": "08:20",
                 "timezone": "Europe/London",
             },
             {
-                "name": "New York open",
-                "time": "09:15",
+                "name": "New York macro follow-through",
+                "time": "08:50",
+                "timezone": "America/New_York",
+            },
+            {
+                "name": "New York open confirmation",
+                "time": "09:50",
                 "timezone": "America/New_York",
             },
             {
                 "name": "New York liquidity window",
-                "time": "15:00",
+                "time": "15:20",
                 "timezone": "America/New_York",
             },
         ]
@@ -435,18 +440,23 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
                     sched.get("sessions")
                     or [
                         {
-                            "name": "London open",
-                            "time": "08:00",
+                            "name": "London confirmation",
+                            "time": "08:20",
                             "timezone": "Europe/London",
                         },
                         {
-                            "name": "New York open",
-                            "time": "09:15",
+                            "name": "New York macro follow-through",
+                            "time": "08:50",
+                            "timezone": "America/New_York",
+                        },
+                        {
+                            "name": "New York open confirmation",
+                            "time": "09:50",
                             "timezone": "America/New_York",
                         },
                         {
                             "name": "New York liquidity window",
-                            "time": "15:00",
+                            "time": "15:20",
                             "timezone": "America/New_York",
                         },
                     ]

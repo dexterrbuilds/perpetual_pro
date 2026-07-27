@@ -74,6 +74,7 @@ def test_process_scan_command_runs_production_workflow(monkeypatch):
     assert scan_calls[0]["symbols"] == ["BTC", "ETH"]
     assert scan_calls[0]["timeframe"] == "4h"
     assert scan_calls[0]["notify_on_empty"] is True
+    assert scan_calls[0]["telegram_chat_ids"] == ["123456"]
 
 
 def test_process_update_ignores_unauthorized_chat(monkeypatch):

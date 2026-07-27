@@ -59,14 +59,17 @@ scheduler:
   enabled: true
   timezone: "Africa/Lagos"   # Report timestamps remain in WAT
   sessions:
-    - name: "London open"
-      time: "08:00"
+    - name: "London confirmation"
+      time: "08:20"          # First 15m London cash-session candle has closed
       timezone: "Europe/London"
-    - name: "New York open"
-      time: "09:15"          # 15 minutes before the U.S. cash open
+    - name: "New York macro follow-through"
+      time: "08:50"          # After common 08:30 ET U.S. macro releases
+      timezone: "America/New_York"
+    - name: "New York open confirmation"
+      time: "09:50"          # First 15m U.S. cash-session candle has closed
       timezone: "America/New_York"
     - name: "New York liquidity window"
-      time: "15:00"          # ETF/benchmark and late-session volume
+      time: "15:20"          # Confirmation inside the high-volume 15:00–16:00 ET window
       timezone: "America/New_York"
   # WAT fallback used only if sessions is empty.
   times:

@@ -380,6 +380,7 @@ def process_telegram_update(update: Dict[str, Any], config: AppConfig) -> Dict[s
             symbols=symbols or None,
             timeframe=timeframe,
             notify_on_empty=True,
+            telegram_chat_ids=[incoming_chat_id],
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Telegram on-demand scan failed: {}", type(exc).__name__)

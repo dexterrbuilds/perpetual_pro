@@ -40,6 +40,7 @@ from loguru import logger
 from src import __version__
 from src.api.service import AnalyzeRequest, analyze_from_image, scan_symbols
 from src.notify.telegram import (
+    get_telegram_alert_chat_ids,
     get_telegram_credentials,
     is_telegram_ready,
     send_test_telegram_alert,
@@ -157,6 +158,7 @@ def telegram_status() -> Dict[str, Any]:
     """Redacted configuration and scheduler state; does not call Telegram."""
     cfg = get_config()
     token, chat = get_telegram_credentials()
+    alert_chats = get_telegram_alert_chat_ids()
     command_chats = get_telegram_command_chat_ids(chat)
     return {
         "ok": True,
@@ -166,6 +168,10 @@ def telegram_status() -> Dict[str, Any]:
             "token_configured": bool(token),
             "chat_id_configured": bool(chat),
             "chat_id_suffix": chat[-4:] if chat else None,
+            "alert_chat_count": len(alert_chats),
+            "additional_alert_chats_configured": bool(
+                (os.getenv("TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS") or "").strip()
+            ),
             "command_chat_ids_explicit": bool(
                 (os.getenv("TELEGRAM_COMMAND_CHAT_IDS") or "").strip()
             ),

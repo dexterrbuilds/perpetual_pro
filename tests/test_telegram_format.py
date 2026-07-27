@@ -13,6 +13,7 @@ from src.notify.telegram import (
     diagnose_telegram,
     format_prop_scan_report,
     format_signal_photo_caption,
+    get_telegram_alert_chat_ids,
     get_telegram_credentials,
     is_telegram_ready,
     send_telegram_message_detailed,
@@ -35,6 +36,8 @@ def test_format_prop_scan_report_with_rows():
                 "symbol": "BTC/USDT:USDT",
                 "price": 112450,
                 "direction": "long",
+                "confidence": 84,
+                "technical_confidence": 82,
                 "llm_confidence": 78,
                 "leverage": 5,
                 "risk_pct": 1.0,
@@ -63,16 +66,16 @@ def test_format_prop_scan_report_with_rows():
     )
     assert "Prop Scan" in text
     assert "BTC" in text
-    assert "112,450" in text or "112450" in text
-    assert "LLM 78%" in text
+    assert "112,300" in text or "112300" in text
+    assert "84% Confidence" in text
+    assert "Technical 82%" in text
     assert "MTF aligned" in text
     assert "Entry" in text
     assert "Wait Retest" in text
-    assert "execution 76/100" in text
-    assert "immediate-SL risk 24%" in text
+    assert "Execution 76/100" in text
     assert "TP1" in text
-    assert "10/14 fills" in text
-    assert "PF 1.40" in text
+    assert "NFA · DYOR · Trade at your own risk" in text
+    assert "Educational" not in text
 
 
 def test_format_empty():
@@ -86,17 +89,51 @@ def test_format_empty():
     assert "STAND ASIDE" in text
     assert "Scanned 15 symbols" in text
     assert "2 directional candidate" in text
+    assert "≥80% confidence" in text
+    assert text.endswith("NFA · DYOR · Trade at your own risk")
 
 
 def test_filter_high_confidence():
     rows = [
-        {"direction": "long", "llm_confidence": 80, "rank_score": 70, "prop_safe": True},
-        {"direction": "long", "llm_confidence": 40, "rank_score": 30, "prop_safe": True},
-        {"direction": "flat", "llm_confidence": 90, "rank_score": 90, "prop_safe": True},
-        {"direction": "short", "llm_confidence": 70, "rank_score": 60, "prop_safe": False},
+        {
+            "direction": "long",
+            "confidence": 80,
+            "llm_confidence": 80,
+            "rank_score": 70,
+            "prop_safe": True,
+        },
+        {
+            "direction": "long",
+            "confidence": 79.9,
+            "llm_confidence": 90,
+            "rank_score": 90,
+            "prop_safe": True,
+        },
+        {
+            "direction": "long",
+            "confidence": 92,
+            "llm_confidence": 40,
+            "rank_score": 30,
+            "prop_safe": True,
+        },
+        {
+            "direction": "flat",
+            "confidence": 90,
+            "llm_confidence": 90,
+            "rank_score": 90,
+            "prop_safe": True,
+        },
+        {
+            "direction": "short",
+            "confidence": 90,
+            "llm_confidence": 70,
+            "rank_score": 60,
+            "prop_safe": False,
+        },
     ]
     out = filter_high_confidence(rows, min_llm=65, min_rank=50, only_prop_safe=True)
     assert len(out) == 1
+    assert out[0]["confidence"] == 80
     assert out[0]["llm_confidence"] == 80
 
 
@@ -155,24 +192,46 @@ def test_session_schedule_follows_london_and_new_york_dst():
     cfg = load_config(ROOT / "config.yaml")
     summer_now = datetime(2026, 7, 23, 6, 0, tzinfo=ZoneInfo("UTC"))
     london, london_name = next_session_datetime(cfg.scheduler.sessions, now=summer_now)
-    assert london_name == "London open"
-    assert london.strftime("%H:%M %Z") == "08:00 BST"
-    assert london.astimezone(ZoneInfo("Africa/Lagos")).strftime("%H:%M") == "08:00"
+    assert london_name == "London confirmation"
+    assert london.strftime("%H:%M %Z") == "08:20 BST"
+    assert london.astimezone(ZoneInfo("Africa/Lagos")).strftime("%H:%M") == "08:20"
 
     after_london = datetime(2026, 7, 23, 12, 0, tzinfo=ZoneInfo("UTC"))
-    ny_open, ny_name = next_session_datetime(cfg.scheduler.sessions, now=after_london)
-    assert ny_name == "New York open"
-    assert ny_open.strftime("%H:%M %Z") == "09:15 EDT"
-    assert ny_open.astimezone(ZoneInfo("Africa/Lagos")).strftime("%H:%M") == "14:15"
+    ny_macro, ny_name = next_session_datetime(cfg.scheduler.sessions, now=after_london)
+    assert ny_name == "New York macro follow-through"
+    assert ny_macro.strftime("%H:%M %Z") == "08:50 EDT"
+    assert ny_macro.astimezone(ZoneInfo("Africa/Lagos")).strftime("%H:%M") == "13:50"
+
+    after_macro = datetime(2026, 7, 23, 13, 0, tzinfo=ZoneInfo("UTC"))
+    ny_open, ny_open_name = next_session_datetime(
+        cfg.scheduler.sessions,
+        now=after_macro,
+    )
+    assert ny_open_name == "New York open confirmation"
+    assert ny_open.strftime("%H:%M %Z") == "09:50 EDT"
 
     winter_now = datetime(2026, 1, 15, 13, 30, tzinfo=ZoneInfo("UTC"))
-    winter_open, winter_name = next_session_datetime(
+    winter_macro, winter_name = next_session_datetime(
         cfg.scheduler.sessions,
         now=winter_now,
     )
-    assert winter_name == "New York open"
-    assert winter_open.strftime("%H:%M %Z") == "09:15 EST"
-    assert winter_open.astimezone(ZoneInfo("Africa/Lagos")).strftime("%H:%M") == "15:15"
+    assert winter_name == "New York macro follow-through"
+    assert winter_macro.strftime("%H:%M %Z") == "08:50 EST"
+    assert winter_macro.astimezone(ZoneInfo("Africa/Lagos")).strftime("%H:%M") == "14:50"
+
+
+def test_alert_destinations_include_primary_and_additional(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1001111")
+    monkeypatch.setenv(
+        "TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS",
+        "-1002222, @private_channel -1001111",
+    )
+    assert get_telegram_alert_chat_ids() == [
+        "-1001111",
+        "-1002222",
+        "@private_channel",
+    ]
+    assert get_telegram_alert_chat_ids(["999999"]) == ["999999"]
 
 
 def test_credentials_from_env_only(monkeypatch):
@@ -278,9 +337,9 @@ def test_signal_photo_caption_is_clean_and_actionable():
         "symbol": "BTC/USDT:USDT",
         "direction": "long",
         "primary_tf": "15m",
-        "confidence": 78,
-        "technical_confidence": 75,
-        "llm_confidence": 80,
+        "confidence": 87,
+        "technical_confidence": 84,
+        "llm_confidence": 90,
         "entry_status": "wait_retest",
         "execution_score": 76,
         "entry_low": 112300,
@@ -289,6 +348,7 @@ def test_signal_photo_caption_is_clean_and_actionable():
         "take_profits": [113200, 113900, 114800, 116000],
         "leverage": 5,
         "risk_pct": 1,
+        "setup_name": "Long Momentum",
         "immediate_sl_risk": 24,
         "order_flow_score": 0.42,
         "funding_rate": 0.0001,
@@ -300,18 +360,28 @@ def test_signal_photo_caption_is_clean_and_actionable():
                 "entry_reason": "Wait for the demand-zone retest; do not enter at market.",
             },
             "chart": {"timeframe": "15m"},
+            "primary_setup": {
+                "hold_label": "Intraday",
+                "hold_hours_max": 12,
+                "risk_reward": [1.2, 2.4, 3.1, 4.0],
+            },
         },
     }
-    caption = format_signal_photo_caption(row, slot_label="16:00 WAT")
-    assert "BTC LONG RETEST" in caption
-    assert "DO NOT CHASE" in caption
-    assert "CONFIDENCE 78%" in caption
-    assert "Entry" in caption
-    assert "Stop" in caption
-    assert "TP1" in caption
-    assert "Why:" in caption
-    assert "funding" in caption
-    assert "OI 24h" in caption
+    caption = format_signal_photo_caption(row, slot_label="New York open")
+    assert "BTC LONG — RETEST" in caption
+    assert "87% Confidence" in caption
+    assert "Technical 84%" in caption
+    assert "Execution 76/100" in caption
+    assert "Intraday" in caption
+    assert "NY open" in caption
+    assert "<b>Entry:</b>" in caption
+    assert "<b>Stop:</b>" in caption
+    assert "<b>TP1:</b>" in caption
+    assert "<b>Setup:</b> Long Momentum" in caption
+    assert "<b>R:R (TP2):</b> 2.40" in caption
+    assert "<b>Why:</b>" in caption
+    assert "Educational" not in caption
+    assert caption.endswith("NFA · DYOR · Trade at your own risk")
     assert len(caption) <= 1024
 
 
@@ -392,8 +462,8 @@ def test_scheduled_scan_calls_detailed_sender(monkeypatch):
     cfg = load_config(ROOT / "config.yaml")
     row = {
         "direction": "long",
-        "confidence": 76,
-        "llm_confidence": 78,
+        "confidence": 82,
+        "llm_confidence": 82,
         "rank_score": 72,
         "prop_safe": True,
         "signal_eligible": True,
@@ -460,8 +530,8 @@ def test_scheduled_scan_sends_chart_alert_without_text_fallback(monkeypatch):
     row = {
         "symbol": "BTC/USDT:USDT",
         "direction": "long",
-        "confidence": 78,
-        "llm_confidence": 80,
+        "confidence": 84,
+        "llm_confidence": 84,
         "rank_score": 72,
         "prop_safe": True,
         "signal_eligible": True,
@@ -498,3 +568,68 @@ def test_scheduled_scan_sends_chart_alert_without_text_fallback(monkeypatch):
     assert result["telegram_sent"] is True
     assert result["telegram_delivery_status"] == "sent_chart_alerts"
     assert result["telegram_delivery"]["items"][0]["message_id"] == 99
+
+
+def test_scheduled_scan_fans_out_but_manual_override_stays_private(monkeypatch):
+    from src.scheduler import scan_job
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1001111")
+    monkeypatch.setenv("TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS", "-1002222")
+    cfg = load_config(ROOT / "config.yaml")
+    row = {
+        "symbol": "ETH/USDT:USDT",
+        "direction": "short",
+        "confidence": 86,
+        "technical_confidence": 84,
+        "llm_confidence": 88,
+        "rank_score": 81,
+        "prop_safe": True,
+        "signal_eligible": True,
+        "entry_status": "wait_retest",
+        "execution_score": 79,
+        "payload": {"chart": {"candles": [{}] * 10}},
+    }
+    monkeypatch.setattr(
+        scan_job,
+        "scan_symbols",
+        lambda *a, **k: {"ok": True, "ranked_results": [row]},
+    )
+    monkeypatch.setattr(scan_job, "render_signal_chart_png", lambda row: b"png")
+    monkeypatch.setattr(
+        scan_job,
+        "format_signal_photo_caption",
+        lambda row, slot_label="": "<b>ETH SHORT</b>",
+    )
+    photo_chats = []
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_photo_detailed",
+        lambda photo, caption, **kwargs: photo_chats.append(kwargs["chat_id"])
+        or {"ok": True, "message_id": len(photo_chats)},
+    )
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_message_detailed",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fallback called")),
+    )
+
+    scheduled = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label="scheduled",
+        send=True,
+    )
+    assert photo_chats == ["-1001111", "-1002222"]
+    assert scheduled["telegram_delivery"]["destination_count"] == 2
+    assert scheduled["telegram_delivery_status"] == "sent_chart_alerts"
+
+    photo_chats.clear()
+    manual = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label="manual",
+        send=True,
+        telegram_chat_ids=["999999"],
+    )
+    assert photo_chats == ["999999"]
+    assert manual["telegram_delivery"]["destination_count"] == 1
+    assert manual["telegram_delivery_status"] == "sent_chart_alerts"

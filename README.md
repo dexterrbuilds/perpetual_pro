@@ -41,8 +41,9 @@ Built to feel like a senior prop trader sitting next to you.
 - **Prop risk** (default): **0.5–1% risk per trade**, **max 5x leverage**, flags for high drawdown / wide stop / low R:R
 - **LLM confidence** with supporting vs opposing factors in reports
 - **Backtest**: `python main.py BTC --backtest --bars 500` (pending retest fills, fees/slippage, unfilled signals, stop-out rate, MFE/MAE, win rate, profit factor, max DD)
-- **DST-aware scheduled scans** at the London open, shortly before the New York
-  cash open, and the New York 3 p.m. liquidity/ETF window, with
+- **DST-aware scheduled scans** after the first London candle, after the common
+  8:30 a.m. ET macro window, after the first New York cash-session candle, and
+  inside the New York 3–4 p.m. liquidity/ETF window, with
   **Telegram chart alerts**. Each actionable alert includes a plotted closed-candle
   chart (EMA/VWAP, structure, entry, SL, TP1–TP4) and a compact signal call with
   confidence, execution status, reason, risk, funding/OI context, and hold window.
@@ -56,6 +57,7 @@ Built to feel like a senior prop trader sitting next to you.
 # Copy .env.example → .env (gitignored) and fill:
 export TELEGRAM_BOT_TOKEN="your-bot-token-from-BotFather"
 export TELEGRAM_CHAT_ID="your-alert-group-id"
+export TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS="your-private-channel-id"
 export TELEGRAM_COMMAND_CHAT_IDS="your-private-chat-id"
 export TELEGRAM_TEST_KEY="a-long-random-admin-key"
 # Optional outside Render; may be a base URL or the full webhook endpoint:
@@ -84,6 +86,8 @@ curl -X POST https://your-host/telegram/test-scan \
 The API registers a secured Telegram webhook at startup. On Render it uses
 `RENDER_EXTERNAL_URL` automatically; other hosts can set `TELEGRAM_WEBHOOK_URL`.
 Set `TELEGRAM_CHAT_ID` to the group/channel that receives alerts. Optionally set
+comma/space-separated `TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS` to mirror scheduled
+alerts to more destinations, such as a private channel. Set
 comma/space-separated `TELEGRAM_COMMAND_CHAT_IDS` to accept commands from
 different private chats; when omitted, commands fall back to `TELEGRAM_CHAT_ID`.
 
@@ -96,9 +100,10 @@ different private chats; when omitted, commands fall back to `TELEGRAM_CHAT_ID`.
 /help                 command guide
 ```
 
-Command replies and scan acknowledgements return to the authorized command chat.
-Qualified chart alerts and the no-quality-setup confirmation continue to use the
-group/channel in `TELEGRAM_CHAT_ID`. Overlapping scheduled/on-demand scans are
+Manual `/scan` acknowledgements, qualified charts, and stand-aside results stay
+in the requesting authorized DM. Scheduled scans fan out to the main group in
+`TELEGRAM_CHAT_ID` and every destination in
+`TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS`. Overlapping scheduled/on-demand scans are
 blocked. The bot must be started by the user for a private chat, added to a group,
 or made an administrator with posting permission for a channel. Telegram numeric
 group/channel IDs commonly begin with `-100`.

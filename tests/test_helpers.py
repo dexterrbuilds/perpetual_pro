@@ -22,7 +22,7 @@ from src.utils.helpers import (
 from src.analysis.patterns import PatternDetector
 from src.data.exchange import ExchangeClient
 from src.analysis.market_structure import MarketStructureAnalyzer
-from src.analysis.risk import RiskManager
+from src.analysis.risk import RiskManager, suggest_hold_window
 from src.utils.config import load_config
 
 
@@ -189,6 +189,29 @@ def test_risk_manager_aggressive_band():
     plan = rm.build_plan("long", price=100.0, atr=2.0, confidence=70, primary_tf="15m")
     assert plan.leverage_suggested >= 20
     assert plan.leverage_suggested <= 100
+
+
+def test_hold_style_uses_timeframe_not_momentum_name():
+    label, detail, max_hours = suggest_hold_window(
+        "15m",
+        setup_name="Long Momentum",
+        strategy_tags=["momentum", "day_trade"],
+        direction="long",
+        confidence=84,
+    )
+    assert label == "Intraday"
+    assert "1–8 hours" in detail
+    assert max_hours == 12
+
+    scalp_label, _, scalp_max = suggest_hold_window(
+        "5m",
+        setup_name="Short Momentum",
+        strategy_tags=["momentum", "scalping"],
+        direction="short",
+        confidence=84,
+    )
+    assert scalp_label == "Scalp"
+    assert scalp_max == 2
 
 
 def test_load_config_defaults():

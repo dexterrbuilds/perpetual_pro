@@ -722,7 +722,7 @@ class ConfluenceEngine:
 
         # Style tags
         if abs(mom) > 0.35 and adx >= 18:
-            tags.append("momentum_scalp")
+            tags.append("momentum")
         if adx < 24 and (bb_pos <= 0.22 or bb_pos >= 0.78 or (rsi is not None and (rsi < 35 or rsi > 65))):
             tags.append("mean_reversion")
         if struct.last_bos:
@@ -736,14 +736,10 @@ class ConfluenceEngine:
             names = " ".join(p.name.lower() for p in pat.hits[:3])
             if any(x in names for x in ("engulf", "star", "hammer", "shooting", "marubozu")):
                 tags.append("reversal")
-                tags.append("candle_scalp")
 
         # Horizon — prefer intraday horizons: 15m, 1h, 4h
-        if mins <= 15:
+        if mins <= 5:
             tags.append("scalping")
-            tags.append("day_trade")
-        elif mins <= 60:
-            tags.append("day_trade")
         elif mins <= 240:
             tags.append("day_trade")
         else:
@@ -771,14 +767,14 @@ class ConfluenceEngine:
         if direction == "flat":
             return "No Trade / Stand Aside"
         side = "Long" if direction == "long" else "Short"
-        if "momentum_scalp" in tags:
-            return f"{side} Momentum Scalp"
         if "breakout" in tags or "breakdown" in tags:
             return f"{side} Breakout Retest"
+        if "momentum" in tags:
+            return f"{side} Momentum"
         if "mean_reversion" in tags:
-            return f"{side} Mean Reversion Scalp"
-        if "candle_scalp" in tags or "reversal" in tags:
-            return f"{side} Reversal Scalp"
+            return f"{side} Mean Reversion"
+        if "reversal" in tags:
+            return f"{side} Reversal"
         if "volume_surge" in tags and "momentum" in tags:
             return f"{side} Volume Momentum Burst"
         if "choch" in tags:

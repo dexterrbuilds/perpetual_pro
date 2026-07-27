@@ -821,7 +821,7 @@ def suggest_hold_window(
     tags = [str(x).lower() for x in (strategy_tags or [])]
     blob = f"{setup_name or ''} {' '.join(tags)} {direction or ''}".lower()
 
-    if t in ("1m", "3m", "5m") or "scalp" in blob or "momentum_scalp" in blob:
+    if t in ("1m", "3m", "5m") or "scalping" in tags:
         return "Scalp", "Suggested hold: 30–90 minutes (scalp — max 2h)", 2.0
     if t in ("15m", "30m") or "mean_reversion" in blob:
         return "Intraday", "Suggested hold: 1–8 hours (day trade — max 12h)", 12.0

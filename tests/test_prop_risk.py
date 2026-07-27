@@ -85,8 +85,9 @@ def test_config_loads_prop_and_telegram():
     assert "15:00" in cfg.scheduler.times
     assert "20:00" in cfg.scheduler.times
     assert [session["name"] for session in cfg.scheduler.sessions] == [
-        "London open",
-        "New York open",
+        "London confirmation",
+        "New York macro follow-through",
+        "New York open confirmation",
         "New York liquidity window",
     ]
     assert cfg.telegram.notify_on_empty is True

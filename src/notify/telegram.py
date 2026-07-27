@@ -12,7 +12,7 @@ from __future__ import annotations
 import html
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
@@ -46,6 +46,35 @@ def get_telegram_credentials(
     token = (bot_token if bot_token is not None else os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     chat = (chat_id if chat_id is not None else os.getenv("TELEGRAM_CHAT_ID") or "").strip()
     return token, chat
+
+
+def get_telegram_alert_chat_ids(
+    override_chat_ids: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """
+    Resolve alert destinations without changing the primary credential contract.
+
+    Scheduled scans use TELEGRAM_CHAT_ID plus optional comma/space-separated
+    TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS. A per-run override is exclusive and is
+    used by private /scan commands so their results stay in the requesting DM.
+    """
+    if override_chat_ids is not None:
+        sources = list(override_chat_ids)
+    else:
+        _, primary_chat = get_telegram_credentials()
+        sources = [
+            primary_chat,
+            os.getenv("TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS") or "",
+        ]
+
+    destinations: List[str] = []
+    for source in sources:
+        for candidate in str(source or "").replace(";", ",").split(","):
+            for value in candidate.split():
+                chat_id = value.strip()
+                if chat_id and chat_id not in destinations:
+                    destinations.append(chat_id)
+    return destinations
 
 
 def _response_detail(response: requests.Response) -> Dict[str, Any]:
@@ -244,7 +273,8 @@ def send_telegram_photo_detailed(
         }
     if len(caption) > 1024:
         logger.warning("Telegram photo caption truncated from {} characters", len(caption))
-        caption = caption[:1000] + "\nNot Financial Advice."
+        footer = "\n\nNFA · DYOR · Trade at your own risk"
+        caption = caption[: 1024 - len(footer)].rstrip() + footer
 
     url = f"{TELEGRAM_API_ROOT}/bot{token}/sendPhoto"
     data: Dict[str, Any] = {
@@ -352,19 +382,15 @@ def format_signal_photo_caption(
     symbol = str(row.get("symbol") or "—").split("/")[0].split(":")[0]
     confidence = _number(row.get("confidence"))
     technical = _number(row.get("technical_confidence"))
-    llm = _number(row.get("llm_confidence"))
     execution_score = _number(row.get("execution_score") or execution.get("score"))
     status = str(row.get("entry_status") or execution.get("status") or "blocked")
     timeframe = str(row.get("primary_tf") or chart.get("timeframe") or "15m")
     setup_name = str(row.get("setup_name") or payload.get("setup_name") or "").strip()
     risk_rewards = list(primary.get("risk_reward") or [])
-    confidence_label = (
-        "VERY HIGH" if confidence >= 80 else ("HIGH" if confidence >= 72 else "QUALIFIED")
-    )
     if status == "wait_retest":
-        call = f"{direction} RETEST — DO NOT CHASE"
+        call = f"{direction} — RETEST"
     elif status == "ready":
-        call = f"{direction} — CONFIRMATION READY"
+        call = f"{direction} — READY"
     else:
         call = f"{direction} — CONDITIONAL"
 
@@ -387,66 +413,63 @@ def format_signal_photo_caption(
     targets = list(row.get("take_profits") or [])
     leverage = row.get("leverage") or row.get("display_leverage") or 5
     risk_pct = _number(row.get("risk_pct"), 1.0)
-    immediate_risk = _number(row.get("immediate_sl_risk"))
-    order_flow = _number(row.get("order_flow_score"))
-    hold = str(row.get("hold_label") or primary.get("hold_detail") or "30m–24h")
+    hold_style = _caption_hold_style(
+        row.get("hold_label") or primary.get("hold_label"),
+        timeframe=timeframe,
+        hold_hours_max=primary.get("hold_hours_max"),
+    )
+    rr_tp2 = _caption_target_rr(
+        direction=direction,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        stop=stop,
+        targets=targets,
+        risk_rewards=risk_rewards,
+    )
+    session = _caption_session_label(slot_label)
 
     lines = [
         f"{icon} <b>{html.escape(symbol)} {call}</b>",
         (
-            f"<b>{confidence_label} CONFIDENCE {confidence:.0f}%</b> · "
-            f"Tech {technical:.0f}% · LLM {llm:.0f}% · Exec {execution_score:.0f}/100"
+            f"<b>{confidence:.0f}% Confidence</b> · "
+            f"Technical {technical:.0f}% · Execution {execution_score:.0f}/100"
         ),
-        f"⏱ {html.escape(timeframe)} entry · 1h/4h confirmation"
-        + (f" · {html.escape(slot_label)}" if slot_label else ""),
-    ]
-    if setup_name or risk_rewards:
-        setup_bits = []
-        if setup_name:
-            setup_bits.append(html.escape(setup_name))
-        if len(risk_rewards) > 1:
-            setup_bits.append(f"TP2 R:R {_number(risk_rewards[1]):.2f}")
-        lines.append("📐 " + " · ".join(setup_bits))
-    lines += [
         "",
-        f"🎯 <b>Entry</b> {_caption_price(entry_low)} – {_caption_price(entry_high)}",
-        f"🛑 <b>Stop</b> {_caption_price(stop)} · risk {risk_pct:.2f}% · ≤{leverage}x",
+        (
+            f"⏱ {html.escape(timeframe)} · 1h/4h confirmation · "
+            f"{html.escape(hold_style)}"
+            + (f" · {html.escape(session)}" if session else "")
+        ),
+        f"🎯 <b>Entry:</b> {_caption_price(entry_low)} – {_caption_price(entry_high)}",
+        f"🛑 <b>Stop:</b> {_caption_price(stop)}",
     ]
     if targets:
-        lines.append(
-            "✅ "
-            + " · ".join(
-                f"<b>TP{index}</b> {_caption_price(target)}"
-                for index, target in enumerate(targets[:4], 1)
-            )
+        lines.extend(
+            f"✅ <b>TP{index}:</b> {_caption_price(target)}"
+            for index, target in enumerate(targets[:4], 1)
         )
+    setup_label = setup_name or f"{direction.title()} {hold_style}"
     lines += [
-        f"📊 Immediate-SL risk {immediate_risk:.0f}% · flow {order_flow:+.2f}",
+        "",
+        f"📐 <b>Setup:</b> {html.escape(setup_label)}",
+        (
+            f"📊 <b>R:R (TP2):</b> {rr_tp2:.2f} · "
+            f"Risk {risk_pct:g}% · ≤{leverage}x"
+        ),
         f"🧠 <b>Why:</b> {html.escape(reason)}",
     ]
-    if entry_reason:
-        lines.append(f"📌 <b>Execution:</b> {html.escape(entry_reason)}")
-    funding = row.get("funding_rate")
-    oi_change = row.get("open_interest_change_pct_24h")
-    derivatives = []
-    if funding is not None:
-        derivatives.append(f"funding {_number(funding) * 100:+.4f}%")
-    if oi_change is not None:
-        derivatives.append(f"OI 24h {_number(oi_change):+.2f}%")
-    if derivatives:
-        lines.append("⚙ " + " · ".join(derivatives))
+    execution_note = entry_reason
+    if not execution_note and status == "wait_retest":
+        execution_note = "Wait for retest of the zone. Do not chase."
+    elif not execution_note and status == "ready":
+        execution_note = "Enter only after the confirmation candle closes."
+    if execution_note:
+        lines += ["", f"📌 {html.escape(execution_note)}"]
     lines += [
-        f"⌛ Hold {html.escape(hold)}",
-        "<i>Wait for the stated entry condition. Educational only.</i>",
+        "",
+        "NFA · DYOR · Trade at your own risk",
     ]
     caption = "\n".join(lines)
-    # Optional details are removed before any hard truncation, preserving HTML.
-    if len(caption) > 1024 and entry_reason:
-        lines = [line for line in lines if not line.startswith("📌")]
-        caption = "\n".join(lines)
-    if len(caption) > 1024:
-        lines = [line for line in lines if not line.startswith("⚙")]
-        caption = "\n".join(lines)
     return caption
 
 
@@ -467,6 +490,66 @@ def _caption_price(value: Any) -> str:
     if price >= 1:
         return f"${price:.4f}".rstrip("0").rstrip(".")
     return f"${price:.8f}".rstrip("0").rstrip(".")
+
+
+def _caption_hold_style(
+    hold_label: Any,
+    *,
+    timeframe: str,
+    hold_hours_max: Any = None,
+) -> str:
+    """Normalize the actual plan horizon into a clear Telegram style."""
+    label = str(hold_label or "").strip().lower()
+    max_hours = _number(hold_hours_max, -1.0)
+    if label == "scalp" or (0 < max_hours <= 2):
+        return "Scalp"
+    if label in {"intraday", "intra-day"} or (2 < max_hours <= 12):
+        return "Intraday"
+    if label in {"day", "day trade", "day-trade"} or max_hours > 12:
+        return "Day"
+
+    tf = str(timeframe or "").strip().lower()
+    if tf in {"1m", "3m", "5m"}:
+        return "Scalp"
+    if tf in {"15m", "30m"}:
+        return "Intraday"
+    return "Day"
+
+
+def _caption_target_rr(
+    *,
+    direction: str,
+    entry_low: Any,
+    entry_high: Any,
+    stop: Any,
+    targets: List[Any],
+    risk_rewards: List[Any],
+) -> float:
+    if len(risk_rewards) > 1:
+        return max(0.0, _number(risk_rewards[1]))
+    if risk_rewards:
+        return max(0.0, _number(risk_rewards[0]))
+    target_index = 1 if len(targets) > 1 else 0
+    if not targets:
+        return 0.0
+    entry = (_number(entry_low) + _number(entry_high)) / 2.0
+    stop_value = _number(stop)
+    target = _number(targets[target_index])
+    risk = abs(entry - stop_value)
+    if risk <= 0:
+        return 0.0
+    reward = target - entry if direction == "LONG" else entry - target
+    return max(0.0, reward / risk)
+
+
+def _caption_session_label(slot_label: str) -> str:
+    label = str(slot_label or "").strip()
+    lowered = label.lower()
+    if "new york" in lowered or "ny " in lowered:
+        return "NY open" if "open" in lowered else "NY session"
+    if "london" in lowered:
+        return "London open" if "open" in lowered else "London session"
+    return label
 
 
 def diagnose_telegram(timeout: int = 10) -> Dict[str, Any]:
@@ -645,7 +728,7 @@ def format_prop_scan_report(
     slot_label: str = "",
     timezone: str = "Africa/Lagos",
     max_rows: int = 6,
-    min_signal_confidence: float = 68.0,
+    min_signal_confidence: float = 80.0,
     scanned_count: Optional[int] = None,
     ranked_count: Optional[int] = None,
 ) -> str:
@@ -680,6 +763,8 @@ def format_prop_scan_report(
                 "execution ≥65, and the prop-safety gate."
             ),
             "No trade is the correct position until a clean entry appears.",
+            "",
+            "NFA · DYOR · Trade at your own risk",
         ]
         return "\n".join(lines)
 
@@ -699,17 +784,13 @@ def format_prop_scan_report(
     for i, row in enumerate(ranked[:max_rows], 1):
         sym = str(row.get("symbol") or "—")
         base = sym.split("/")[0].split(":")[0]
-        price = row.get("price")
-        price_s = fmt_price(price)
         direction = str(row.get("direction") or "flat").upper()
         side_icon = "🟢" if direction == "LONG" else "🔴"
-        llm = row.get("llm_confidence")
-        llm_s = f"{float(llm):.0f}%" if llm is not None else "—"
+        confidence = _number(row.get("confidence"))
+        technical = _number(row.get("technical_confidence"))
         lev = row.get("leverage") or row.get("display_leverage") or "—"
         risk = row.get("risk_pct")
         risk_s = f"{float(risk):.2f}%" if risk is not None else "—"
-        rank = row.get("rank_score")
-        rank_s = f"{float(rank):.0f}" if rank is not None else "—"
         reason = (
             row.get("llm_confidence_reason")
             or row.get("reason")
@@ -722,19 +803,13 @@ def format_prop_scan_report(
         entry_s = (
             f"{fmt_price(entry_low)}–{fmt_price(entry_high)}"
             if entry_low is not None and entry_high is not None
-            else price_s
+            else fmt_price(row.get("price"))
         )
         entry_status = str(row.get("entry_status") or "ready").replace("_", " ").title()
         execution_score = row.get("execution_score")
         execution_s = (
             f"{float(execution_score):.0f}/100"
             if execution_score is not None
-            else "—"
-        )
-        immediate_risk = row.get("immediate_sl_risk")
-        immediate_risk_s = (
-            f"{float(immediate_risk):.0f}%"
-            if immediate_risk is not None
             else "—"
         )
         targets = list(row.get("take_profits") or [])
@@ -746,24 +821,13 @@ def format_prop_scan_report(
             )
             target_line = f"\n   {shown}"
         hold = html.escape(str(row.get("hold_label") or "intraday"))
-        bt = row.get("backtest") or {}
-        bt_line = ""
-        if bt.get("sample_ok"):
-            filled = int(bt.get("n_trades") or 0)
-            signals = int(bt.get("n_signals") or filled)
-            bt_line = (
-                f"\n   BT {float(bt.get('win_rate') or 0):.0f}% WR · "
-                f"PF {float(bt.get('profit_factor') or 0):.2f} · "
-                f"{filled}/{signals} fills · "
-                f"{float(bt.get('stop_out_rate') or 0):.0f}% stopped"
-            )
         safe_reason = html.escape(str(reason))
         lines.append(
-            f"{side_icon} <b>{i}. {html.escape(base)} {direction}</b> · LLM {llm_s}\n"
-            f"   {entry_status} · execution {execution_s} · immediate-SL risk {immediate_risk_s}\n"
-            f"   Price {price_s} · Entry {entry_s}{target_line}\n"
+            f"{side_icon} <b>{i}. {html.escape(base)} {direction}</b> · "
+            f"<b>{confidence:.0f}% Confidence</b>\n"
+            f"   Technical {technical:.0f}% · Execution {execution_s} · {entry_status}\n"
+            f"   Entry {entry_s}{target_line}\n"
             f"   SL {fmt_price(row.get('stop_loss'))} · {lev}x · risk {risk_s} · {hold}\n"
-            f"   Rank {rank_s}{bt_line}"
             + (f"\n   Why: {safe_reason}" if safe_reason else "")
             + (f"\n   ⚠ {html.escape(', '.join(flags))}" if flags else "")
         )
@@ -772,7 +836,7 @@ def format_prop_scan_report(
         f"🛡 Prop gate: <b>≥{min_signal_confidence:.0f}% blended confidence</b> · "
         "execution ≥65 · 0.5–1% risk · ≤5x"
     )
-    lines.append("Educational only · honor the stop · close within 24h")
+    lines.append("NFA · DYOR · Trade at your own risk")
     return "\n".join(lines).strip()
 
 
