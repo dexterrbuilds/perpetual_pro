@@ -62,6 +62,9 @@ def test_backtest_returns_core_metrics():
     assert result.n_signals >= result.n_trades
     assert result.unfilled_signals >= 0
     assert 0 <= result.stop_out_rate <= 100
+    assert 0 <= result.early_stop_rate <= 100
+    assert 0 <= result.win_rate_lower_bound <= 100
+    assert result.median_mae_r >= 0
     assert d["prop_settings"]["entry_wait_bars"] == 4
     assert d["prop_settings"]["fee_rate"] > 0
     for trade in d["trades"]:
@@ -69,4 +72,6 @@ def test_backtest_returns_core_metrics():
         assert trade["fees"] >= 0
         assert trade["mfe_r"] >= 0
         assert trade["mae_r"] >= 0
+        assert isinstance(trade["r_multiple"], float)
+        assert isinstance(trade["stopped_early"], bool)
     assert d["prop_settings"]["max_leverage"] <= 5

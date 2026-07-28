@@ -5,7 +5,9 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from threading import RLock
+import time
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from loguru import logger
@@ -14,10 +16,41 @@ from src.data.exchange import (
     ExchangeClient,
     MarketSnapshot,
     build_exchange_attempt_order,
+    is_permanent_exchange_access_error,
     normalize_exchange_id,
 )
 from src.utils.config import AppConfig
 from src.utils.helpers import timeframe_to_minutes
+
+
+_VENUE_HEALTH_LOCK = RLock()
+_VENUE_BLOCKED_UNTIL: Dict[str, float] = {}
+_VENUE_BLOCK_COOLDOWN_SECONDS = 30 * 60
+
+
+def _venue_is_blocked(exchange_id: str) -> bool:
+    """Return whether a venue recently produced a systemic access failure."""
+    now = time.monotonic()
+    with _VENUE_HEALTH_LOCK:
+        until = _VENUE_BLOCKED_UNTIL.get(exchange_id, 0.0)
+        if until <= now:
+            _VENUE_BLOCKED_UNTIL.pop(exchange_id, None)
+            return False
+        return True
+
+
+def _block_venue(exchange_id: str, reason: Any) -> None:
+    """Circuit-break a geo/permission-blocked venue for later scan symbols."""
+    with _VENUE_HEALTH_LOCK:
+        _VENUE_BLOCKED_UNTIL[exchange_id] = (
+            time.monotonic() + _VENUE_BLOCK_COOLDOWN_SECONDS
+        )
+    logger.warning(
+        "Venue {} circuit-breaker opened for {} minutes: {}",
+        exchange_id,
+        _VENUE_BLOCK_COOLDOWN_SECONDS // 60,
+        str(reason)[:240],
+    )
 
 
 @dataclass
@@ -30,6 +63,7 @@ class MultiTimeframeData:
     frames: Dict[str, pd.DataFrame] = field(default_factory=dict)
     snapshot: Optional[MarketSnapshot] = None
     errors: List[str] = field(default_factory=list)
+    quality: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     @property
     def primary(self) -> pd.DataFrame:
@@ -60,6 +94,94 @@ def closed_candles(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         logger.debug("Excluded incomplete {} candle at {}", timeframe, last_ts)
         return df.iloc[:-1].copy()
     return df
+
+
+def assess_candle_quality(
+    df: pd.DataFrame,
+    timeframe: str,
+    *,
+    now: Optional[pd.Timestamp] = None,
+) -> Dict[str, Any]:
+    """Score live-candle freshness and continuity without rejecting old test data."""
+    if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        return {
+            "ok": False,
+            "score": 0.0,
+            "reason": "missing_or_unindexed_candles",
+            "bars": 0,
+        }
+
+    minutes = max(1, timeframe_to_minutes(timeframe))
+    expected = pd.Timedelta(minutes=minutes)
+    current = now or pd.Timestamp(datetime.now(timezone.utc))
+    if current.tzinfo is None:
+        current = current.tz_localize("UTC")
+    last_open = df.index[-1]
+    if last_open.tzinfo is None:
+        last_open = last_open.tz_localize("UTC")
+    last_close = last_open + expected
+    age_intervals = max(
+        0.0,
+        (current - last_close).total_seconds() / max(expected.total_seconds(), 1.0),
+    )
+
+    recent = df.tail(min(160, len(df)))
+    diffs = recent.index.to_series().diff().dropna()
+    gap_ratio = (
+        float((diffs > expected * 1.5).mean())
+        if not diffs.empty
+        else 0.0
+    )
+    volumes = pd.to_numeric(recent.get("volume"), errors="coerce")
+    zero_volume_ratio = (
+        float((volumes.fillna(0) <= 0).mean())
+        if volumes is not None and len(volumes)
+        else 0.0
+    )
+    invalid_ohlc = (
+        (recent["high"] < recent[["open", "close"]].max(axis=1))
+        | (recent["low"] > recent[["open", "close"]].min(axis=1))
+        | (recent["low"] <= 0)
+        | (recent["high"] <= 0)
+    )
+    invalid_ratio = float(invalid_ohlc.mean()) if len(invalid_ohlc) else 0.0
+
+    score = 100.0
+    score -= min(55.0, age_intervals * 28.0)
+    score -= min(30.0, gap_ratio * 300.0)
+    score -= min(20.0, zero_volume_ratio * 100.0)
+    score -= min(50.0, invalid_ratio * 500.0)
+    score = max(0.0, min(100.0, score))
+    ok = bool(
+        len(df) >= 60
+        and age_intervals <= 1.5
+        and gap_ratio <= 0.08
+        and zero_volume_ratio <= 0.15
+        and invalid_ratio == 0.0
+    )
+    reasons: List[str] = []
+    if age_intervals > 1.5:
+        reasons.append(f"stale_{age_intervals:.1f}_intervals")
+    if gap_ratio > 0.08:
+        reasons.append(f"gaps_{gap_ratio:.0%}")
+    if zero_volume_ratio > 0.15:
+        reasons.append(f"zero_volume_{zero_volume_ratio:.0%}")
+    if invalid_ratio > 0:
+        reasons.append(f"invalid_ohlc_{invalid_ratio:.0%}")
+    if len(df) < 60:
+        reasons.append(f"only_{len(df)}_bars")
+    return {
+        "ok": ok,
+        "score": round(score, 1),
+        "reason": ",".join(reasons) if reasons else "fresh_continuous_closed_candles",
+        "bars": len(df),
+        "last_open": last_open.isoformat(),
+        "last_close": last_close.isoformat(),
+        "age_intervals": round(age_intervals, 3),
+        "gap_ratio": round(gap_ratio, 4),
+        "zero_volume_ratio": round(zero_volume_ratio, 4),
+        "invalid_ratio": round(invalid_ratio, 4),
+    }
 
 
 def fetch_multi_timeframe(
@@ -125,6 +247,7 @@ def fetch_multi_timeframe(
                 if kind == "ohlcv":
                     value = closed_candles(value, label)
                     result.frames[label] = value
+                    result.quality[label] = assess_candle_quality(value, label)
                     logger.info("Loaded {} · {} · {} closed bars", symbol, label, len(value))
                 else:
                     result.snapshot = value
@@ -134,6 +257,12 @@ def fetch_multi_timeframe(
                 result.errors.append(f"{label}: {exc}")
                 if kind == "ohlcv":
                     result.frames[label] = pd.DataFrame()
+                    result.quality[label] = {
+                        "ok": False,
+                        "score": 0.0,
+                        "reason": f"fetch_failed:{type(exc).__name__}",
+                        "bars": 0,
+                    }
                     logger.error("Failed multi-tf fetch {}: {}", label, exc)
                 else:
                     logger.warning("Market snapshot failed: {}", exc)
@@ -179,6 +308,14 @@ def fetch_multi_timeframe_with_fallback(
     exchanges = build_exchange_attempt_order(
         requested, config, auto_fallback=auto_fallback
     )
+    healthy = [ex for ex in exchanges if not _venue_is_blocked(ex)]
+    cooled_down = [ex for ex in exchanges if ex not in healthy]
+    if healthy and cooled_down:
+        exchanges = [*healthy, *cooled_down]
+        logger.info(
+            "Deferring temporarily blocked venues to the end: {}",
+            ", ".join(cooled_down),
+        )
     attempted: List[str] = []
     last_client: Optional[ExchangeClient] = None
     last_mtf: Optional[MultiTimeframeData] = None
@@ -228,6 +365,9 @@ def fetch_multi_timeframe_with_fallback(
                 symbol,
                 ex_id,
             )
+            failure_detail = " | ".join(mtf.errors)
+            if is_permanent_exchange_access_error(failure_detail):
+                _block_venue(ex_id, failure_detail)
             # Keep this client as last-resort shell; drop previous empty one
             if last_client is not None:
                 last_client.close()
@@ -236,6 +376,8 @@ def fetch_multi_timeframe_with_fallback(
             client = None  # ownership transferred to last_client
         except Exception as exc:  # noqa: BLE001
             logger.warning("Exchange {} failed for {}: {}", ex_id, symbol, exc)
+            if is_permanent_exchange_access_error(exc):
+                _block_venue(ex_id, exc)
             if client is not None:
                 client.close()
                 client = None

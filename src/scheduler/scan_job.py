@@ -145,6 +145,10 @@ def filter_high_confidence(
     only_prop_safe: bool,
     min_confidence: float = MIN_TELEGRAM_SIGNAL_CONFIDENCE,
     min_execution_score: float = 65.0,
+    max_immediate_sl_risk: float = 32.0,
+    max_chase_distance_atr: float = 1.0,
+    min_tp2_rr: float = 1.25,
+    max_spread_bps: float = 12.0,
 ) -> List[Dict[str, Any]]:
     confidence_floor = max(
         MIN_TELEGRAM_SIGNAL_CONFIDENCE,
@@ -167,6 +171,27 @@ def filter_high_confidence(
         execution_score = row.get("execution_score")
         if execution_score is not None and float(execution_score or 0) < min_execution_score:
             continue
+        immediate_sl_risk = row.get("immediate_sl_risk")
+        if (
+            immediate_sl_risk is not None
+            and float(immediate_sl_risk) > max_immediate_sl_risk
+        ):
+            continue
+        chase_distance = row.get("chase_distance_atr")
+        if chase_distance is not None and float(chase_distance) > max_chase_distance_atr:
+            continue
+        spread_bps = row.get("spread_bps")
+        if spread_bps is not None and float(spread_bps) > max_spread_bps:
+            continue
+        if row.get("market_quality_ok") is False:
+            continue
+        if row.get("data_quality_ok") is False:
+            continue
+        if row.get("historical_edge_ok") is False:
+            continue
+        tp2_rr = _row_tp2_rr(row)
+        if tp2_rr is not None and tp2_rr < min_tp2_rr:
+            continue
         entry_status = row.get("entry_status")
         if entry_status is not None and entry_status not in ("ready", "wait_retest"):
             continue
@@ -182,6 +207,36 @@ def filter_high_confidence(
         reverse=True,
     )
     return out
+
+
+def _row_tp2_rr(row: Dict[str, Any]) -> Optional[float]:
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    primary = (
+        payload.get("primary_setup")
+        if isinstance(payload.get("primary_setup"), dict)
+        else {}
+    )
+    risk_rewards = list(primary.get("risk_reward") or [])
+    if len(risk_rewards) > 1:
+        try:
+            return float(risk_rewards[1])
+        except (TypeError, ValueError):
+            return None
+    targets = list(row.get("take_profits") or [])
+    if len(targets) < 2:
+        return None
+    try:
+        entry = (float(row["entry_low"]) + float(row["entry_high"])) / 2.0
+        stop = float(row["stop_loss"])
+        target = float(targets[1])
+    except (KeyError, TypeError, ValueError):
+        return None
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    direction = str(row.get("direction") or "").lower()
+    reward = target - entry if direction == "long" else entry - target
+    return max(0.0, reward / risk)
 
 
 def _run_scheduled_scan_once_unlocked(
@@ -228,6 +283,14 @@ def _run_scheduled_scan_once_unlocked(
         min_execution_score=float(
             getattr(cfg.analysis, "execution_min_score", 65.0)
         ),
+        max_immediate_sl_risk=float(
+            getattr(cfg.analysis, "max_immediate_sl_risk", 32.0)
+        ),
+        max_chase_distance_atr=float(
+            getattr(cfg.analysis, "max_chase_distance_atr", 1.0)
+        ),
+        min_tp2_rr=float(getattr(cfg.analysis, "min_tp2_rr", 1.25)),
+        max_spread_bps=float(getattr(cfg.analysis, "max_spread_bps", 12.0)),
     )
     report = format_prop_scan_report(
         filtered,

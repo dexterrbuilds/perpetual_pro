@@ -26,6 +26,30 @@ from src.utils.helpers import normalize_symbol, safe_float
 # instances and returns defensive copies so callers cannot mutate cached data.
 _CACHE_LOCK = RLock()
 _MARKET_DATA_CACHE: Dict[Tuple[Any, ...], Tuple[float, Any]] = {}
+_MARKETS_LOCK = RLock()
+_MARKETS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+class PermanentExchangeAccessError(RuntimeError):
+    """The deployment cannot use this venue until its network/location changes."""
+
+
+_PERMANENT_ACCESS_MARKERS = (
+    "403 forbidden",
+    "451",
+    "restricted location",
+    "restricted jurisdiction",
+    "not available in your country",
+    "not available in your region",
+    "country is not supported",
+    "service unavailable from a restricted location",
+)
+
+
+def is_permanent_exchange_access_error(error: Any) -> bool:
+    """Identify geo/permission failures that retries cannot repair."""
+    message = str(error or "").lower()
+    return any(marker in message for marker in _PERMANENT_ACCESS_MARKERS)
 
 
 def _cache_get(key: Tuple[Any, ...]) -> Any:
@@ -92,7 +116,7 @@ DEFAULT_FALLBACK_EXCHANGES: List[str] = [
 def normalize_exchange_id(exchange_id: str) -> str:
     """Normalize friendly / alias exchange names to ccxt ids."""
     if not exchange_id:
-        return "bybit"
+        return "okx"
     raw = exchange_id.strip().lower().replace("-", "").replace("_", "")
     if raw in {"binanceusdm", "binanceus"}:
         return "binanceusdm"
@@ -110,7 +134,7 @@ def build_exchange_attempt_order(
     auto_fallback: Optional[bool] = None,
 ) -> List[str]:
     """Build ordered exchange list: preferred first, then configured fallbacks."""
-    preferred_norm = normalize_exchange_id(preferred or "bybit")
+    preferred_norm = normalize_exchange_id(preferred or "okx")
     use_fallback = (
         config.exchange.auto_fallback
         if auto_fallback is None and config
@@ -158,6 +182,12 @@ class MarketSnapshot:
     long_short_ratio: Optional[float] = None
     long_account: Optional[float] = None
     short_account: Optional[float] = None
+    spread_bps: Optional[float] = None
+    orderbook_imbalance: Optional[float] = None
+    orderbook_bid_depth: Optional[float] = None
+    orderbook_ask_depth: Optional[float] = None
+    orderbook_timestamp: Optional[int] = None
+    mark_index_basis_bps: Optional[float] = None
     raw: Dict[str, Any] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
 
@@ -179,7 +209,7 @@ class ExchangeClient:
     ) -> None:
         self.config = config
         self.exchange_cfg = exchange_cfg or (config.exchange if config else ExchangeConfig())
-        raw_id = (exchange_id or self.exchange_cfg.default or "bybit").lower()
+        raw_id = (exchange_id or self.exchange_cfg.default or "okx").lower()
         self.exchange_id = normalize_exchange_id(raw_id)
         self.cache_ttl_seconds = max(
             0,
@@ -230,16 +260,37 @@ class ExchangeClient:
         with self._markets_lock:
             if self._markets_loaded and not reload:
                 return self._exchange.markets or {}
-            try:
-                markets = self._exchange.load_markets(reload=reload)
-                self._markets_loaded = True
-                return markets
-            except ccxt.NetworkError as exc:
-                logger.warning("Network error loading markets (will try direct fetch): {}", exc)
-                return self._exchange.markets or {}
-            except ccxt.ExchangeError as exc:
-                logger.warning("Exchange error loading markets (will try direct fetch): {}", exc)
-                return self._exchange.markets or {}
+            with _MARKETS_LOCK:
+                cached = _MARKETS_CACHE.get(self.exchange_id)
+                if cached and not reload and cached[0] > time.monotonic():
+                    try:
+                        self._exchange.set_markets(cached[1])
+                        self._markets_loaded = True
+                        return self._exchange.markets or {}
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Shared markets cache rejected by {}: {}", self.exchange_id, exc)
+                try:
+                    markets = self._exchange.load_markets(reload=reload)
+                    self._markets_loaded = True
+                    _MARKETS_CACHE[self.exchange_id] = (
+                        time.monotonic() + 3600.0,
+                        markets,
+                    )
+                    return markets
+                except ccxt.NetworkError as exc:
+                    if is_permanent_exchange_access_error(exc):
+                        raise PermanentExchangeAccessError(
+                            f"{self.exchange_id} public market data is blocked: {exc}"
+                        ) from exc
+                    logger.warning("Network error loading markets (will try direct fetch): {}", exc)
+                    return self._exchange.markets or {}
+                except ccxt.ExchangeError as exc:
+                    if is_permanent_exchange_access_error(exc):
+                        raise PermanentExchangeAccessError(
+                            f"{self.exchange_id} public market data is blocked: {exc}"
+                        ) from exc
+                    logger.warning("Exchange error loading markets (will try direct fetch): {}", exc)
+                    return self._exchange.markets or {}
 
     def resolve_symbol(self, symbol: str) -> str:
         """Normalize and resolve symbol against exchange markets."""
@@ -250,6 +301,8 @@ class ExchangeClient:
             return str(cached)
         try:
             self.load_markets()
+        except PermanentExchangeAccessError:
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.debug("load_markets skipped: {}", exc)
 
@@ -356,6 +409,13 @@ class ExchangeClient:
                 time.sleep(sleep_s)
             except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
                 last_err = exc
+                if is_permanent_exchange_access_error(exc):
+                    logger.warning(
+                        "Permanent access failure on {}; skipping retries: {}",
+                        self.exchange_id,
+                        exc,
+                    )
+                    break
                 sleep_s = min(1.5 ** attempt, 10)
                 logger.warning(
                     "OHLCV fetch error (attempt {}): {}; retry in {}s", attempt, exc, sleep_s
@@ -391,7 +451,13 @@ class ExchangeClient:
                             candidate,
                             price,
                         )
-                        _cache_put(cache_key, result, getattr(self, "cache_ttl_seconds", 300))
+                        # Ticker is used as the live execution reference. Keep
+                        # the five-minute cache for closed OHLCV, not live price.
+                        _cache_put(
+                            cache_key,
+                            result,
+                            min(30, getattr(self, "cache_ttl_seconds", 300)),
+                        )
                         return result
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
@@ -533,6 +599,67 @@ class ExchangeClient:
 
         return result
 
+    def fetch_order_book_summary(
+        self,
+        symbol: str,
+        limit: int = 25,
+    ) -> Dict[str, Any]:
+        """Best-effort L2 spread and depth imbalance for execution filtering."""
+        resolved = self.resolve_symbol(symbol)
+        cache_key = ("orderbook_summary", self.exchange_id, resolved, int(limit))
+        cached = _cache_get(cache_key)
+        if isinstance(cached, dict) and cached:
+            return cached
+        try:
+            if not self._exchange.has.get("fetchOrderBook"):
+                return {}
+            book = self._exchange.fetch_order_book(resolved, limit=limit) or {}
+            bids = list(book.get("bids") or [])[:limit]
+            asks = list(book.get("asks") or [])[:limit]
+            if not bids or not asks:
+                return {}
+            best_bid = safe_float(bids[0][0])
+            best_ask = safe_float(asks[0][0])
+            mid = (best_bid + best_ask) / 2.0
+            spread_bps = (
+                (best_ask - best_bid) / mid * 10_000.0
+                if mid > 0 and best_ask >= best_bid
+                else None
+            )
+            # Amount units vary for derivatives, but the same contract units on
+            # each side make this normalized imbalance useful.
+            bid_depth = sum(
+                max(0.0, safe_float(row[1]))
+                for row in bids
+                if isinstance(row, (list, tuple)) and len(row) >= 2
+            )
+            ask_depth = sum(
+                max(0.0, safe_float(row[1]))
+                for row in asks
+                if isinstance(row, (list, tuple)) and len(row) >= 2
+            )
+            total_depth = bid_depth + ask_depth
+            imbalance = (
+                (bid_depth - ask_depth) / total_depth
+                if total_depth > 0
+                else None
+            )
+            result = {
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread_bps": spread_bps,
+                "bid_depth": bid_depth,
+                "ask_depth": ask_depth,
+                "imbalance": imbalance,
+                "timestamp": book.get("timestamp"),
+            }
+            # Order books age faster than OHLCV; never hold this for five minutes.
+            _cache_put(cache_key, result, min(15, self.cache_ttl_seconds))
+            return result
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Order book unavailable for {}: {}", resolved, exc)
+            return {}
+
     def fetch_market_snapshot(self, symbol: str) -> MarketSnapshot:
         """Compose ticker + funding + OI + L/S into one snapshot."""
         resolved = self.resolve_symbol(symbol)
@@ -552,6 +679,7 @@ class ExchangeClient:
                 "funding": pool.submit(self.fetch_funding_rate, resolved),
                 "oi": pool.submit(self.fetch_open_interest, resolved),
                 "ls": pool.submit(self.fetch_long_short_ratio, resolved),
+                "orderbook": pool.submit(self.fetch_order_book_summary, resolved, 25),
                 "oi_history": pool.submit(
                     self.fetch_open_interest_history, resolved, "1h", 24
                 ),
@@ -659,6 +787,34 @@ class ExchangeClient:
         else:
             errors.append("ls_ratio_unavailable")
 
+        orderbook = fetched["orderbook"]
+        if orderbook:
+            snap.spread_bps = (
+                safe_float(orderbook.get("spread_bps"))
+                if orderbook.get("spread_bps") is not None
+                else None
+            )
+            snap.orderbook_imbalance = (
+                safe_float(orderbook.get("imbalance"))
+                if orderbook.get("imbalance") is not None
+                else None
+            )
+            snap.orderbook_bid_depth = safe_float(orderbook.get("bid_depth")) or None
+            snap.orderbook_ask_depth = safe_float(orderbook.get("ask_depth")) or None
+            snap.orderbook_timestamp = orderbook.get("timestamp")
+            snap.raw["orderbook_summary"] = orderbook
+        else:
+            errors.append("orderbook_unavailable")
+
+        if snap.mark is not None and snap.index is not None and snap.index > 0:
+            snap.mark_index_basis_bps = (
+                (snap.mark - snap.index) / snap.index * 10_000.0
+            )
+        if snap.spread_bps is None and snap.bid > 0 and snap.ask >= snap.bid:
+            midpoint = (snap.bid + snap.ask) / 2.0
+            if midpoint > 0:
+                snap.spread_bps = (snap.ask - snap.bid) / midpoint * 10_000.0
+
         # A mark/index quote is a safer last-price fallback than returning zero.
         if not snap.last:
             snap.last = next(
@@ -666,7 +822,11 @@ class ExchangeClient:
                 0.0,
             )
         snap.errors = list(dict.fromkeys(errors))
-        _cache_put(cache_key, snap, getattr(self, "cache_ttl_seconds", 300))
+        _cache_put(
+            cache_key,
+            snap,
+            min(30, getattr(self, "cache_ttl_seconds", 300)),
+        )
         return snap
 
     def close(self) -> None:

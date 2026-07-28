@@ -395,9 +395,9 @@ def format_signal_photo_caption(
         call = f"{direction} — CONDITIONAL"
 
     reason = (
-        row.get("llm_confidence_reason")
-        or row.get("reason")
+        row.get("reason")
         or ((payload.get("key_reasons") or [""])[0])
+        or row.get("llm_confidence_reason")
         or "Multi-timeframe confluence passed"
     )
     reason = str(reason).strip()
@@ -427,6 +427,18 @@ def format_signal_photo_caption(
         risk_rewards=risk_rewards,
     )
     session = _caption_session_label(slot_label)
+    sl_risk = row.get("immediate_sl_risk")
+    spread_bps = row.get("spread_bps")
+    backtest = row.get("backtest") if isinstance(row.get("backtest"), dict) else {}
+    quality_bits = []
+    if sl_risk is not None:
+        quality_bits.append(f"SL risk {_number(sl_risk):.0f}%")
+    if spread_bps is not None:
+        quality_bits.append(f"spread {_number(spread_bps):.1f} bps")
+    if backtest.get("sample_reliable") and backtest.get("expectancy_r") is not None:
+        quality_bits.append(
+            f"historical expectancy {_number(backtest.get('expectancy_r')):+.2f}R"
+        )
 
     lines = [
         f"{icon} <b>{html.escape(symbol)} {call}</b>",
@@ -458,6 +470,8 @@ def format_signal_photo_caption(
         ),
         f"🧠 <b>Why:</b> {html.escape(reason)}",
     ]
+    if quality_bits:
+        lines.append(f"🛡 <b>Quality:</b> {html.escape(' · '.join(quality_bits))}")
     execution_note = entry_reason
     if not execution_note and status == "wait_retest":
         execution_note = "Wait for retest of the zone. Do not chase."
@@ -760,7 +774,7 @@ def format_prop_scan_report(
             + ".",
             (
                 f"Nothing passed ≥{min_signal_confidence:.0f}% confidence, "
-                "execution ≥65, and the prop-safety gate."
+                "execution/SL-risk, market-quality, R:R, and prop-safety gates."
             ),
             "No trade is the correct position until a clean entry appears.",
             "",
@@ -792,8 +806,8 @@ def format_prop_scan_report(
         risk = row.get("risk_pct")
         risk_s = f"{float(risk):.2f}%" if risk is not None else "—"
         reason = (
-            row.get("llm_confidence_reason")
-            or row.get("reason")
+            row.get("reason")
+            or row.get("llm_confidence_reason")
             or ""
         )
         if len(reason) > 120:
@@ -833,8 +847,8 @@ def format_prop_scan_report(
         )
         lines.append("")
     lines.append(
-        f"🛡 Prop gate: <b>≥{min_signal_confidence:.0f}% blended confidence</b> · "
-        "execution ≥65 · 0.5–1% risk · ≤5x"
+        f"🛡 Prop gate: <b>≥{min_signal_confidence:.0f}% calibrated confidence</b> · "
+        "clean execution · TP2 ≥1.25R · 0.5–1% risk · ≤5x"
     )
     lines.append("NFA · DYOR · Trade at your own risk")
     return "\n".join(lines).strip()

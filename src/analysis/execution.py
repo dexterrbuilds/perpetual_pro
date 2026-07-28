@@ -52,6 +52,11 @@ class ExecutionProfile:
     stop_distance_atr: float = 0.0
     immediate_sl_risk: float = 100.0
     order_flow_score: float = 0.0
+    spread_bps: Optional[float] = None
+    orderbook_imbalance: Optional[float] = None
+    orderbook_alignment: float = 0.0
+    mark_index_basis_bps: Optional[float] = None
+    market_quality_ok: bool = True
     candle_score: float = 0.0
     anchor_sources: List[str] = field(default_factory=list)
     reasons: List[str] = field(default_factory=list)
@@ -153,6 +158,7 @@ def build_execution_profile(
     direction: str,
     price: float,
     atr: float,
+    snapshot: Optional[Any] = None,
 ) -> ExecutionProfile:
     """Create a structure-clustered limit/retest entry and realistic targets."""
     if direction not in ("long", "short") or not price or not atr:
@@ -212,19 +218,59 @@ def build_execution_profile(
 
     direction_sign = 1.0 if direction == "long" else -1.0
     flow_alignment = candle.order_flow_score * direction_sign
+    spread_bps = (
+        safe_float(getattr(snapshot, "spread_bps", None))
+        if getattr(snapshot, "spread_bps", None) is not None
+        else None
+    )
+    book_imbalance = (
+        safe_float(getattr(snapshot, "orderbook_imbalance", None))
+        if getattr(snapshot, "orderbook_imbalance", None) is not None
+        else None
+    )
+    book_alignment = (
+        float(clamp(book_imbalance * direction_sign, -1, 1))
+        if book_imbalance is not None
+        else 0.0
+    )
+    basis_bps = (
+        safe_float(getattr(snapshot, "mark_index_basis_bps", None))
+        if getattr(snapshot, "mark_index_basis_bps", None) is not None
+        else None
+    )
+    adverse_basis = bool(
+        basis_bps is not None
+        and (
+            (direction == "long" and basis_bps > 18.0)
+            or (direction == "short" and basis_bps < -18.0)
+        )
+    )
+    market_quality_ok = bool(spread_bps is None or spread_bps <= 12.0)
     score = 52.0
     score += min(18.0, cluster_strength * 6.0)
     score += candle.score * 11.0
     score += flow_alignment * 10.0
+    score += book_alignment * 7.0
     score += 4.0 if candle.volume_ratio >= 1.05 else -4.0
     score -= 18.0 if candle.adverse_rejection else 0.0
     score -= 10.0 if candle.absorption else 0.0
     score -= max(0.0, chase_distance - 0.5) * 15.0
     score += 6.0 if target_rr2 >= 1.25 else -18.0
+    if spread_bps is not None:
+        if spread_bps <= 2.0:
+            score += 3.0
+        elif spread_bps > 12.0:
+            score -= 25.0
+        elif spread_bps > 7.0:
+            score -= 10.0
+    if adverse_basis:
+        score -= 6.0
     score = float(clamp(score, 0, 100))
 
     inside = entry_low <= price <= entry_high
-    if chase_distance > 1.35 or score < 55:
+    if not market_quality_ok:
+        status = "blocked"
+    elif chase_distance > 1.35 or score < 55:
         status = "avoid_chase"
     elif inside and not candle.adverse_rejection and not candle.absorption:
         status = "ready"
@@ -236,6 +282,10 @@ def build_execution_profile(
         f"Order-flow approximation {candle.order_flow_score:+.2f}",
         f"TP2 planned at {target_rr2:.2f}R",
     ]
+    if spread_bps is not None:
+        reasons.append(
+            f"L2 spread {spread_bps:.2f} bps; book alignment {book_alignment:+.2f}"
+        )
     risks: List[str] = []
     if candle.adverse_rejection:
         risks.append("Latest closed candle rejects the trade direction")
@@ -245,12 +295,20 @@ def build_execution_profile(
         risks.append(f"Price is {chase_distance:.2f} ATR from the entry; use a limit/retest")
     if target_rr2 < 1.25:
         risks.append("Structure does not offer at least 1.25R to TP2")
+    if not market_quality_ok:
+        risks.append(f"Order-book spread is too wide ({spread_bps:.2f} bps)")
+    if book_alignment < -0.45:
+        risks.append("Order-book depth is strongly adverse to the setup")
+    if adverse_basis:
+        risks.append(f"Mark/index premium is crowded against entry ({basis_bps:+.1f} bps)")
     immediate_risk = float(
         clamp(
             100.0
             - score
             + (18.0 if candle.adverse_rejection else 0.0)
-            + max(0.0, 0.95 - stop_distance / atr) * 22.0,
+            + max(0.0, 0.95 - stop_distance / atr) * 22.0
+            + (15.0 if not market_quality_ok else 0.0)
+            + (8.0 if book_alignment < -0.45 else 0.0),
             0,
             100,
         )
@@ -282,6 +340,11 @@ def build_execution_profile(
         stop_distance_atr=float(stop_distance / atr),
         immediate_sl_risk=immediate_risk,
         order_flow_score=candle.order_flow_score,
+        spread_bps=spread_bps,
+        orderbook_imbalance=book_imbalance,
+        orderbook_alignment=book_alignment,
+        mark_index_basis_bps=basis_bps,
+        market_quality_ok=market_quality_ok,
         candle_score=candle.score,
         anchor_sources=anchor_sources,
         reasons=reasons,

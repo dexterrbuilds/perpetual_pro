@@ -157,3 +157,44 @@ def test_build_exchange_attempt_order_prefers_requested():
     assert order[0] == "okx"
     assert "bybit" in order
     assert len(order) == len(set(order))
+
+
+def test_permanent_access_failure_is_deferred_for_next_symbol(monkeypatch):
+    import src.data.multi_tf as multi_tf
+
+    order = ["bybit", "okx"]
+    calls: List[str] = []
+    monkeypatch.setattr(multi_tf, "_VENUE_BLOCKED_UNTIL", {})
+    monkeypatch.setattr(
+        multi_tf,
+        "build_exchange_attempt_order",
+        lambda preferred, config=None, auto_fallback=None: list(order),
+    )
+    monkeypatch.setattr(multi_tf, "ExchangeClient", _FakeClient)
+
+    def fake_fetch(client, symbol, primary_tf, **kwargs):
+        calls.append(client.exchange_id)
+        if client.exchange_id == "bybit":
+            mtf = _empty_mtf(symbol, "bybit", primary_tf)
+            mtf.errors = ["15m: bybit 403 Forbidden restricted location"]
+            return mtf
+        return _filled_mtf(symbol, client.exchange_id, primary_tf)
+
+    monkeypatch.setattr(multi_tf, "fetch_multi_timeframe", fake_fetch)
+
+    first = fetch_multi_timeframe_with_fallback(
+        symbol="BTC",
+        primary_tf="15m",
+        preferred_exchange="bybit",
+    )
+    first.client.close()
+    assert calls == ["bybit", "okx"]
+
+    calls.clear()
+    second = fetch_multi_timeframe_with_fallback(
+        symbol="ETH",
+        primary_tf="15m",
+        preferred_exchange="bybit",
+    )
+    second.client.close()
+    assert calls == ["okx"]

@@ -36,6 +36,8 @@ class BacktestTrade:
     mfe_r: float = 0.0
     mae_r: float = 0.0
     fees: float = 0.0
+    r_multiple: float = 0.0
+    stopped_early: bool = False
 
 
 @dataclass
@@ -56,6 +58,10 @@ class BacktestResult:
     n_signals: int = 0
     unfilled_signals: int = 0
     stop_out_rate: float = 0.0
+    early_stop_rate: float = 0.0
+    expectancy_r: float = 0.0
+    median_mae_r: float = 0.0
+    win_rate_lower_bound: float = 0.0
     equity_curve: List[Dict[str, Any]] = field(default_factory=list)
     trades: List[Dict[str, Any]] = field(default_factory=list)
     prop_settings: Dict[str, Any] = field(default_factory=dict)
@@ -232,6 +238,7 @@ def run_backtest(
                     pnl = units * (open_pos["entry"] - exit_px)
                 fees = units * (open_pos["entry"] + exit_px) * fee_rate
                 pnl -= fees
+                initial_risk = max(units * risk_unit, 1e-12)
                 equity += pnl
                 peak = max(peak, equity)
                 dd = (peak - equity) / peak * 100.0 if peak > 0 else 0.0
@@ -253,6 +260,8 @@ def run_backtest(
                         mfe_r=float(open_pos["mfe_r"]),
                         mae_r=float(open_pos["mae_r"]),
                         fees=float(fees),
+                        r_multiple=float(pnl / initial_risk),
+                        stopped_early=bool(hit[0] == "sl" and held <= 2),
                     )
                 )
                 open_pos = None
@@ -361,6 +370,11 @@ def run_backtest(
             pnl = units * (open_pos["entry"] - exit_px)
         fees = units * (open_pos["entry"] + exit_px) * fee_rate
         pnl -= fees
+        risk_unit = max(
+            abs(open_pos["entry"] - open_pos["stop"]),
+            open_pos["entry"] * 1e-9,
+        )
+        initial_risk = max(units * risk_unit, 1e-12)
         equity += pnl
         trades.append(
             BacktestTrade(
@@ -379,6 +393,8 @@ def run_backtest(
                 mfe_r=float(open_pos["mfe_r"]),
                 mae_r=float(open_pos["mae_r"]),
                 fees=float(fees),
+                r_multiple=float(pnl / initial_risk),
+                stopped_early=False,
             )
         )
         curve.append({"t": str(work.index[last_i]), "equity": round(equity, 4)})
@@ -393,6 +409,11 @@ def run_backtest(
     net = equity - capital0
     stop_outs = sum(1 for t in trades if t.reason == "sl")
     stop_out_rate = stop_outs / n * 100.0 if n else 0.0
+    early_stops = sum(1 for t in trades if t.stopped_early)
+    early_stop_rate = early_stops / n * 100.0 if n else 0.0
+    expectancy_r = float(np.mean([t.r_multiple for t in trades])) if trades else 0.0
+    median_mae_r = float(np.median([t.mae_r for t in trades])) if trades else 0.0
+    win_rate_lower_bound = _wilson_lower_bound(wins, n) * 100.0 if n else 0.0
 
     # Include starting equity so a first-trade loss is not incorrectly treated
     # as a new peak with zero drawdown.
@@ -419,6 +440,10 @@ def run_backtest(
         n_signals=n_signals,
         unfilled_signals=unfilled_signals + (1 if pending is not None else 0),
         stop_out_rate=round(stop_out_rate, 2),
+        early_stop_rate=round(early_stop_rate, 2),
+        expectancy_r=round(expectancy_r, 3),
+        median_mae_r=round(median_mae_r, 3),
+        win_rate_lower_bound=round(win_rate_lower_bound, 2),
         equity_curve=curve,
         trades=[asdict(t) for t in trades[-50:]],
         prop_settings={
@@ -437,6 +462,18 @@ def run_backtest(
             f"Prop rules: risk {risk_pct}% · max lev {max_lev:.0f}x · one position at a time.",
         ],
     )
+
+
+def _wilson_lower_bound(wins: int, total: int, z: float = 1.2815515655) -> float:
+    """One-sided 90% Wilson lower bound for a small-sample win rate."""
+    if total <= 0:
+        return 0.0
+    p = max(0.0, min(1.0, wins / total))
+    z2 = z * z
+    denom = 1.0 + z2 / total
+    centre = p + z2 / (2.0 * total)
+    margin = z * np.sqrt((p * (1.0 - p) + z2 / (4.0 * total)) / total)
+    return float(max(0.0, (centre - margin) / denom))
 
 
 def _signal_direction(

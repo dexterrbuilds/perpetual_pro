@@ -435,6 +435,9 @@ class ReportGenerator:
                 "funding_average_24h": snap.funding_average_24h,
                 "open_interest": snap.open_interest,
                 "open_interest_change_pct_24h": snap.open_interest_change_pct_24h,
+                "spread_bps": snap.spread_bps,
+                "orderbook_imbalance": snap.orderbook_imbalance,
+                "mark_index_basis_bps": snap.mark_index_basis_bps,
                 "long_short_ratio": snap.long_short_ratio,
                 "percentage_24h": snap.percentage_24h,
             }

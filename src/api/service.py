@@ -161,6 +161,9 @@ def _build_analysis_payload(
             "open_interest": analysis.snapshot.open_interest,
             "open_interest_value": analysis.snapshot.open_interest_value,
             "open_interest_change_pct_24h": analysis.snapshot.open_interest_change_pct_24h,
+            "spread_bps": analysis.snapshot.spread_bps,
+            "orderbook_imbalance": analysis.snapshot.orderbook_imbalance,
+            "mark_index_basis_bps": analysis.snapshot.mark_index_basis_bps,
         }
     if analysis.news:
         payload["news"] = {
@@ -615,8 +618,16 @@ def scan_symbols(
                 analysis = engine.analyze(
                     mtf,
                     news=news_bundle,
-                    simulated_capital=req.simulated_capital or 100.0,
-                    risk_pct=req.risk_pct or 1.0,
+                    simulated_capital=(
+                        req.simulated_capital
+                        if req.simulated_capital is not None
+                        else cfg.risk.simulated_capital
+                    ),
+                    risk_pct=(
+                        req.risk_pct
+                        if req.risk_pct is not None
+                        else cfg.risk.risk_per_trade_pct
+                    ),
                     use_llm=use_llm,
                 )
                 backtest_summary: Dict[str, Any] = {}
@@ -633,41 +644,57 @@ def scan_symbols(
                         warmup=min(80, max(40, len(mtf.primary) // 3)),
                         indicator_suite=analysis.indicators,
                     )
-                    sample_ok = bt.n_trades >= 3
+                    sample_ok = bt.n_trades >= 8
+                    sample_reliable = bt.n_trades >= 12
                     validation_score = float(
                         clamp(
                             50.0
-                            + (bt.win_rate - 50.0) * 0.45
-                            + (min(bt.profit_factor, 2.5) - 1.0) * 14.0
-                            - bt.max_drawdown_pct * 2.0,
+                            + bt.expectancy_r * 18.0
+                            + (min(bt.profit_factor, 2.5) - 1.0) * 8.0
+                            + (bt.win_rate_lower_bound - 35.0) * 0.25
+                            - max(0.0, bt.early_stop_rate - 35.0) * 0.35
+                            - max(0.0, bt.max_drawdown_pct - 3.0) * 2.0,
                             0.0,
                             100.0,
                         )
                     ) if sample_ok else 50.0
+                    historical_edge_ok = bool(
+                        not sample_reliable
+                        or (
+                            bt.expectancy_r > -0.10
+                            and bt.profit_factor >= 0.75
+                            and bt.early_stop_rate <= 65.0
+                        )
+                    )
                     backtest_summary = {
                         "sample_ok": sample_ok,
+                        "sample_reliable": sample_reliable,
                         "n_signals": bt.n_signals,
                         "n_trades": bt.n_trades,
                         "unfilled_signals": bt.unfilled_signals,
                         "win_rate": bt.win_rate,
+                        "win_rate_lower_bound": bt.win_rate_lower_bound,
                         "stop_out_rate": bt.stop_out_rate,
+                        "early_stop_rate": bt.early_stop_rate,
+                        "expectancy_r": bt.expectancy_r,
+                        "median_mae_r": bt.median_mae_r,
                         "profit_factor": bt.profit_factor,
                         "max_drawdown_pct": bt.max_drawdown_pct,
                         "net_pnl_pct": bt.net_pnl_pct,
                         "validation_score": round(validation_score, 1),
+                        "historical_edge_ok": historical_edge_ok,
                     }
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Scan backtest skipped for {}: {}", normalized_symbol, exc)
                     validation_score = 50.0
                     sample_ok = False
+                    historical_edge_ok = True
 
                 model_lev = getattr(analysis.trade_plan, "leverage_suggested", 0) or 1
                 leverage = _cap_display_leverage(model_lev, SCAN_LEVERAGE_CAP)
-                llm_reason = (
-                    analysis.llm_confidence_reason
-                    or (analysis.key_reasons[:1] or [analysis.setup_name or ""])[0]
+                reason = (
+                    (analysis.key_reasons[:1] or [analysis.setup_name or ""])[0]
                 )
-                reason = llm_reason
                 plan = analysis.trade_plan
                 primary = plan.to_primary_setup() if plan else None
                 prop_safe = bool(getattr(plan, "prop_safe", True)) if plan else True
@@ -688,9 +715,13 @@ def scan_symbols(
                 )
                 live_rank_score = float(analysis.rank_score)
                 scan_rank_score = (
-                    0.90 * live_rank_score + 0.10 * validation_score
+                    live_rank_score
+                    + float(clamp((validation_score - 50.0) * 0.08, -6.0, 3.0))
                     if sample_ok
                     else live_rank_score
+                )
+                primary_quality = dict(
+                    (analysis.meta.get("data_quality") or {}).get(primary_tf) or {}
                 )
                 row = {
                     "symbol": normalized_symbol,
@@ -727,6 +758,15 @@ def scan_symbols(
                     "take_profits": list(getattr(plan, "take_profits", None) or []),
                     "hold_label": getattr(plan, "hold_label", "") if plan else "",
                     "backtest": backtest_summary,
+                    "historical_edge_ok": historical_edge_ok,
+                    "data_quality_ok": bool(
+                        analysis.meta.get("primary_data_quality_ok", True)
+                    ),
+                    "data_quality_score": round(
+                        float(primary_quality.get("score", 100.0)),
+                        1,
+                    ),
+                    "data_quality_reason": primary_quality.get("reason"),
                     "entry_status": execution.get("status", "blocked"),
                     "execution_score": round(float(execution.get("score") or 0), 1),
                     "immediate_sl_risk": round(
@@ -737,6 +777,12 @@ def scan_symbols(
                     ),
                     "order_flow_score": round(
                         float(execution.get("order_flow_score") or 0), 3
+                    ),
+                    "spread_bps": execution.get("spread_bps"),
+                    "orderbook_imbalance": execution.get("orderbook_imbalance"),
+                    "orderbook_alignment": execution.get("orderbook_alignment"),
+                    "market_quality_ok": bool(
+                        execution.get("market_quality_ok", True)
                     ),
                     "funding_rate": (
                         analysis.snapshot.funding_rate
@@ -764,6 +810,7 @@ def scan_symbols(
                         "rank_score": scan_rank_score,
                         "live_rank_score": live_rank_score,
                         "backtest": backtest_summary,
+                        "data_quality": analysis.meta.get("data_quality") or {},
                         "execution": execution,
                         "chart": chart,
                         "setup_name": analysis.setup_name,
@@ -828,8 +875,8 @@ def scan_symbols(
         "exchange": ex_id,
         "leverage_display_cap": SCAN_LEVERAGE_CAP,
         "ranking": (
-            "90% live closed-candle confluence/execution + 10% pending-fill "
-            "backtest validation (no-trade setups excluded)"
+            "Deterministic closed-candle confluence/execution with bounded "
+            "robust-sample backtest adjustment (LLM cannot promote signals)"
         ),
         "prop_mode": bool(getattr(cfg.risk, "prop_mode", True)),
     }

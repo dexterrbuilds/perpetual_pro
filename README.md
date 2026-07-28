@@ -12,16 +12,16 @@ Built to feel like a senior prop trader sitting next to you.
 
 ### Data Mode (primary)
 - Exchanges via **ccxt**: Binance USDM, Bybit, OKX, Bitget
-- Closed OHLCV + current/24h **funding**, **open interest change**, and **long/short ratio** (when available)
-- Day-trade stack: **15m execution + 1h drive + 4h confirmation**, with five-minute market-data caching and parallel fetches
+- Closed OHLCV + current/24h **funding**, **open interest change**, **long/short ratio**, and L2 spread/depth imbalance (when available)
+- Day-trade stack: **15m execution + 1h drive + 4h confirmation**, with five-minute closed-candle caching, short live-price/order-book caches, shared market metadata, and parallel fetches
 - **80+ indicators** via pandas-ta (trend, momentum, volatility, volume, Ichimoku, squeeze, etc.)
 - Market structure: Order Blocks, Fair Value Gaps, liquidity pools, BOS / CHoCH, volume profile approx
 - Candlestick + classical chart patterns with confidence scores
 - RSI / MACD / Stochastic **divergences**
 - News + lexicon sentiment (CryptoCompare / CoinGecko; CryptoPanic with token)
 - Weighted **confluence engine** (trend, momentum, structure, patterns, derivatives, MTF, volume, news)
-- Execution engine: compact OB/FVG/EMA/VWAP/volume-profile retest zones, wick/body/order-flow approximation, anti-chase filtering, structure/volatility SL, and TP1–TP4
-- Strict directional gate: low-confluence, poor-execution, and extended setups remain **bias only / no trade**
+- Execution engine: compact OB/FVG/EMA/VWAP/volume-profile retest zones, wick/body/order-flow approximation, L2 spread/imbalance checks, anti-chase filtering, structure/volatility SL, and TP1–TP4
+- Strict directional gate: stale/gapped candles, live-price dislocation, wide spreads, high immediate-SL risk, weak TP2 R:R, low confluence, and extended setups remain **bias only / no trade**
 - Risk engine: entry zone, SL, TP1–TP4, R:R, position size from account risk %
 
 ### Screen Mode (`--screen`)
@@ -39,8 +39,8 @@ Built to feel like a senior prop trader sitting next to you.
 
 ### Prop account toolkit
 - **Prop risk** (default): **0.5–1% risk per trade**, **max 5x leverage**, flags for high drawdown / wide stop / low R:R
-- **LLM confidence** with supporting vs opposing factors in reports
-- **Backtest**: `python main.py BTC --backtest --bars 500` (pending retest fills, fees/slippage, unfilled signals, stop-out rate, MFE/MAE, win rate, profit factor, max DD)
+- **LLM context/veto only** with supporting vs opposing factors; it cannot promote deterministic confidence
+- **Backtest**: `python main.py BTC --backtest --bars 500` (pending retest fills, fees/slippage, unfilled signals, early stop-out rate, expectancy in R, Wilson win-rate lower bound, MFE/MAE, profit factor, max DD)
 - **DST-aware scheduled scans** after the first London candle, after the common
   8:30 a.m. ET macro window, after the first New York cash-session candle, and
   inside the New York 3–4 p.m. liquidity/ETF window, with

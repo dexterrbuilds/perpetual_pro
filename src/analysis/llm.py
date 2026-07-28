@@ -24,8 +24,8 @@ class LLMNarrative:
     stop_loss: Dict[str, Any] = field(default_factory=dict)  # {"price": 122, "reason": "invalidates structure"}
     tps: List[Dict[str, Any]] = field(default_factory=list)  # [{"label":"TP1","price":126,"rr":0.6}]
     max_hold_hours: int = 24
-    suggested_leverage: float = 20.0
-    suggested_leverage_range: str = "20x-100x"
+    suggested_leverage: float = 5.0
+    suggested_leverage_range: str = "1x-5x prop / 10x-30x standard"
     leverage_reasoning: str = ""
     funding_impact: str = ""
     volume_confidence: float = 0.0
@@ -99,14 +99,14 @@ class NarrativeLLM:
         return self._fallback(context, provider="local_fallback")
 
     def _build_prompt(self, ctx: Dict[str, Any]) -> str:
-        # Updated prompt to request a professional trader-style trade card optimized
-        # for high-leverage crypto perpetual day-trading and scalping.
+        # The model explains an already-computed deterministic plan. It must not
+        # invent a looser stop, more leverage, or confidence beyond the engine.
         return (
             "You are a senior crypto perpetual futures day trader. "
             "Prioritize 15m, 1h, and 4h (4h for confirmation). Hold time typically 30min–12 hours (max 24h). "
-            "Leverage should be aggressive but responsible (20x–100x); avoid extreme >150x except in rare, very high conviction micro-scalps. "
+            "Respect the supplied deterministic plan. Prop mode is capped at 5x; standard day-trade mode is capped at 30x. "
             "Signal styles: short-term momentum, breakout retests, mean reversion, and intraday structure. "
-            "Entries must be tight zones with clear invalidation; include alternative entries on retests. "
+            "Never replace the supplied entry, stop, targets, or direction. Explain them and flag conflicts. "
             "CRITICAL: Score llm_confidence (0-100) as how likely THIS directional signal will play out "
             "over the suggested hold window. Flat/no-trade → llm_confidence ≤ 25. "
             "Do not inflate confidence; be skeptical of weak confluence or conflicting factors. "
@@ -129,7 +129,7 @@ class NarrativeLLM:
             '  "tps": [{"label":"TP1","price":<num>,"rr":<num>,"note":"short-term"}, ... up to 4],\n'
             '  "max_hold_hours": <int>,  /* typically 12 or 24 */\n'
             '  "suggested_leverage": <num>,\n'
-            '  "suggested_leverage_range": "20x-100x (or narrower)",\n'
+            '  "suggested_leverage_range": "1x-5x prop or 10x-30x standard",\n'
             '  "leverage_reasoning": "short justification for leverage choice",\n'
             '  "funding_impact": "how funding rate affects this trade (short)",\n'
             '  "volume_confidence": <0.0-1.0>,\n'
@@ -269,8 +269,11 @@ class NarrativeLLM:
                 "note": str(t.get("note") or "")
             } for i, t in enumerate(tps)][:4],
             max_hold_hours=int(parsed.get("max_hold_hours") or parsed.get("max_hold") or 24),
-            suggested_leverage=_safe_num(parsed.get("suggested_leverage"), 20.0) or 20.0,
-            suggested_leverage_range=str(parsed.get("suggested_leverage_range") or "20x-100x"),
+            suggested_leverage=_safe_num(parsed.get("suggested_leverage"), 5.0) or 5.0,
+            suggested_leverage_range=str(
+                parsed.get("suggested_leverage_range")
+                or "1x-5x prop / 10x-30x standard"
+            ),
             leverage_reasoning=str(parsed.get("leverage_reasoning") or ""),
             funding_impact=str(parsed.get("funding_impact") or ""),
             volume_confidence=_safe_num(parsed.get("volume_confidence"), 0.0) or 0.0,
@@ -321,7 +324,7 @@ class NarrativeLLM:
 
         risks = [
             "Crypto perps can gap; stops may slip in liquidation cascades.",
-            "High leverage (20x–100x band) amplifies liquidation risk — risk the plan, not max margin.",
+            "Leverage amplifies liquidation risk — risk the plan, not max margin.",
             "Funding and crowded positioning can reverse quickly around event risk.",
         ]
         if atr_pct and atr_pct > 2.5:
@@ -361,12 +364,12 @@ class NarrativeLLM:
         narrative = (
             f"{setup}: {direction} bias {bias} ({conf:.0f}% conf). "
             f"Confluence from short-term momentum, volume, funding and micro-structure. "
-            f"Suggested leverage ~{lev:.0f}x within 20x–100x band; tighten to ~20x if funding/ATR hostile. "
+            f"Suggested leverage ~{lev:.0f}x within the configured prop/day-trade cap. "
             f"Hold typically 30min–12h (max 24h); scale out at TP1–TP4."
         )
         lev_reason = (
             f"Leverage chosen ~{lev:.0f}x based on confidence {conf:.0f}%, ATR {atr_pct:.2f}%, funding {funding}. "
-            "Higher conf + low funding → push toward upper band; hostile funding → reduce toward 20x."
+            "Hostile funding or wider ATR requires less leverage."
         )
         scenarios = {
             "bullish": "Continuation if short-term momentum and volume expand and funding stabilizes.",
@@ -384,7 +387,7 @@ class NarrativeLLM:
             card_lines.append(f"Stop: {stop['price']:.4f} — {stop['reason']}")
         for tp in (tps[:4] if tps else []):
             card_lines.append(f"{tp['label']}: {tp['price']:.4f} ({tp['note']})")
-        card_lines.append(f"Lev: ~{lev:.0f}x (20x–100x). Hold ~30min–12h (max 24h)")
+        card_lines.append(f"Lev: ~{lev:.0f}x within configured cap. Hold ~30min–12h (max 24h)")
         trade_card = " | ".join(card_lines)
 
         conf_detail = build_heuristic_confidence_detail(
@@ -405,7 +408,7 @@ class NarrativeLLM:
             tps=tps,
             max_hold_hours=24,
             suggested_leverage=lev,
-            suggested_leverage_range="20x-100x",
+            suggested_leverage_range="1x-5x prop / 10x-30x standard",
             leverage_reasoning=lev_reason,
             funding_impact=(f"Funding {funding}%" if funding is not None else "n/a"),
             volume_confidence=float(ctx.get("volume_confidence") or 0.0),
@@ -566,12 +569,14 @@ def combined_rank_score(
     llm_confidence: float,
     technical_confidence: float,
     confluence_total: float = 0.0,
+    execution_score: float = 50.0,
 ) -> float:
     """
     Rank score for directional setups only.
 
     Flat/neutral → 0 (excluded from leaderboard).
-    Else: 60% LLM confidence + 40% technical (conf + |confluence|).
+    LLM is context only. Ranking is 95% deterministic technical/confluence/
+    execution quality and 5% model agreement.
     """
     direction = (direction or "flat").lower()
     if direction not in ("long", "short"):
@@ -579,5 +584,11 @@ def combined_rank_score(
     llm_c = max(0.0, min(100.0, float(llm_confidence or 0.0)))
     tech_c = max(0.0, min(100.0, float(technical_confidence or 0.0)))
     conf_boost = abs(float(confluence_total or 0.0)) * 100.0
-    technical_blend = 0.7 * tech_c + 0.3 * conf_boost
-    return round(0.6 * llm_c + 0.4 * technical_blend, 3)
+    execution_c = max(0.0, min(100.0, float(execution_score or 0.0)))
+    return round(
+        0.55 * tech_c
+        + 0.20 * conf_boost
+        + 0.20 * execution_c
+        + 0.05 * llm_c,
+        3,
+    )

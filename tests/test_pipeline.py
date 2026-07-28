@@ -16,7 +16,7 @@ from src.analysis.confluence import ConfluenceEngine
 from src.analysis.indicators import compute_indicators
 from src.data.exchange import MarketSnapshot
 from src.data.multi_tf import MultiTimeframeData
-from src.data.multi_tf import closed_candles
+from src.data.multi_tf import assess_candle_quality, closed_candles
 from src.data.news import NewsBundle, NewsItem
 from src.report.generator import ReportGenerator
 from src.utils.config import load_config
@@ -62,6 +62,32 @@ def test_incomplete_exchange_candle_is_removed():
     historical = df.copy()
     historical.index = historical.index - pd.Timedelta(days=2)
     assert len(closed_candles(historical, "15m")) == 4
+
+
+def test_live_candle_quality_rejects_stale_or_gapped_data():
+    now = pd.Timestamp("2026-07-28T12:00:00Z")
+    idx = pd.date_range(end=now - pd.Timedelta(minutes=15), periods=100, freq="15min")
+    df = pd.DataFrame(
+        {
+            "open": [100.0] * 100,
+            "high": [101.0] * 100,
+            "low": [99.0] * 100,
+            "close": [100.5] * 100,
+            "volume": [1000.0] * 100,
+        },
+        index=idx,
+    )
+    fresh = assess_candle_quality(df, "15m", now=now)
+    assert fresh["ok"] is True
+    assert fresh["age_intervals"] == 0
+
+    stale = assess_candle_quality(
+        df.iloc[:-8],
+        "15m",
+        now=now,
+    )
+    assert stale["ok"] is False
+    assert "stale" in stale["reason"]
 
 
 def test_full_confluence_pipeline(tmp_path):
@@ -137,3 +163,36 @@ def test_full_confluence_pipeline(tmp_path):
     assert "confluence_total" in payload
     assert "primary_setup" in payload
     assert "position_simulation" in payload
+
+
+def test_stale_confirmation_timeframe_blocks_live_signal():
+    cfg = load_config(ROOT / "config.yaml")
+    primary = _ohlcv(320, drift=0.12)
+    h1 = primary.resample("1h").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    ).dropna()
+    h4 = primary.resample("4h").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    ).dropna()
+    mtf = MultiTimeframeData(
+        symbol="BTC/USDT:USDT",
+        exchange_id="okx",
+        primary_tf="15m",
+        frames={"15m": primary, "1h": h1, "4h": h4},
+        snapshot=MarketSnapshot(
+            symbol="BTC/USDT:USDT",
+            exchange_id="okx",
+            last=float(primary["close"].iloc[-1]),
+        ),
+        quality={
+            "15m": {"ok": True, "score": 100.0, "reason": "fresh"},
+            "1h": {"ok": False, "score": 20.0, "reason": "stale_3.0_intervals"},
+            "4h": {"ok": True, "score": 100.0, "reason": "fresh"},
+        },
+    )
+
+    result = ConfluenceEngine(cfg).analyze(mtf, use_llm=False)
+
+    assert result.meta["primary_data_quality_ok"] is False
+    assert result.confidence <= 45.0
+    assert result.meta["signal_eligible"] is False

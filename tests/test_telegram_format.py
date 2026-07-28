@@ -176,6 +176,66 @@ def test_filter_rejects_weak_execution_and_signal_gate():
     )
 
 
+def test_filter_rejects_immediate_stop_market_data_and_backtest_risks():
+    base = {
+        "direction": "long",
+        "confidence": 86,
+        "llm_confidence": 75,
+        "rank_score": 78,
+        "prop_safe": True,
+        "signal_eligible": True,
+        "entry_status": "wait_retest",
+        "execution_score": 78,
+        "immediate_sl_risk": 20,
+        "chase_distance_atr": 0.5,
+        "spread_bps": 2.0,
+        "market_quality_ok": True,
+        "data_quality_ok": True,
+        "historical_edge_ok": True,
+        "payload": {"primary_setup": {"risk_reward": [0.8, 1.4, 2.0]}},
+    }
+    assert len(
+        filter_high_confidence(
+            [base],
+            min_llm=65,
+            min_rank=50,
+            only_prop_safe=True,
+        )
+    ) == 1
+
+    for field, bad_value in (
+        ("immediate_sl_risk", 40),
+        ("chase_distance_atr", 1.2),
+        ("spread_bps", 15),
+        ("market_quality_ok", False),
+        ("data_quality_ok", False),
+        ("historical_edge_ok", False),
+    ):
+        row = dict(base)
+        row[field] = bad_value
+        assert (
+            filter_high_confidence(
+                [row],
+                min_llm=65,
+                min_rank=50,
+                only_prop_safe=True,
+            )
+            == []
+        )
+
+    low_rr = dict(base)
+    low_rr["payload"] = {"primary_setup": {"risk_reward": [0.7, 1.1]}}
+    assert (
+        filter_high_confidence(
+            [low_rr],
+            min_llm=65,
+            min_rank=50,
+            only_prop_safe=True,
+        )
+        == []
+    )
+
+
 def test_next_slot_datetime_future():
     from datetime import datetime
     from zoneinfo import ZoneInfo

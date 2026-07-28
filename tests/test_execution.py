@@ -16,6 +16,7 @@ from src.analysis.execution import analyze_candles, build_execution_profile
 from src.analysis.indicators import IndicatorSuite
 from src.analysis.market_structure import StructureLevel, StructureReport
 from src.analysis.risk import RiskManager
+from src.data.exchange import MarketSnapshot
 from src.report.charts import build_market_chart_payload, render_signal_chart_png
 from src.utils.config import RiskConfig
 
@@ -141,3 +142,31 @@ def test_adverse_rejection_wick_is_detected():
     assert context.adverse_rejection is True
     assert context.upper_wick_ratio > 0.45
     assert any("do not enter" in note.lower() for note in context.notes)
+
+
+def test_wide_spread_blocks_otherwise_valid_entry():
+    df = _execution_df()
+    suite = IndicatorSuite(
+        df=df,
+        summary={"ema_fast": 100.15, "ema_mid": 100.0, "vwap": 99.95, "atr": 1.0},
+    )
+    snapshot = MarketSnapshot(
+        symbol="BTC/USDT:USDT",
+        exchange_id="bybit",
+        last=100.7,
+        spread_bps=18.0,
+        orderbook_imbalance=-0.6,
+    )
+    profile = build_execution_profile(
+        df,
+        suite,
+        _structure(),
+        direction="long",
+        price=100.7,
+        atr=1.0,
+        snapshot=snapshot,
+    )
+    assert profile.status == "blocked"
+    assert profile.market_quality_ok is False
+    assert profile.spread_bps == 18.0
+    assert profile.immediate_sl_risk > 32

@@ -151,9 +151,22 @@ class ConfluenceEngine:
             result.warnings.extend(ind.errors)
 
         atr = safe_float(ind.summary.get("atr"), primary["high"].iloc[-14:].sub(primary["low"].iloc[-14:]).mean())
-        price = safe_float(ind.summary.get("close"), primary["close"].iloc[-1])
+        closed_price = safe_float(ind.summary.get("close"), primary["close"].iloc[-1])
+        price = closed_price
         if mtf.snapshot and mtf.snapshot.last:
             price = mtf.snapshot.last
+        live_move_atr = abs(price - closed_price) / max(atr, closed_price * 1e-9)
+        live_move_pct = (
+            abs(price - closed_price) / closed_price * 100.0
+            if closed_price > 0
+            else 0.0
+        )
+        live_price_ok = bool(live_move_atr <= 4.0 and live_move_pct <= 4.0)
+        if not live_price_ok:
+            result.warnings.append(
+                "Live price moved too far from the latest closed candle "
+                f"({live_move_atr:.1f} ATR / {live_move_pct:.1f}%) — signal blocked."
+            )
 
         # --- Patterns & structure ---
         pat = self.patterns.detect(primary)
@@ -263,8 +276,53 @@ class ConfluenceEngine:
             direction=direction,
             price=price,
             atr=atr,
+            snapshot=mtf.snapshot,
         )
         result.execution = execution
+        quality_map = dict(mtf.quality or {})
+        primary_quality = dict(quality_map.get(mtf.primary_tf) or {})
+        required_quality = {
+            tf: dict(quality_map.get(tf) or {})
+            for tf in [mtf.primary_tf, "1h", "4h"]
+            if tf in mtf.frames
+        }
+        # Historical/unit callers may not supply live-quality metadata. When
+        # the live fetcher does supply it, all requested confirmation frames
+        # must be fresh and continuous before a directional signal can pass.
+        mtf_data_quality_ok = bool(
+            not quality_map
+            or (
+                required_quality
+                and all(q.get("ok", False) for q in required_quality.values())
+            )
+        )
+        data_quality_ok = mtf_data_quality_ok and live_price_ok
+        data_quality_score = min(
+            [
+                safe_float(q.get("score"), 0.0)
+                for q in required_quality.values()
+            ]
+            or [100.0]
+        )
+
+        # Overall confidence is deterministic. Execution can confirm a clean
+        # entry or penalize one likely to stop immediately, but a language model
+        # is never allowed to promote a weak technical setup.
+        execution_adjustment = float(
+            clamp((execution.score - 70.0) * 0.12, -10.0, 3.0)
+        )
+        sl_penalty = max(0.0, execution.immediate_sl_risk - 28.0) * 0.20
+        quality_penalty = max(0.0, 75.0 - data_quality_score) * 0.20
+        calibrated_conf = float(
+            clamp(
+                conf + execution_adjustment - sl_penalty - quality_penalty,
+                self.config.analysis.min_confidence,
+                self.config.analysis.max_confidence,
+            )
+        )
+        if not data_quality_ok:
+            calibrated_conf = min(calibrated_conf, 45.0)
+        result.confidence = calibrated_conf
 
         # Trade plan — structure-clustered retest entry, stop, and targets.
         funding = mtf.snapshot.funding_rate if mtf.snapshot else None
@@ -273,7 +331,7 @@ class ConfluenceEngine:
             price=price,
             atr=atr,
             structure_stops=(support, resistance),
-            confidence=conf,
+            confidence=calibrated_conf,
             funding_rate=funding,
             primary_tf=mtf.primary_tf,
             setup_name=result.setup_name,
@@ -285,7 +343,7 @@ class ConfluenceEngine:
             price=price,
             atr=atr,
             bias=bias,
-            confidence=conf,
+            confidence=calibrated_conf,
             support=support,
             resistance=resistance,
         )
@@ -299,7 +357,23 @@ class ConfluenceEngine:
         funding_pct = (funding * 100.0) if funding is not None else None
 
         # LLM narrative (Groq / Gemini / local fallback) — includes play-out confidence
-        if use_llm:
+        llm_candidate = bool(
+            use_llm
+            and direction in ("long", "short")
+            and calibrated_conf
+            >= float(
+                getattr(
+                    self.config.analysis,
+                    "directional_confidence_threshold",
+                    68.0,
+                )
+            )
+            - 5.0
+            and execution.score
+            >= float(getattr(self.config.analysis, "execution_min_score", 65.0)) - 5.0
+            and data_quality_ok
+        )
+        if llm_candidate:
             try:
                 llm_ctx = {
                     "symbol": result.symbol,
@@ -307,7 +381,7 @@ class ConfluenceEngine:
                     "primary_tf": result.primary_tf,
                     "bias": bias,
                     "direction": direction,
-                    "confidence": conf,
+                    "confidence": calibrated_conf,
                     "price": price,
                     "setup_name": result.setup_name,
                     "confluence_total": result.confluence_total,
@@ -331,9 +405,15 @@ class ConfluenceEngine:
                 else:
                     result.trader_commentary = self._commentary(result)
                 if narrative.key_reasons:
-                    result.key_reasons = narrative.key_reasons
+                    result.key_reasons = list(
+                        dict.fromkeys(
+                            [*result.key_reasons, *narrative.key_reasons]
+                        )
+                    )[:8]
                 if narrative.key_risks:
-                    result.key_risks = narrative.key_risks
+                    result.key_risks = list(
+                        dict.fromkeys([*result.key_risks, *narrative.key_risks])
+                    )[:8]
                 # Enrich scenario narratives if provided
                 if result.scenarios and narrative.scenarios:
                     for key in ("bullish", "base", "bearish"):
@@ -355,7 +435,7 @@ class ConfluenceEngine:
                 result.trader_commentary = self._commentary(result)
                 result.llm_confidence, result.llm_confidence_reason = heuristic_llm_confidence(
                     direction=direction,
-                    technical_confidence=conf,
+                    technical_confidence=calibrated_conf,
                     confluence_total=result.confluence_total,
                     atr_pct=plan.atr_pct,
                     funding_rate_pct=funding_pct,
@@ -368,13 +448,13 @@ class ConfluenceEngine:
                     conf_reason=result.llm_confidence_reason,
                     factors=result.factor_breakdown(),
                     confluence_total=result.confluence_total,
-                    technical_confidence=conf,
+                    technical_confidence=calibrated_conf,
                 )
         else:
             result.trader_commentary = self._commentary(result)
             result.llm_confidence, result.llm_confidence_reason = heuristic_llm_confidence(
                 direction=direction,
-                technical_confidence=conf,
+                technical_confidence=calibrated_conf,
                 confluence_total=result.confluence_total,
                 atr_pct=plan.atr_pct,
                 funding_rate_pct=funding_pct,
@@ -387,7 +467,7 @@ class ConfluenceEngine:
                 conf_reason=result.llm_confidence_reason,
                 factors=result.factor_breakdown(),
                 confluence_total=result.confluence_total,
-                technical_confidence=conf,
+                technical_confidence=calibrated_conf,
             )
 
         if not result.llm_confidence_reason:
@@ -395,24 +475,15 @@ class ConfluenceEngine:
                 f"Play-out score {result.llm_confidence:.0f}% for {direction}."
             )
 
-        # Flat/neutral: keep low priority; directional: blend display confidence
-        if direction in ("long", "short"):
-            if result.llm_confidence > 0:
-                # Primary confidence leans on LLM play-out, anchored by technical
-                result.confidence = float(
-                    clamp(
-                        0.55 * result.llm_confidence + 0.45 * conf,
-                        self.config.analysis.min_confidence,
-                        self.config.analysis.max_confidence,
-                    )
-                )
-        else:
+        # LLM confidence is a narrative/veto field only. It cannot raise the
+        # deterministic execution-calibrated confidence.
+        if direction not in ("long", "short"):
             # Do not present flat setups as high-confidence trades
             result.llm_confidence = min(float(result.llm_confidence or 0.0), 25.0)
-            result.confidence = min(conf, 30.0)
+            result.confidence = min(calibrated_conf, 30.0)
 
-        # Prop eligibility is based on the final blended confidence, not the
-        # earlier technical-only estimate used to draft the initial plan.
+        # Prop eligibility is based on deterministic confidence calibrated by
+        # execution and data quality.
         confidence_floor = float(
             getattr(self.config.analysis, "directional_confidence_threshold", 68.0)
         )
@@ -421,6 +492,9 @@ class ConfluenceEngine:
         )
         execution_floor = float(
             getattr(self.config.analysis, "execution_min_score", 65.0)
+        )
+        max_immediate_sl_risk = float(
+            getattr(self.config.analysis, "max_immediate_sl_risk", 32.0)
         )
         self.risk.apply_prop_confidence_gate(
             plan, result.confidence, minimum=confidence_floor
@@ -431,6 +505,9 @@ class ConfluenceEngine:
             and abs(result.confluence_total) >= score_floor
             and execution.score >= execution_floor
             and execution.status in ("ready", "wait_retest")
+            and execution.immediate_sl_risk <= max_immediate_sl_risk
+            and execution.market_quality_ok
+            and data_quality_ok
             and getattr(plan, "prop_safe", True)
         )
         if direction in ("long", "short") and not signal_eligible:
@@ -449,6 +526,28 @@ class ConfluenceEngine:
                 )
             if execution.status not in ("ready", "wait_retest"):
                 gate_reasons.append(execution.status.replace("_", " "))
+            if execution.immediate_sl_risk > max_immediate_sl_risk:
+                gate_reasons.append(
+                    f"immediate-SL risk {execution.immediate_sl_risk:.0f}%"
+                )
+            if not execution.market_quality_ok:
+                gate_reasons.append("wide spread / poor market quality")
+            if not data_quality_ok:
+                failed_quality = [
+                    f"{tf}:{q.get('reason', 'invalid')}"
+                    for tf, q in required_quality.items()
+                    if not q.get("ok", False)
+                ]
+                gate_reasons.append(
+                    (
+                        f"live price dislocation {live_move_atr:.1f} ATR"
+                        if not live_price_ok
+                        else (
+                            "market data quality: "
+                            + ", ".join(failed_quality or ["invalid"])
+                        )
+                    )
+                )
             if not plan.prop_safe:
                 gate_reasons.append("prop risk gate")
             result.direction = "flat"
@@ -476,6 +575,7 @@ class ConfluenceEngine:
             llm_confidence=result.llm_confidence,
             technical_confidence=result.technical_confidence,
             confluence_total=result.confluence_total,
+            execution_score=execution.score,
         )
 
         result.meta = {
@@ -504,6 +604,11 @@ class ConfluenceEngine:
             "prop_flags": list(getattr(plan, "prop_flags", None) or []),
             "signal_eligible": signal_eligible,
             "execution": execution.to_dict(),
+            "data_quality": dict(mtf.quality or {}),
+            "primary_data_quality_ok": data_quality_ok,
+            "live_price_ok": live_price_ok,
+            "live_move_atr": round(live_move_atr, 3),
+            "live_move_pct": round(live_move_pct, 3),
             "holding_window": "30m–24h",
             "indicator_timeframes_computed": sorted(indicator_suites),
         }
@@ -548,6 +653,12 @@ class ConfluenceEngine:
 
         for tf, df in mtf.frames.items():
             if df is None or df.empty or len(df) < 30:
+                continue
+            quality = dict((mtf.quality or {}).get(tf) or {})
+            if quality and not quality.get("ok", False):
+                notes.append(
+                    f"{tf}: excluded for data quality ({quality.get('reason', 'invalid')})"
+                )
                 continue
             ind = (indicator_suites or {}).get(tf)
             if ind is None:
@@ -856,13 +967,13 @@ class ConfluenceEngine:
         )
 
     def _commentary(self, a: FullAnalysis) -> str:
-        """Day-trader / scalper narrative for high-leverage perps."""
+        """Day-trader narrative for selective, prop-aware crypto perps."""
         parts: List[str] = []
         price = a.meta.get("price") if a.meta else None
         parts.append(
             f"Day-trade read on {a.primary_tf} {a.symbol}: {a.bias} lean "
             f"({a.confidence:.0f}% conf, confluence {a.confluence_total:+.3f}). "
-            f"Engine is weighted for momentum, volume, funding, and micro-structure."
+            f"Engine is weighted for trend, momentum, structure, volume, and execution quality."
         )
         if a.structure:
             parts.append(a.structure.summary + ".")
@@ -921,21 +1032,17 @@ class ConfluenceEngine:
         funding: Optional[float],
     ) -> List[str]:
         risks = [
-            "High-leverage perps (20x–100x) liquidate fast — risk % of capital at the stop, not max margin.",
+            "Leveraged perps can liquidate quickly — risk % of capital at the stop, not max margin.",
             "Day-trade / scalp: thesis should resolve intraday (30min–12h); do not turn losers into swings.",
             "Simulation only — not live account advice.",
         ]
         atr_pct = (atr / price * 100) if price else 0
         if atr_pct > 2.0:
-            risks.append(f"Elevated ATR ({atr_pct:.2f}% of price) — cut leverage toward 20x and trail after TP1.")
+            risks.append(f"Elevated ATR ({atr_pct:.2f}% of price) — reduce leverage and wait for a wider structural invalidation.")
         if funding is not None and abs(funding) > 0.0003:
             risks.append(f"Funding not neutral ({funding*100:+.4f}%) — squeeze / funding bleed risk.")
         if a.confidence < 45:
             risks.append("Confidence below 45% — skip or micro size only.")
         if a.trade_plan and a.trade_plan.quality == "poor":
             risks.append("Plan quality poor — do not force the trade.")
-        if a.trade_plan and (a.trade_plan.leverage_suggested or 0) >= 50:
-            risks.append("Suggested leverage ≥50x — bank partials at TP1 and never move stop against you.")
-        if a.trade_plan and (a.trade_plan.leverage_suggested or 0) >= 90:
-            risks.append("Suggested leverage ≥90x — extreme leverage, use only on highest conviction scalps and micro-size positions.")
         return risks[:8]

@@ -323,10 +323,9 @@ class RiskManager:
         else:
             tp_mults = list(self.DEFAULT_TP_MULTS)
 
-        # High conviction → slightly tighter stop; low conf → slightly wider
-        if confidence >= 75:
-            stop_mult *= 0.85
-        elif confidence < 45:
+        # Stops follow volatility/structure, never confidence. A high score is
+        # not evidence that normal candle noise has become smaller.
+        if confidence < 45:
             stop_mult *= 1.1
 
         support, resistance = (None, None)
@@ -492,12 +491,17 @@ class RiskManager:
         prop_flags = self._prop_flags(
             atr_pct=atr_pct,
             primary_rr=evaluation_rr,
-            min_rr=float(min_rr or 1.2),
+            min_rr=float(min_rr or 1.25),
             effective_risk_pct=effective_risk_pct,
             confidence=confidence,
             lev=lev,
             entry_status=str(execution.get("status") or "ready"),
             execution_score=safe_float(execution.get("score"), 100.0),
+            immediate_sl_risk=safe_float(
+                execution.get("immediate_sl_risk"),
+                0.0,
+            ),
+            market_quality_ok=bool(execution.get("market_quality_ok", True)),
         )
         prop_safe = not any(
             f in prop_flags
@@ -508,6 +512,8 @@ class RiskManager:
                 "LOW_CONFIDENCE",
                 "POOR_EXECUTION",
                 "AVOID_CHASE",
+                "IMMEDIATE_SL_RISK",
+                "MARKET_QUALITY",
             )
         )
 
@@ -609,6 +615,8 @@ class RiskManager:
             "LOW_CONFIDENCE",
             "POOR_EXECUTION",
             "AVOID_CHASE",
+            "IMMEDIATE_SL_RISK",
+            "MARKET_QUALITY",
         }
         plan.prop_flags = list(dict.fromkeys(plan.prop_flags))
         plan.prop_safe = not any(flag in unsafe for flag in plan.prop_flags)
@@ -625,6 +633,8 @@ class RiskManager:
         lev: float,
         entry_status: str = "ready",
         execution_score: float = 100.0,
+        immediate_sl_risk: float = 0.0,
+        market_quality_ok: bool = True,
     ) -> List[str]:
         flags: List[str] = []
         if not self.prop_mode:
@@ -640,6 +650,10 @@ class RiskManager:
             flags.append("LOW_CONFIDENCE")
         if execution_score < 65:
             flags.append("POOR_EXECUTION")
+        if immediate_sl_risk > 32:
+            flags.append("IMMEDIATE_SL_RISK")
+        if not market_quality_ok:
+            flags.append("MARKET_QUALITY")
         if entry_status in ("avoid_chase", "blocked"):
             flags.append("AVOID_CHASE")
         if lev >= self.PROP_LEV_CEILING - 1e-9:

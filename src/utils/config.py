@@ -19,13 +19,13 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 
 @dataclass
 class ExchangeConfig:
-    default: str = "bybit"
+    default: str = "okx"
     auto_fallback: bool = True
     fallback_exchanges: List[str] = field(
         default_factory=lambda: [
+            "okx",
             "bybit",
             "binanceusdm",
-            "okx",
             "bitget",
             "mexc",
             "bingx",
@@ -58,7 +58,7 @@ class RiskConfig:
     # Leverage bounds (prop default 1–5; day-trade mode uses 10–30)
     leverage_ceiling: float = 5.0
     leverage_floor: float = 1.0
-    min_rr: float = 1.2
+    min_rr: float = 1.25
     default_stop_atr_mult: float = 1.0
     default_tp_atr_mults: List[float] = field(default_factory=lambda: [0.7, 1.3, 2.0, 3.0])
     # Legacy alias (read-only migration)
@@ -119,6 +119,10 @@ class AnalysisConfig:
     directional_score_threshold: float = 0.20
     directional_confidence_threshold: float = 68.0
     execution_min_score: float = 65.0
+    max_immediate_sl_risk: float = 32.0
+    max_chase_distance_atr: float = 1.0
+    max_spread_bps: float = 12.0
+    min_tp2_rr: float = 1.25
 
 
 @dataclass
@@ -225,7 +229,7 @@ class SchedulerConfig:
         ]
     )
     watchlist: List[str] = field(default_factory=list)
-    exchange: str = "bybit"
+    exchange: str = "okx"
     timeframe: str = "15m"
     no_news: bool = False
     only_prop_safe: bool = True
@@ -290,7 +294,7 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
     default_max_lev = 5 if prop_mode else 30
     return AppConfig(
         exchange=ExchangeConfig(
-            default=str(ex.get("default", "bybit")),
+            default=str(ex.get("default", "okx")),
             auto_fallback=bool(ex.get("auto_fallback", True)),
             fallback_exchanges=list(
                 ex.get(
@@ -328,7 +332,7 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             leverage_ceiling=float(risk.get("leverage_ceiling", risk.get("max_leverage", default_lev_ceil))),
             leverage_floor=float(risk.get("leverage_floor", default_lev_floor)),
             max_leverage=int(risk.get("max_leverage", risk.get("leverage_ceiling", default_max_lev))),
-            min_rr=float(risk.get("min_rr", 1.2)),
+            min_rr=float(risk.get("min_rr", 1.25)),
             default_stop_atr_mult=float(risk.get("default_stop_atr_mult", 1.0)),
             default_tp_atr_mults=list(risk.get("default_tp_atr_mults", [0.7, 1.3, 2.0, 3.0])),
         ),
@@ -367,6 +371,12 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
                 an.get("directional_confidence_threshold", 68)
             ),
             execution_min_score=float(an.get("execution_min_score", 65)),
+            max_immediate_sl_risk=float(an.get("max_immediate_sl_risk", 32)),
+            max_chase_distance_atr=float(
+                an.get("max_chase_distance_atr", 1.0)
+            ),
+            max_spread_bps=float(an.get("max_spread_bps", 12.0)),
+            min_tp2_rr=float(an.get("min_tp2_rr", 1.25)),
         ),
         news=NewsConfig(
             enabled=bool(news.get("enabled", True)),
@@ -464,7 +474,7 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
                 if isinstance(item, dict)
             ],
             watchlist=list(sched.get("watchlist", [])),
-            exchange=str(sched.get("exchange", "bybit") or "bybit"),
+            exchange=str(sched.get("exchange", "okx") or "okx"),
             timeframe=str(sched.get("timeframe", "15m") or "15m"),
             no_news=bool(sched.get("no_news", False)),
             only_prop_safe=bool(sched.get("only_prop_safe", True)),

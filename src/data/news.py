@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import re
+import copy
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -13,6 +16,10 @@ from loguru import logger
 
 from src.utils.config import AppConfig, NewsConfig
 from src.utils.helpers import clamp, symbol_base, utc_now_iso
+
+
+_PUBLIC_NEWS_LOCK = RLock()
+_PUBLIC_NEWS_CACHE: Dict[str, tuple[float, Any]] = {}
 
 
 @dataclass
@@ -215,9 +222,12 @@ class NewsAnalyzer:
         items: List[NewsItem] = []
         try:
             url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN"
-            resp = self.session.get(url, timeout=15)
-            resp.raise_for_status()
-            payload = resp.json()
+            payload = self._cached_public_json(
+                "cryptocompare:en",
+                url,
+                timeout=15,
+                ttl_seconds=300,
+            )
             rows = payload.get("Data") or []
             base_l = base.lower()
             for row in rows:
@@ -250,9 +260,14 @@ class NewsAnalyzer:
         # Secondary: Gecko trending as soft macro signal (not classic news)
         try:
             url = "https://api.coingecko.com/api/v3/search/trending"
-            resp = self.session.get(url, timeout=12)
-            if resp.ok:
-                coins = (resp.json() or {}).get("coins") or []
+            trending_payload = self._cached_public_json(
+                "coingecko:trending",
+                url,
+                timeout=12,
+                ttl_seconds=300,
+            )
+            if trending_payload:
+                coins = (trending_payload or {}).get("coins") or []
                 names = []
                 hit = False
                 for c in coins[:10]:
@@ -279,6 +294,28 @@ class NewsAnalyzer:
             logger.debug("CoinGecko trending failed: {}", exc)
 
         return items
+
+    def _cached_public_json(
+        self,
+        key: str,
+        url: str,
+        *,
+        timeout: int,
+        ttl_seconds: int,
+    ) -> Any:
+        """Share market-wide news responses across every symbol in one scan."""
+        with _PUBLIC_NEWS_LOCK:
+            cached = _PUBLIC_NEWS_CACHE.get(key)
+            if cached and cached[0] > time.monotonic():
+                return copy.deepcopy(cached[1])
+            resp = self.session.get(url, timeout=timeout)
+            resp.raise_for_status()
+            payload = resp.json()
+            _PUBLIC_NEWS_CACHE[key] = (
+                time.monotonic() + max(1, ttl_seconds),
+                copy.deepcopy(payload),
+            )
+            return payload
 
     def _score_text(self, text: str) -> float:
         """Lexicon + config keyword sentiment in [-1, 1]."""

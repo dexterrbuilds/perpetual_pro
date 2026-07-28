@@ -1,12 +1,14 @@
 # perpetual_pro — crypto perpetuals day-trading / scalping configuration
 
 exchange:
-  default: bybit
+  # Railway's US region cannot reach Bybit/Binance futures; OKX is the verified
+  # working primary data venue there. Fallback remains automatic.
+  default: okx
   auto_fallback: true
   fallback_exchanges:
+    - okx
     - bybit
     - binanceusdm
-    - okx
     - bitget
     - mexc
     - bingx
@@ -36,7 +38,7 @@ risk:
   max_leverage: 5
   leverage_ceiling: 5.0
   leverage_floor: 1.0
-  min_rr: 1.2
+  min_rr: 1.25
   # Tight stops for scalps / day trades
   default_stop_atr_mult: 1.0
   # TP1–TP4: realistic short-term targets (ATR multiples)
@@ -77,7 +79,7 @@ scheduler:
     - "15:00"
     - "20:00"
   watchlist: []          # empty → built-in default coins
-  exchange: bybit
+  exchange: okx
   timeframe: "15m"
   no_news: false
   only_prop_safe: true
@@ -122,6 +124,11 @@ analysis:
   directional_score_threshold: 0.20
   directional_confidence_threshold: 68
   execution_min_score: 65
+  # Hard execution-quality gates used before any Telegram alert.
+  max_immediate_sl_risk: 32
+  max_chase_distance_atr: 1.0
+  max_spread_bps: 12
+  min_tp2_rr: 1.25
 
 news:
   enabled: true

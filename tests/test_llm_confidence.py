@@ -61,6 +61,24 @@ def test_combined_rank_score_prefers_higher_llm():
     assert high > low
 
 
+def test_combined_rank_is_dominated_by_deterministic_quality_not_llm():
+    weak_with_hype = combined_rank_score(
+        direction="long",
+        llm_confidence=99,
+        technical_confidence=55,
+        confluence_total=0.20,
+        execution_score=55,
+    )
+    strong_with_cautious_llm = combined_rank_score(
+        direction="long",
+        llm_confidence=55,
+        technical_confidence=82,
+        confluence_total=0.55,
+        execution_score=82,
+    )
+    assert strong_with_cautious_llm > weak_with_hype
+
+
 def test_from_parsed_reads_llm_confidence():
     llm = NarrativeLLM(config=None)
     narrative = llm._from_parsed(
