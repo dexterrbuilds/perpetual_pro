@@ -123,6 +123,9 @@ class AnalysisConfig:
     max_chase_distance_atr: float = 1.0
     max_spread_bps: float = 12.0
     min_tp2_rr: float = 1.25
+    ready_entry_expiry_bars: int = 3
+    retest_entry_expiry_bars: int = 6
+    max_entry_valid_minutes: int = 180
 
 
 @dataclass
@@ -236,6 +239,22 @@ class SchedulerConfig:
 
 
 @dataclass
+class SignalTrackerConfig:
+    """Low-overhead forward tracker for Telegram signal outcomes."""
+
+    enabled: bool = True
+    websocket_enabled: bool = True
+    websocket_url: str = "wss://ws.okx.com:8443/ws/v5/public"
+    database_path: str = "./data/signal_tracker.db"
+    reconcile_interval_seconds: int = 1800
+    lifecycle_check_seconds: int = 15
+    notification_retry_seconds: int = 60
+    target_allocations: List[float] = field(
+        default_factory=lambda: [0.25, 0.25, 0.25, 0.25]
+    )
+
+
+@dataclass
 class AppConfig:
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -250,6 +269,7 @@ class AppConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    signal_tracker: SignalTrackerConfig = field(default_factory=SignalTrackerConfig)
     config_path: Optional[Path] = None
 
     def resolve_path(self, path: str) -> Path:
@@ -286,6 +306,7 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
     logging_cfg = data.get("logging", {}) or {}
     tg = data.get("telegram", {}) or {}
     sched = data.get("scheduler", {}) or {}
+    tracker = data.get("signal_tracker", {}) or {}
 
     sim_cap = risk.get("simulated_capital", risk.get("account_balance", 1000.0))
     prop_mode = bool(risk.get("prop_mode", True))
@@ -377,6 +398,15 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             ),
             max_spread_bps=float(an.get("max_spread_bps", 12.0)),
             min_tp2_rr=float(an.get("min_tp2_rr", 1.25)),
+            ready_entry_expiry_bars=max(
+                1, int(an.get("ready_entry_expiry_bars", 3))
+            ),
+            retest_entry_expiry_bars=max(
+                1, int(an.get("retest_entry_expiry_bars", 6))
+            ),
+            max_entry_valid_minutes=max(
+                30, int(an.get("max_entry_valid_minutes", 180))
+            ),
         ),
         news=NewsConfig(
             enabled=bool(news.get("enabled", True)),
@@ -479,6 +509,42 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             no_news=bool(sched.get("no_news", False)),
             only_prop_safe=bool(sched.get("only_prop_safe", True)),
         ),
+        signal_tracker=SignalTrackerConfig(
+            enabled=bool(tracker.get("enabled", True)),
+            websocket_enabled=bool(tracker.get("websocket_enabled", True)),
+            websocket_url=str(
+                tracker.get(
+                    "websocket_url",
+                    "wss://ws.okx.com:8443/ws/v5/public",
+                )
+                or "wss://ws.okx.com:8443/ws/v5/public"
+            ),
+            database_path=str(
+                tracker.get("database_path", "./data/signal_tracker.db")
+                or "./data/signal_tracker.db"
+            ),
+            reconcile_interval_seconds=max(
+                60,
+                int(tracker.get("reconcile_interval_seconds", 1800)),
+            ),
+            lifecycle_check_seconds=max(
+                5,
+                int(tracker.get("lifecycle_check_seconds", 15)),
+            ),
+            notification_retry_seconds=max(
+                15,
+                int(tracker.get("notification_retry_seconds", 60)),
+            ),
+            target_allocations=[
+                max(0.0, float(value))
+                for value in list(
+                    tracker.get(
+                        "target_allocations",
+                        [0.25, 0.25, 0.25, 0.25],
+                    )
+                )[:4]
+            ],
+        ),
         config_path=config_path,
     )
 
@@ -526,6 +592,32 @@ def _apply_env_overrides(cfg: AppConfig) -> AppConfig:
             "yes",
             "on",
         )
+    if os.getenv("SIGNAL_TRACKER_ENABLED"):
+        cfg.signal_tracker.enabled = os.environ[
+            "SIGNAL_TRACKER_ENABLED"
+        ].strip().lower() in ("1", "true", "yes", "on")
+    if os.getenv("SIGNAL_TRACKER_WEBSOCKET_ENABLED"):
+        cfg.signal_tracker.websocket_enabled = os.environ[
+            "SIGNAL_TRACKER_WEBSOCKET_ENABLED"
+        ].strip().lower() in ("1", "true", "yes", "on")
+    if os.getenv("SIGNAL_TRACKER_DB_PATH"):
+        cfg.signal_tracker.database_path = os.environ[
+            "SIGNAL_TRACKER_DB_PATH"
+        ].strip()
+    elif os.getenv("RAILWAY_VOLUME_MOUNT_PATH"):
+        mount_path = Path(os.environ["RAILWAY_VOLUME_MOUNT_PATH"].strip())
+        cfg.signal_tracker.database_path = str(
+            mount_path / "perpetual_pro_signals.db"
+        )
+    if os.getenv("SIGNAL_TRACKER_RECONCILE_SECONDS"):
+        cfg.signal_tracker.reconcile_interval_seconds = max(
+            60,
+            int(os.environ["SIGNAL_TRACKER_RECONCILE_SECONDS"]),
+        )
+    if os.getenv("OKX_PUBLIC_WEBSOCKET_URL"):
+        cfg.signal_tracker.websocket_url = os.environ[
+            "OKX_PUBLIC_WEBSOCKET_URL"
+        ].strip()
     if os.getenv("TESSERACT_CMD"):
         cfg.ocr.tesseract_cmd = os.environ["TESSERACT_CMD"]
     if os.getenv("OLLAMA_BASE_URL"):

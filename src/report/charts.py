@@ -100,6 +100,15 @@ def build_market_chart_payload(
             "take_profits": list(plan.take_profits),
             "entry_status": getattr(plan, "entry_status", "blocked"),
             "execution_score": getattr(plan, "execution_score", 0.0),
+            "entry_valid_until": getattr(plan, "entry_valid_until", ""),
+            "entry_valid_for_minutes": getattr(
+                plan, "entry_valid_for_minutes", 0
+            ),
+            "hold_hours_min": getattr(plan, "hold_hours_min", 0.0),
+            "hold_hours_typical_max": getattr(
+                plan, "hold_hours_typical_max", 0.0
+            ),
+            "hold_hours_max": getattr(plan, "hold_hours_max", 24.0),
         }
     return {
         "timeframe": timeframe,

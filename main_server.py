@@ -58,6 +58,12 @@ from src.scheduler.scan_job import (
     start_scheduler_background,
     stop_scheduler_background,
 )
+from src.tracking.signal_tracker import (
+    get_signal_reliability_summary,
+    get_signal_tracker_status,
+    start_signal_tracker_background,
+    stop_signal_tracker_background,
+)
 from src.utils.config import load_config, setup_logging
 
 # ---------------------------------------------------------------------------
@@ -79,11 +85,13 @@ def get_config():
 async def lifespan(app: FastAPI):
     cfg = get_config()
     logger.info("perpetual_pro API v{} starting (exchange={})", __version__, cfg.exchange.default)
+    tracker_started = start_signal_tracker_background(cfg)
     scheduler_started = start_scheduler_background(cfg)
     webhook_started = configure_telegram_webhook(cfg)
     logger.info(
-        "Background services: scheduler_started={} webhook_started={} "
+        "Background services: tracker_started={} scheduler_started={} webhook_started={} "
         "scheduler_enabled={} times={} timezone={}",
+        tracker_started,
         scheduler_started,
         webhook_started,
         cfg.scheduler.enabled,
@@ -94,6 +102,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         stop_scheduler_background()
+        stop_signal_tracker_background()
         logger.info("perpetual_pro API shutdown complete")
 
 
@@ -135,6 +144,7 @@ def root() -> Dict[str, Any]:
                 "X-Telegram-Test-Key required)"
             ),
             "telegram_commands": "/scan · /status · /help",
+            "signal_reliability": "GET /signal-tracker/reliability",
         },
         "disclaimer": "Not financial advice. High leverage perps can liquidate quickly.",
     }
@@ -150,7 +160,14 @@ def health() -> Dict[str, Any]:
         "default_timeframe": cfg.timeframes.primary,
         "telegram_ready": is_telegram_ready(cfg),
         "scheduler": get_scheduler_status(),
+        "signal_tracker": get_signal_tracker_status(),
     }
+
+
+@app.get("/signal-tracker/reliability")
+def signal_tracker_reliability() -> Dict[str, Any]:
+    """Forward outcome bands; scores are not probabilities until calibrated."""
+    return get_signal_reliability_summary()
 
 
 @app.get("/telegram/status")
@@ -182,6 +199,7 @@ def telegram_status() -> Dict[str, Any]:
         },
         "webhook": get_telegram_webhook_status(),
         "scheduler": get_scheduler_status(),
+        "signal_tracker": get_signal_tracker_status(),
     }
 
 

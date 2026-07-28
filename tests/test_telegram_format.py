@@ -20,11 +20,14 @@ from src.notify.telegram import (
     send_telegram_photo_detailed,
 )
 from src.scheduler.scan_job import (
+    cap_signals_by_portfolio_risk,
     filter_high_confidence,
     get_scheduler_status,
     next_session_datetime,
     next_slot_datetime,
+    remember_sent_scheduled_signals,
     run_scheduler_loop,
+    suppress_recent_scheduled_signals,
 )
 from src.utils.config import load_config
 
@@ -71,7 +74,7 @@ def test_format_prop_scan_report_with_rows():
     assert "Technical 82%" in text
     assert "MTF aligned" in text
     assert "Entry" in text
-    assert "Wait Retest" in text
+    assert "Retest Only" in text
     assert "Execution 76/100" in text
     assert "TP1" in text
     assert "NFA · DYOR · Trade at your own risk" in text
@@ -234,6 +237,58 @@ def test_filter_rejects_immediate_stop_market_data_and_backtest_risks():
         )
         == []
     )
+
+
+def test_scheduled_signal_dedup_lasts_only_for_entry_validity(monkeypatch):
+    import src.scheduler.scan_job as scan_job
+
+    monkeypatch.setattr(scan_job, "_RECENT_SIGNAL_ALERTS", {})
+    row = {
+        "symbol": "BTC/USDT:USDT",
+        "direction": "long",
+        "entry_low": 100.0,
+        "entry_high": 100.2,
+        "stop_loss": 99.0,
+        "entry_valid_for_minutes": 90,
+    }
+    remember_sent_scheduled_signals([row], now_monotonic=1000.0)
+
+    kept, suppressed = suppress_recent_scheduled_signals(
+        [dict(row)],
+        now_monotonic=1001.0,
+    )
+    assert kept == []
+    assert suppressed == [row]
+
+    changed = dict(row, entry_low=101.0, entry_high=101.2)
+    kept, suppressed = suppress_recent_scheduled_signals(
+        [changed],
+        now_monotonic=1001.0,
+    )
+    assert kept == [changed]
+    assert suppressed == []
+
+    kept, suppressed = suppress_recent_scheduled_signals(
+        [dict(row)],
+        now_monotonic=1000.0 + 90 * 60 + 1,
+    )
+    assert kept == [row]
+    assert suppressed == []
+
+
+def test_portfolio_risk_cap_keeps_highest_ranked_setups():
+    rows = [
+        {"symbol": "BTC", "rank_score": 90, "risk_pct": 1.0},
+        {"symbol": "ETH", "rank_score": 85, "risk_pct": 0.5},
+        {"symbol": "SOL", "rank_score": 80, "risk_pct": 1.0},
+        {"symbol": "SUI", "rank_score": 75, "risk_pct": 0.5},
+    ]
+    kept, excluded = cap_signals_by_portfolio_risk(
+        rows,
+        max_open_risk_pct=2.0,
+    )
+    assert [row["symbol"] for row in kept] == ["BTC", "ETH", "SUI"]
+    assert [row["symbol"] for row in excluded] == ["SOL"]
 
 
 def test_next_slot_datetime_future():
@@ -409,6 +464,11 @@ def test_signal_photo_caption_is_clean_and_actionable():
         "leverage": 5,
         "risk_pct": 1,
         "setup_name": "Long Momentum",
+        "entry_valid_for_minutes": 90,
+        "entry_valid_until": "2026-07-28T14:30:00Z",
+        "hold_hours_min": 1,
+        "hold_hours_typical_max": 8,
+        "hold_hours_max": 12,
         "immediate_sl_risk": 24,
         "order_flow_score": 0.42,
         "funding_rate": 0.0001,
@@ -434,15 +494,55 @@ def test_signal_photo_caption_is_clean_and_actionable():
     assert "Execution 76/100" in caption
     assert "Intraday" in caption
     assert "NY open" in caption
+    assert "<b>Entry valid:</b> 90m · until 14:30 UTC" in caption
+    assert "<b>Hold after fill:</b> 1–8h · hard max 12h" in caption
+    assert "cancel at expiry" in caption
     assert "<b>Entry:</b>" in caption
+    assert "<b>Entry mode:</b> RETEST ONLY" in caption
     assert "<b>Stop:</b>" in caption
     assert "<b>TP1:</b>" in caption
     assert "<b>Setup:</b> Long Momentum" in caption
     assert "<b>R:R (TP2):</b> 2.40" in caption
     assert "<b>Why:</b>" in caption
+    assert "<b>Beginner rule:</b>" in caption
+    assert "Once Entry touches" in caption
     assert "Educational" not in caption
     assert caption.endswith("NFA · DYOR · Trade at your own risk")
     assert len(caption) <= 1024
+
+
+def test_signal_photo_caption_explains_cmp_ready_entry():
+    row = {
+        "symbol": "ETH/USDT:USDT",
+        "direction": "short",
+        "confidence": 88,
+        "technical_confidence": 86,
+        "entry_status": "ready",
+        "execution_score": 82,
+        "entry_low": 3800,
+        "entry_high": 3810,
+        "stop_loss": 3830,
+        "take_profits": [3770, 3740],
+        "leverage": 5,
+        "risk_pct": 0.5,
+        "primary_tf": "15m",
+        "setup_name": "Short Momentum",
+        "reason": "Bearish structure and execution align.",
+        "payload": {
+            "primary_setup": {
+                "hold_label": "Intraday",
+                "hold_hours_max": 12,
+                "risk_reward": [1.0, 2.0],
+            },
+            "execution": {"status": "ready"},
+            "chart": {"timeframe": "15m"},
+        },
+    }
+    caption = format_signal_photo_caption(row)
+    assert "ETH SHORT — CMP READY" in caption
+    assert "<b>Entry mode:</b> CMP ALLOWED" in caption
+    assert "If it leaves before you act, wait for a new scan." in caption
+    assert "candle finishes above Stop" in caption
 
 
 def test_telegram_diagnostics_checks_bot_chat_and_membership(monkeypatch):

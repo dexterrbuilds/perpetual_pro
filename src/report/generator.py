@@ -327,7 +327,19 @@ class ReportGenerator:
                 "invalidation": plan.invalidation,
                 "hold_label": getattr(plan, "hold_label", ""),
                 "hold_detail": getattr(plan, "hold_detail", ""),
+                "hold_hours_min": getattr(plan, "hold_hours_min", 0.0),
+                "hold_hours_typical_max": getattr(
+                    plan, "hold_hours_typical_max", 0.0
+                ),
                 "hold_hours_max": getattr(plan, "hold_hours_max", 24.0),
+                "signal_generated_at": getattr(plan, "signal_generated_at", ""),
+                "entry_valid_until": getattr(plan, "entry_valid_until", ""),
+                "entry_valid_for_minutes": getattr(
+                    plan, "entry_valid_for_minutes", 0
+                ),
+                "entry_expiry_bars": getattr(plan, "entry_expiry_bars", 0),
+                "entry_expiry_reason": getattr(plan, "entry_expiry_reason", ""),
+                "time_stop_reason": getattr(plan, "time_stop_reason", ""),
                 "headline": setup["headline"],
                 "pro_lines": setup["pro_lines"],
                 "is_simulation": True,

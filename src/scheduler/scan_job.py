@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from threading import Event, Lock, Thread
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -19,6 +20,7 @@ from src.notify.telegram import (
     send_telegram_photo_detailed,
 )
 from src.report.charts import render_signal_chart_png
+from src.tracking.signal_tracker import register_delivered_signals
 from src.utils.config import AppConfig, load_config
 
 # Fallback watchlist when scheduler.watchlist is empty
@@ -48,6 +50,8 @@ _SCHEDULER_STATUS: Dict[str, Any] = {
 _BACKGROUND_THREAD: Optional[Thread] = None
 _BACKGROUND_STOP: Optional[Event] = None
 _SCAN_RUN_LOCK = Lock()
+_RECENT_SIGNAL_LOCK = Lock()
+_RECENT_SIGNAL_ALERTS: Dict[Tuple[str, str], Dict[str, float]] = {}
 
 
 def _status_update(**values: Any) -> None:
@@ -209,6 +213,112 @@ def filter_high_confidence(
     return out
 
 
+def suppress_recent_scheduled_signals(
+    rows: List[Dict[str, Any]],
+    *,
+    now_monotonic: Optional[float] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Suppress nearly identical scheduled alerts while the first entry is live."""
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    kept: List[Dict[str, Any]] = []
+    suppressed: List[Dict[str, Any]] = []
+    with _RECENT_SIGNAL_LOCK:
+        stale = [
+            key
+            for key, value in _RECENT_SIGNAL_ALERTS.items()
+            if value.get("expires_at", 0.0) <= now
+        ]
+        for key in stale:
+            _RECENT_SIGNAL_ALERTS.pop(key, None)
+
+        for row in rows:
+            key = (
+                str(row.get("symbol") or "").upper(),
+                str(row.get("direction") or "").lower(),
+            )
+            previous = _RECENT_SIGNAL_ALERTS.get(key)
+            entry = _row_entry_mid(row)
+            stop = _safe_float_or_none(row.get("stop_loss"))
+            same_levels = bool(
+                previous
+                and _within_bps(entry, previous.get("entry"), 8.0)
+                and _within_bps(stop, previous.get("stop"), 12.0)
+            )
+            if same_levels:
+                suppressed.append(row)
+            else:
+                kept.append(row)
+    return kept, suppressed
+
+
+def cap_signals_by_portfolio_risk(
+    rows: List[Dict[str, Any]],
+    *,
+    max_open_risk_pct: float,
+    default_risk_pct: float = 1.0,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Keep highest-ranked signals inside one conservative correlated-risk cap."""
+    budget = max(0.1, float(max_open_risk_pct or 0.0))
+    used = 0.0
+    kept: List[Dict[str, Any]] = []
+    excluded: List[Dict[str, Any]] = []
+    for row in rows:
+        risk = _safe_float_or_none(row.get("risk_pct"))
+        risk = risk if risk is not None else max(0.1, float(default_risk_pct or 1.0))
+        if used + risk <= budget + 1e-9:
+            kept.append(row)
+            used += risk
+        else:
+            excluded.append(row)
+    return kept, excluded
+
+
+def remember_sent_scheduled_signals(
+    rows: List[Dict[str, Any]],
+    *,
+    now_monotonic: Optional[float] = None,
+) -> None:
+    """Remember successfully delivered setups until their pending-entry expiry."""
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    with _RECENT_SIGNAL_LOCK:
+        for row in rows:
+            validity_minutes = max(
+                15.0,
+                _safe_float_or_none(row.get("entry_valid_for_minutes")) or 60.0,
+            )
+            key = (
+                str(row.get("symbol") or "").upper(),
+                str(row.get("direction") or "").lower(),
+            )
+            _RECENT_SIGNAL_ALERTS[key] = {
+                "entry": _row_entry_mid(row) or 0.0,
+                "stop": _safe_float_or_none(row.get("stop_loss")) or 0.0,
+                "expires_at": now + validity_minutes * 60.0,
+            }
+
+
+def _row_entry_mid(row: Dict[str, Any]) -> Optional[float]:
+    low = _safe_float_or_none(row.get("entry_low"))
+    high = _safe_float_or_none(row.get("entry_high"))
+    if low is None or high is None:
+        return _safe_float_or_none(row.get("price"))
+    return (low + high) / 2.0
+
+
+def _safe_float_or_none(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _within_bps(current: Optional[float], previous: Optional[float], bps: float) -> bool:
+    if current is None or previous is None or previous <= 0:
+        return False
+    return abs(current - previous) / previous * 10_000.0 <= bps
+
+
 def _row_tp2_rr(row: Dict[str, Any]) -> Optional[float]:
     payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
     primary = (
@@ -292,6 +402,37 @@ def _run_scheduled_scan_once_unlocked(
         min_tp2_rr=float(getattr(cfg.analysis, "min_tp2_rr", 1.25)),
         max_spread_bps=float(getattr(cfg.analysis, "max_spread_bps", 12.0)),
     )
+    suppressed_duplicates: List[Dict[str, Any]] = []
+    slot_lower = str(slot_label or "").lower()
+    manual_delivery = bool(
+        telegram_chat_ids is not None
+        or any(
+            marker in slot_lower
+            for marker in ("manual", "on-demand", "telegram")
+        )
+    )
+    if send and not manual_delivery and filtered:
+        filtered, suppressed_duplicates = suppress_recent_scheduled_signals(filtered)
+        if suppressed_duplicates:
+            logger.info(
+                "Suppressed {} duplicate scheduled signal(s) still inside "
+                "their entry-validity window",
+                len(suppressed_duplicates),
+            )
+    filtered, portfolio_risk_excluded = cap_signals_by_portfolio_risk(
+        filtered,
+        max_open_risk_pct=float(
+            getattr(cfg.risk, "max_open_risk_pct", 2.0) or 2.0
+        ),
+        default_risk_pct=float(cfg.risk.risk_per_trade_pct or 1.0),
+    )
+    if portfolio_risk_excluded:
+        logger.info(
+            "Withheld {} lower-ranked signal(s) to keep total proposed open "
+            "risk within {:.2f}%",
+            len(portfolio_risk_excluded),
+            float(getattr(cfg.risk, "max_open_risk_pct", 2.0) or 2.0),
+        )
     report = format_prop_scan_report(
         filtered,
         slot_label=slot_label or "scan",
@@ -305,6 +446,7 @@ def _run_scheduled_scan_once_unlocked(
     )
     sent = False
     delivery: Optional[Dict[str, Any]] = None
+    tracking: Optional[Dict[str, Any]] = None
     delivery_status = "not_requested"
     destinations = get_telegram_alert_chat_ids(telegram_chat_ids)
     # Credentials from env only (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — never YAML
@@ -312,6 +454,9 @@ def _run_scheduled_scan_once_unlocked(
     if send and tg_ready:
         if filtered:
             rendered: List[Dict[str, Any]] = []
+            tracking_destinations: List[List[str]] = [
+                [] for _ in range(len(filtered[:6]))
+            ]
             # Render each chart once, then fan the immutable payload out.
             for index, row in enumerate(filtered[:6], 1):
                 symbol = str(row.get("symbol") or f"signal-{index}")
@@ -347,7 +492,7 @@ def _run_scheduled_scan_once_unlocked(
             fallback_items: List[Dict[str, Any]] = []
             for destination in destinations:
                 destination_items: List[Dict[str, Any]] = []
-                for signal in rendered:
+                for signal_index, signal in enumerate(rendered):
                     symbol = str(signal.get("symbol") or "signal")
                     if not signal.get("ok"):
                         item = {
@@ -369,6 +514,8 @@ def _run_scheduled_scan_once_unlocked(
                         item["mode"] = "photo"
                     destination_items.append(item)
                     chart_items.append(item)
+                    if item.get("ok"):
+                        tracking_destinations[signal_index].append(destination)
 
                 destination_photo_ok = bool(destination_items) and all(
                     item.get("ok") for item in destination_items
@@ -381,6 +528,10 @@ def _run_scheduled_scan_once_unlocked(
                         parse_mode=cfg.telegram.parse_mode or "HTML",
                     )
                     fallback_items.append(fallback)
+                    if fallback.get("ok"):
+                        for signal_destinations in tracking_destinations:
+                            if destination not in signal_destinations:
+                                signal_destinations.append(destination)
                 destination_ok = destination_photo_ok or bool(
                     fallback and fallback.get("ok")
                 )
@@ -445,6 +596,32 @@ def _run_scheduled_scan_once_unlocked(
                         "Telegram chart and text fallback both failed: slot={}",
                         slot_label or "scan",
                     )
+            if sent and not manual_delivery:
+                remember_sent_scheduled_signals(filtered)
+            if sent:
+                tracking = register_delivered_signals(
+                    filtered[:6],
+                    tracking_destinations,
+                    source=(
+                        "telegram_manual"
+                        if manual_delivery
+                        else "telegram_scheduled"
+                    ),
+                    config=cfg,
+                )
+                if not tracking.get("ok"):
+                    logger.error(
+                        "Telegram alerts were delivered but tracker registration "
+                        "was incomplete: errors={}",
+                        tracking.get("errors") or tracking.get("error"),
+                    )
+        elif suppressed_duplicates:
+            delivery_status = "skipped_duplicate_signals"
+            logger.info(
+                "Scheduled Telegram delivery skipped: all {} actionable "
+                "signal(s) were already sent and remain valid",
+                len(suppressed_duplicates),
+            )
         elif (
             bool(notify_on_empty)
             if notify_on_empty is not None
@@ -523,12 +700,15 @@ def _run_scheduled_scan_once_unlocked(
         "scanned": len(watchlist),
         "ranked_count": len(ranked),
         "alert_count": len(filtered),
+        "duplicate_signal_count": len(suppressed_duplicates),
+        "portfolio_risk_excluded_count": len(portfolio_risk_excluded),
         "filtered": filtered,
         "report": report,
         "telegram_sent": sent,
         "telegram_ready": tg_ready,
         "telegram_delivery_status": delivery_status,
         "telegram_delivery": delivery,
+        "signal_tracking": tracking,
         "slot_label": slot_label,
     }
 

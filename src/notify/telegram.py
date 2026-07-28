@@ -389,10 +389,19 @@ def format_signal_photo_caption(
     risk_rewards = list(primary.get("risk_reward") or [])
     if status == "wait_retest":
         call = f"{direction} — RETEST"
+        entry_mode = (
+            "RETEST ONLY — wait for price to return to the Entry zone; "
+            "do not enter at the current price."
+        )
     elif status == "ready":
-        call = f"{direction} — READY"
+        call = f"{direction} — CMP READY"
+        entry_mode = (
+            "CMP ALLOWED — price is already inside the Entry zone after "
+            "confirmation. If it leaves before you act, wait for a new scan."
+        )
     else:
         call = f"{direction} — CONDITIONAL"
+        entry_mode = "CONDITIONAL — do not enter until the stated condition is met."
 
     reason = (
         row.get("reason")
@@ -417,6 +426,28 @@ def format_signal_photo_caption(
         row.get("hold_label") or primary.get("hold_label"),
         timeframe=timeframe,
         hold_hours_max=primary.get("hold_hours_max"),
+    )
+    entry_valid_minutes = int(
+        _number(
+            row.get("entry_valid_for_minutes")
+            or primary.get("entry_valid_for_minutes")
+        )
+    )
+    entry_valid_until = (
+        row.get("entry_valid_until") or primary.get("entry_valid_until") or ""
+    )
+    hold_min = _number(
+        row.get("hold_hours_min") or primary.get("hold_hours_min"),
+        0.0,
+    )
+    hold_typical_max = _number(
+        row.get("hold_hours_typical_max")
+        or primary.get("hold_hours_typical_max"),
+        0.0,
+    )
+    hold_hard_max = _number(
+        row.get("hold_hours_max") or primary.get("hold_hours_max"),
+        0.0,
     )
     rr_tp2 = _caption_target_rr(
         direction=direction,
@@ -452,9 +483,27 @@ def format_signal_photo_caption(
             f"{html.escape(hold_style)}"
             + (f" · {html.escape(session)}" if session else "")
         ),
+        (
+            f"⌛ <b>Entry valid:</b> {entry_valid_minutes}m"
+            + (
+                f" · until {html.escape(_caption_expiry_time(entry_valid_until))}"
+                if entry_valid_until
+                else ""
+            )
+        )
+        if entry_valid_minutes
+        else "",
+        (
+            f"🕒 <b>Hold after fill:</b> {hold_min:g}–{hold_typical_max:g}h"
+            + (f" · hard max {hold_hard_max:g}h" if hold_hard_max else "")
+        )
+        if hold_min and hold_typical_max
+        else "",
         f"🎯 <b>Entry:</b> {_caption_price(entry_low)} – {_caption_price(entry_high)}",
+        f"🚦 <b>Entry mode:</b> {html.escape(entry_mode)}",
         f"🛑 <b>Stop:</b> {_caption_price(stop)}",
     ]
+    lines = [line for line in lines if line]
     if targets:
         lines.extend(
             f"✅ <b>TP{index}:</b> {_caption_price(target)}"
@@ -479,6 +528,13 @@ def format_signal_photo_caption(
         execution_note = "Enter only after the confirmation candle closes."
     if execution_note:
         lines += ["", f"📌 {html.escape(execution_note)}"]
+    invalidation_side = "below" if direction == "LONG" else "above"
+    lines.append(
+        "🧱 <b>Beginner rule:</b> Before entry, cancel at expiry, if TP1 "
+        f"trades first, or if a {html.escape(timeframe)} candle finishes "
+        f"{invalidation_side} Stop (a brief spike does not count). Once Entry "
+        "touches, Stop is hard—do not wait for close."
+    )
     lines += [
         "",
         "NFA · DYOR · Trade at your own risk",
@@ -504,6 +560,20 @@ def _caption_price(value: Any) -> str:
     if price >= 1:
         return f"${price:.4f}".rstrip("0").rstrip(".")
     return f"${price:.8f}".rstrip("0").rstrip(".")
+
+
+def _caption_expiry_time(value: Any) -> str:
+    """Render an ISO signal deadline compactly in UTC."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+        return parsed.astimezone(ZoneInfo("UTC")).strftime("%H:%M UTC")
+    except (TypeError, ValueError):
+        return raw[:16]
 
 
 def _caption_hold_style(
@@ -819,7 +889,13 @@ def format_prop_scan_report(
             if entry_low is not None and entry_high is not None
             else fmt_price(row.get("price"))
         )
-        entry_status = str(row.get("entry_status") or "ready").replace("_", " ").title()
+        raw_entry_status = str(row.get("entry_status") or "ready")
+        entry_status = {
+            "ready": "CMP Ready",
+            "wait_retest": "Retest Only",
+            "avoid_chase": "Avoid Chase",
+            "blocked": "Blocked",
+        }.get(raw_entry_status, raw_entry_status.replace("_", " ").title())
         execution_score = row.get("execution_score")
         execution_s = (
             f"{float(execution_score):.0f}/100"
@@ -835,6 +911,9 @@ def format_prop_scan_report(
             )
             target_line = f"\n   {shown}"
         hold = html.escape(str(row.get("hold_label") or "intraday"))
+        valid_minutes = int(_number(row.get("entry_valid_for_minutes"), 0.0))
+        hold_min = _number(row.get("hold_hours_min"), 0.0)
+        hold_typical = _number(row.get("hold_hours_typical_max"), 0.0)
         safe_reason = html.escape(str(reason))
         lines.append(
             f"{side_icon} <b>{i}. {html.escape(base)} {direction}</b> · "
@@ -842,13 +921,18 @@ def format_prop_scan_report(
             f"   Technical {technical:.0f}% · Execution {execution_s} · {entry_status}\n"
             f"   Entry {entry_s}{target_line}\n"
             f"   SL {fmt_price(row.get('stop_loss'))} · {lev}x · risk {risk_s} · {hold}\n"
+            + (
+                f"   Entry expires {valid_minutes}m · hold {hold_min:g}–{hold_typical:g}h\n"
+                if valid_minutes and hold_min and hold_typical
+                else ""
+            )
             + (f"\n   Why: {safe_reason}" if safe_reason else "")
             + (f"\n   ⚠ {html.escape(', '.join(flags))}" if flags else "")
         )
         lines.append("")
     lines.append(
         f"🛡 Prop gate: <b>≥{min_signal_confidence:.0f}% calibrated confidence</b> · "
-        "clean execution · TP2 ≥1.25R · 0.5–1% risk · ≤5x"
+        "clean execution · TP2 ≥1.25R · 0.5–1% each · ≤2% total open risk · ≤5x"
     )
     lines.append("NFA · DYOR · Trade at your own risk")
     return "\n".join(lines).strip()

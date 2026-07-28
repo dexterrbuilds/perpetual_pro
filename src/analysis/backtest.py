@@ -16,7 +16,7 @@ from loguru import logger
 from src.analysis.indicators import IndicatorSuite, compute_indicators
 from src.data.exchange import ExchangeClient
 from src.utils.config import AppConfig, RiskConfig, load_config
-from src.utils.helpers import normalize_symbol, safe_float, timeframe_to_minutes
+from src.utils.helpers import clamp, normalize_symbol, safe_float, timeframe_to_minutes
 
 
 @dataclass
@@ -83,7 +83,7 @@ def run_backtest(
     warmup: int = 80,
     max_hold_bars: Optional[int] = None,
     indicator_suite: Optional[IndicatorSuite] = None,
-    entry_wait_bars: int = 4,
+    entry_wait_bars: Optional[int] = None,
     fee_rate: float = 0.00055,
     slippage_rate: float = 0.00020,
 ) -> BacktestResult:
@@ -93,9 +93,36 @@ def run_backtest(
     If ``df`` is provided, no network fetch is performed (tests).
     """
     cfg = config or load_config()
+    timeframe_minutes = max(1, timeframe_to_minutes(timeframe))
+    if entry_wait_bars is None:
+        # Live retest signals expire after six primary candles, capped at three
+        # hours. The backtest must not give stale limit entries extra time.
+        retest_bars = max(
+            1,
+            int(getattr(cfg.analysis, "retest_entry_expiry_bars", 6)),
+        )
+        max_entry_minutes = max(
+            30,
+            int(getattr(cfg.analysis, "max_entry_valid_minutes", 180)),
+        )
+        entry_wait_minutes = int(
+            clamp(
+                timeframe_minutes * retest_bars,
+                30,
+                max_entry_minutes,
+            )
+        )
+        entry_wait_bars = max(1, int(round(entry_wait_minutes / timeframe_minutes)))
     if max_hold_bars is None:
-        # Enforce the day-trade horizon across timeframes (up to 24 hours).
-        max_hold_bars = max(1, int((24 * 60) / max(1, timeframe_to_minutes(timeframe))))
+        # Match the live hold policy: micro scalps max 2h, 15m/30m intraday
+        # setups max 12h, higher-timeframe day trades max 24h.
+        max_hold_hours = 2 if timeframe_minutes <= 5 else (12 if timeframe_minutes <= 30 else 24)
+        max_hold_bars = max(
+            1,
+            int((max_hold_hours * 60) / timeframe_minutes),
+        )
+    else:
+        max_hold_hours = max_hold_bars * timeframe_minutes / 60.0
     risk: RiskConfig = cfg.risk
     prop = bool(getattr(risk, "prop_mode", True))
     risk_pct = float(risk.risk_per_trade_pct or 1.0)
@@ -278,6 +305,23 @@ def run_backtest(
             else:
                 hi = float(highs.iloc[i])
                 lo = float(lows.iloc[i])
+                target_passed_without_fill = bool(
+                    (
+                        pending["direction"] == "long"
+                        and hi >= pending["tp"]
+                        and lo > pending["limit"]
+                    )
+                    or (
+                        pending["direction"] == "short"
+                        and lo <= pending["tp"]
+                        and hi < pending["limit"]
+                    )
+                )
+                if target_passed_without_fill:
+                    unfilled_signals += 1
+                    pending = None
+                    i += 1
+                    continue
                 if lo <= pending["limit"] <= hi:
                     direction = pending["direction"]
                     fill = pending["limit"] * (
@@ -452,7 +496,7 @@ def run_backtest(
             "max_leverage": max_lev,
             "stop_atr_mult": stop_atr,
             "tp_atr_mult": tp_atr,
-            "max_hold_hours": 24,
+            "max_hold_hours": max_hold_hours,
             "entry_wait_bars": entry_wait_bars,
             "fee_rate": fee_rate,
             "slippage_rate": slippage_rate,

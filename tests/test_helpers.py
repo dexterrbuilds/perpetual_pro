@@ -22,7 +22,11 @@ from src.utils.helpers import (
 from src.analysis.patterns import PatternDetector
 from src.data.exchange import ExchangeClient
 from src.analysis.market_structure import MarketStructureAnalyzer
-from src.analysis.risk import RiskManager, suggest_hold_window
+from src.analysis.risk import (
+    RiskManager,
+    suggest_hold_window,
+    suggest_trade_lifecycle,
+)
 from src.utils.config import load_config
 
 
@@ -162,7 +166,13 @@ def test_risk_manager_long_plan():
     assert len(plan.potential_profits) >= 4
     assert plan.is_simulation is True
     assert plan.hold_detail
+    assert plan.hold_hours_min == 1.0
+    assert plan.hold_hours_typical_max == 8.0
     assert plan.hold_hours_max <= 24 or "swing" in plan.hold_label.lower()
+    assert plan.entry_valid_for_minutes == 45
+    assert plan.entry_expiry_bars == 3
+    assert plan.entry_valid_until.endswith("Z")
+    assert "TP1" in plan.entry_expiry_reason
     headline = plan.setup_headline("BTC/USDT:USDT")
     assert "LONG SETUP" in headline
     assert plan.alternative_entry_low is not None
@@ -212,6 +222,25 @@ def test_hold_style_uses_timeframe_not_momentum_name():
     )
     assert scalp_label == "Scalp"
     assert scalp_max == 2
+
+
+def test_retest_lifecycle_expires_in_six_closed_candles():
+    generated = pd.Timestamp("2026-07-28T13:00:00Z").to_pydatetime()
+    lifecycle = suggest_trade_lifecycle(
+        primary_tf="15m",
+        setup_name="Order Block Retest",
+        strategy_tags=["retest"],
+        entry_status="wait_retest",
+        atr_pct=1.2,
+        hold_label="Intraday",
+        hold_hours_max=12,
+        generated_at=generated,
+    )
+    assert lifecycle["entry_valid_for_minutes"] == 90
+    assert lifecycle["entry_expiry_bars"] == 6
+    assert lifecycle["entry_valid_until"] == "2026-07-28T14:30:00Z"
+    assert lifecycle["hold_hours_min"] == 1.0
+    assert lifecycle["hold_hours_typical_max"] == 8.0
 
 
 def test_load_config_defaults():

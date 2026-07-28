@@ -24,6 +24,7 @@ from src.scheduler.scan_job import (
     run_scheduled_scan_once,
     scan_in_progress,
 )
+from src.tracking.signal_tracker import get_signal_tracker_status
 from src.utils.config import AppConfig
 
 _WEBHOOK_STATUS_LOCK = Lock()
@@ -317,6 +318,7 @@ def process_telegram_update(update: Dict[str, Any], config: AppConfig) -> Dict[s
 
     if command == "/status":
         scheduler = get_scheduler_status()
+        tracker = get_signal_tracker_status()
         webhook = get_telegram_webhook_status()
         state = "busy" if scan_in_progress() else "ready"
         next_run = scheduler.get("next_run_at") or "not scheduled"
@@ -324,6 +326,8 @@ def process_telegram_update(update: Dict[str, Any], config: AppConfig) -> Dict[s
             "🟢 <b>Perpetual Pro bot is online</b>\n"
             f"Scan worker: <b>{state}</b>\n"
             f"Webhook: <b>{'active' if webhook.get('configured') else 'inactive'}</b>\n"
+            f"Active signals: <b>{int(tracker.get('active_count') or 0)}</b>\n"
+            f"Live tracker: <b>{'streaming' if tracker.get('websocket_connected') else 'standby'}</b>\n"
             f"Next scheduled scan: <code>{html.escape(str(next_run))}</code>"
         )
         delivery = send_telegram_message_detailed(

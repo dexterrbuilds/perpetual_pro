@@ -757,6 +757,32 @@ def scan_symbols(
                     "stop_loss": getattr(plan, "stop_loss", None) if plan else None,
                     "take_profits": list(getattr(plan, "take_profits", None) or []),
                     "hold_label": getattr(plan, "hold_label", "") if plan else "",
+                    "hold_detail": getattr(plan, "hold_detail", "") if plan else "",
+                    "hold_hours_min": getattr(plan, "hold_hours_min", 0.0) if plan else 0.0,
+                    "hold_hours_typical_max": (
+                        getattr(plan, "hold_hours_typical_max", 0.0)
+                        if plan
+                        else 0.0
+                    ),
+                    "hold_hours_max": getattr(plan, "hold_hours_max", 24.0) if plan else 24.0,
+                    "signal_generated_at": (
+                        getattr(plan, "signal_generated_at", "") if plan else ""
+                    ),
+                    "entry_valid_until": (
+                        getattr(plan, "entry_valid_until", "") if plan else ""
+                    ),
+                    "entry_valid_for_minutes": (
+                        getattr(plan, "entry_valid_for_minutes", 0) if plan else 0
+                    ),
+                    "entry_expiry_bars": (
+                        getattr(plan, "entry_expiry_bars", 0) if plan else 0
+                    ),
+                    "entry_expiry_reason": (
+                        getattr(plan, "entry_expiry_reason", "") if plan else ""
+                    ),
+                    "time_stop_reason": (
+                        getattr(plan, "time_stop_reason", "") if plan else ""
+                    ),
                     "backtest": backtest_summary,
                     "historical_edge_ok": historical_edge_ok,
                     "data_quality_ok": bool(

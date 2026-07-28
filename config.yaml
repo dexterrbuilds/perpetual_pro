@@ -84,6 +84,18 @@ scheduler:
   no_news: false
   only_prop_safe: true
 
+# Forward outcome tracking. Only symbols with delivered, qualified alerts are
+# subscribed. REST reconciliation is intentionally infrequent to control cost.
+signal_tracker:
+  enabled: true
+  websocket_enabled: true
+  websocket_url: "wss://ws.okx.com:8443/ws/v5/public"
+  database_path: "./data/signal_tracker.db"
+  reconcile_interval_seconds: 1800
+  lifecycle_check_seconds: 15
+  notification_retry_seconds: 60
+  target_allocations: [0.25, 0.25, 0.25, 0.25]
+
 # Pure day-trade stack: 15m execution, 1h drive, 4h confirmation
 timeframes:
   primary: "15m"
@@ -129,6 +141,10 @@ analysis:
   max_chase_distance_atr: 1.0
   max_spread_bps: 12
   min_tp2_rr: 1.25
+  # Pending entry lifetime: READY resolves faster; RETEST gets six 15m candles.
+  ready_entry_expiry_bars: 3
+  retest_entry_expiry_bars: 6
+  max_entry_valid_minutes: 180
 
 news:
   enabled: true

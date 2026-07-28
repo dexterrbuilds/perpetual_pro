@@ -65,7 +65,8 @@ def test_backtest_returns_core_metrics():
     assert 0 <= result.early_stop_rate <= 100
     assert 0 <= result.win_rate_lower_bound <= 100
     assert result.median_mae_r >= 0
-    assert d["prop_settings"]["entry_wait_bars"] == 4
+    assert d["prop_settings"]["entry_wait_bars"] == 6
+    assert d["prop_settings"]["max_hold_hours"] == 12
     assert d["prop_settings"]["fee_rate"] > 0
     for trade in d["trades"]:
         assert trade["entry_wait_bars"] >= 0

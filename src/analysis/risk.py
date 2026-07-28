@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.utils.config import AppConfig, RiskConfig
-from src.utils.helpers import clamp, format_price, safe_float
+from src.utils.helpers import clamp, format_price, safe_float, timeframe_to_minutes
 
 
 @dataclass
@@ -40,7 +41,16 @@ class TradePlan:
     # Hold window (scalp / day-trade biased)
     hold_label: str = ""
     hold_detail: str = ""
+    hold_hours_min: float = 0.0
+    hold_hours_typical_max: float = 0.0
     hold_hours_max: float = 24.0
+    # Setup lifecycle: a retest thesis is not a good-till-cancelled instruction.
+    signal_generated_at: str = ""
+    entry_valid_until: str = ""
+    entry_valid_for_minutes: int = 0
+    entry_expiry_bars: int = 0
+    entry_expiry_reason: str = ""
+    time_stop_reason: str = ""
     # Explicit: no hardcoded exchange leverage / balance claims
     is_simulation: bool = True
     # Prop account management
@@ -108,7 +118,15 @@ class TradePlan:
             "leverage_suggested": self.leverage_suggested,
             "hold_label": self.hold_label,
             "hold_detail": self.hold_detail,
+            "hold_hours_min": self.hold_hours_min,
+            "hold_hours_typical_max": self.hold_hours_typical_max,
             "hold_hours_max": self.hold_hours_max,
+            "signal_generated_at": self.signal_generated_at,
+            "entry_valid_until": self.entry_valid_until,
+            "entry_valid_for_minutes": self.entry_valid_for_minutes,
+            "entry_expiry_bars": self.entry_expiry_bars,
+            "entry_expiry_reason": self.entry_expiry_reason,
+            "time_stop_reason": self.time_stop_reason,
             "invalidation": self.invalidation,
             "quality": self.quality,
             "prop_mode": self.prop_mode,
@@ -119,6 +137,15 @@ class TradePlan:
             "entry_status": self.entry_status,
             "entry_reason": self.entry_reason,
             "execution_score": self.execution_score,
+            "hold_hours_min": self.hold_hours_min,
+            "hold_hours_typical_max": self.hold_hours_typical_max,
+            "hold_hours_max": self.hold_hours_max,
+            "signal_generated_at": self.signal_generated_at,
+            "entry_valid_until": self.entry_valid_until,
+            "entry_valid_for_minutes": self.entry_valid_for_minutes,
+            "entry_expiry_bars": self.entry_expiry_bars,
+            "entry_expiry_reason": self.entry_expiry_reason,
+            "time_stop_reason": self.time_stop_reason,
             "immediate_sl_risk": self.immediate_sl_risk,
             "chase_distance_atr": self.chase_distance_atr,
             "order_flow_score": self.order_flow_score,
@@ -189,6 +216,15 @@ class TradePlan:
                 lines.append(f"⚠ Flags: {', '.join(self.prop_flags)}")
         if self.hold_detail:
             lines.append(f"⏱ {self.hold_detail}")
+        if self.entry_valid_for_minutes:
+            lines.append(
+                f"⌛ Entry validity: {self.entry_valid_for_minutes} minutes "
+                f"({self.entry_expiry_bars} closed candle(s))."
+            )
+        if self.entry_expiry_reason:
+            lines.append(f"🗑 Cancel pending entry: {self.entry_expiry_reason}")
+        if self.time_stop_reason:
+            lines.append(f"🕒 Time stop: {self.time_stop_reason}")
         if self.invalidation:
             lines.append(f"❌ Invalidation: {self.invalidation}")
         lines.append(f"⭐ Quality: {self.quality.upper()}")
@@ -487,6 +523,36 @@ class RiskManager:
         hold_label, hold_detail, hold_max = suggest_hold_window(
             primary_tf, setup_name, tags, direction, confidence
         )
+        lifecycle = suggest_trade_lifecycle(
+            primary_tf=primary_tf,
+            setup_name=setup_name,
+            strategy_tags=tags,
+            entry_status=str(execution.get("status") or "ready"),
+            atr_pct=atr_pct,
+            hold_label=hold_label,
+            hold_hours_max=hold_max,
+            ready_expiry_bars=int(
+                getattr(
+                    getattr(self.config, "analysis", None),
+                    "ready_entry_expiry_bars",
+                    3,
+                )
+            ),
+            retest_expiry_bars=int(
+                getattr(
+                    getattr(self.config, "analysis", None),
+                    "retest_entry_expiry_bars",
+                    6,
+                )
+            ),
+            max_entry_valid_minutes=int(
+                getattr(
+                    getattr(self.config, "analysis", None),
+                    "max_entry_valid_minutes",
+                    180,
+                )
+            ),
+        )
 
         prop_flags = self._prop_flags(
             atr_pct=atr_pct,
@@ -577,7 +643,15 @@ class RiskManager:
             invalidation=invalidation,
             hold_label=hold_label,
             hold_detail=hold_detail,
+            hold_hours_min=lifecycle["hold_hours_min"],
+            hold_hours_typical_max=lifecycle["hold_hours_typical_max"],
             hold_hours_max=hold_max,
+            signal_generated_at=lifecycle["signal_generated_at"],
+            entry_valid_until=lifecycle["entry_valid_until"],
+            entry_valid_for_minutes=lifecycle["entry_valid_for_minutes"],
+            entry_expiry_bars=lifecycle["entry_expiry_bars"],
+            entry_expiry_reason=lifecycle["entry_expiry_reason"],
+            time_stop_reason=lifecycle["time_stop_reason"],
             is_simulation=True,
             prop_mode=self.prop_mode,
             prop_safe=prop_safe,
@@ -846,6 +920,86 @@ def suggest_hold_window(
     if t in ("1d", "3d", "1w") or t in ("d", "w"):
         return "Day trade", "Suggested hold: 12–24 hours — reassess; not a default swing tool", 24.0
     return "Day trade", "Suggested hold: 4–24 hours (default day-trade window)", 24.0
+
+
+def suggest_trade_lifecycle(
+    *,
+    primary_tf: Optional[str],
+    setup_name: str = "",
+    strategy_tags: Optional[List[str]] = None,
+    entry_status: str = "wait_retest",
+    atr_pct: float = 0.0,
+    hold_label: str = "",
+    hold_hours_max: float = 24.0,
+    ready_expiry_bars: int = 3,
+    retest_expiry_bars: int = 6,
+    max_entry_valid_minutes: int = 180,
+    generated_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Set a short, candle-based entry expiry and post-fill time stop."""
+    tf_minutes = max(1, timeframe_to_minutes(primary_tf or "15m"))
+    blob = " ".join(
+        [setup_name or "", *(str(tag) for tag in (strategy_tags or []))]
+    ).lower()
+    status = str(entry_status or "wait_retest").lower()
+
+    # Ready zones should resolve quickly. Pullback/retest setups get more
+    # candles, but no day-trade entry remains valid longer than three hours.
+    expiry_bars = (
+        max(1, int(retest_expiry_bars))
+        if status == "wait_retest"
+        else max(1, int(ready_expiry_bars))
+    )
+    if any(word in blob for word in ("momentum", "breakout", "continuation")):
+        expiry_bars = min(expiry_bars, 4)
+    if any(word in blob for word in ("mean reversion", "mean_reversion", "retest")):
+        expiry_bars = max(expiry_bars, 6)
+    validity_minutes = int(
+        clamp(
+            tf_minutes * expiry_bars,
+            30,
+            max(30, int(max_entry_valid_minutes)),
+        )
+    )
+    if atr_pct >= 2.5:
+        validity_minutes = max(
+            30,
+            int(round((validity_minutes * 0.75) / tf_minutes) * tf_minutes),
+        )
+    expiry_bars = max(1, int(round(validity_minutes / tf_minutes)))
+
+    created = generated_at or datetime.now(timezone.utc)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    created = created.astimezone(timezone.utc).replace(microsecond=0)
+    valid_until = created + timedelta(minutes=validity_minutes)
+
+    label = str(hold_label or "").lower()
+    if "scalp" in label or hold_hours_max <= 2:
+        hold_min, hold_typical = 0.5, min(1.5, hold_hours_max)
+    elif tf_minutes <= 30:
+        hold_min, hold_typical = 1.0, min(8.0, hold_hours_max)
+    elif tf_minutes <= 120:
+        hold_min, hold_typical = 4.0, min(12.0, hold_hours_max)
+    else:
+        hold_min, hold_typical = 8.0, min(24.0, hold_hours_max)
+
+    return {
+        "signal_generated_at": created.isoformat().replace("+00:00", "Z"),
+        "entry_valid_until": valid_until.isoformat().replace("+00:00", "Z"),
+        "entry_valid_for_minutes": validity_minutes,
+        "entry_expiry_bars": expiry_bars,
+        "entry_expiry_reason": (
+            "cancel if the zone is not touched before expiry, TP1 trades first, "
+            "or a closed candle invalidates structure; never chase afterward"
+        ),
+        "hold_hours_min": float(hold_min),
+        "hold_hours_typical_max": float(hold_typical),
+        "time_stop_reason": (
+            f"after fill, expect resolution in {hold_min:g}–{hold_typical:g}h; "
+            f"close or fully reassess by {hold_hours_max:g}h even if SL/TP is untouched"
+        ),
+    }
 
 
 def _symbol_base(symbol: str) -> str:

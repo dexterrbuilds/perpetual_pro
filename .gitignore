@@ -6,6 +6,10 @@ __pycache__/
 .env
 logs/
 output/
+/data/
+*.db
+*.db-shm
+*.db-wal
 *.log
 .DS_Store
 .idea/

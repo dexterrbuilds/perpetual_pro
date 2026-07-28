@@ -22,6 +22,13 @@ Built to feel like a senior prop trader sitting next to you.
 - Weighted **confluence engine** (trend, momentum, structure, patterns, derivatives, MTF, volume, news)
 - Execution engine: compact OB/FVG/EMA/VWAP/volume-profile retest zones, wick/body/order-flow approximation, L2 spread/imbalance checks, anti-chase filtering, structure/volatility SL, and TP1–TP4
 - Strict directional gate: stale/gapped candles, live-price dislocation, wide spreads, high immediate-SL risk, weak TP2 R:R, low confluence, and extended setups remain **bias only / no trade**
+- Every trade card includes a candle-based pending-entry expiry and a post-fill
+  hold/time-stop window. Unfilled setups are cancelled if expiry arrives, TP1
+  trades first, or closed-candle structure invalidates; scheduled duplicate
+  alerts are suppressed until the original entry window expires.
+- When several correlated coins qualify together, Telegram keeps the
+  highest-ranked setups inside the configured **2% total open-risk budget**
+  instead of presenting every 1%-risk setup as independently safe.
 - Risk engine: entry zone, SL, TP1–TP4, R:R, position size from account risk %
 
 ### Screen Mode (`--screen`)
@@ -50,6 +57,13 @@ Built to feel like a senior prop trader sitting next to you.
   Text delivery remains as an automatic fallback if media rendering/upload fails.
   When no setup passes the quality gates, Telegram sends an explicit
   **NO QUALITY SETUP — STAND ASIDE** confirmation.
+- **Active signal tracker**: only delivered ≥80% setups are persisted and
+  subscribed on one public OKX WebSocket. RETEST signals progress through
+  pending → entered → TP/SL/expired; CMP-ready alerts begin entered. TP1 before
+  entry is recorded as missed, while TP1 after entry keeps the remaining targets
+  active. Telegram follow-ups are sent only on state changes. A 30-minute REST
+  reconciliation recovers disconnects and checks confirmed-candle invalidation.
+  Forward outcomes retain entry delay, fill-proxy slippage, MFE, MAE and R.
 
 **Telegram secrets are env-only** (never put tokens in `config.yaml` or commit them):
 
@@ -60,6 +74,9 @@ export TELEGRAM_CHAT_ID="your-alert-group-id"
 export TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS="your-private-channel-id"
 export TELEGRAM_COMMAND_CHAT_IDS="your-private-chat-id"
 export TELEGRAM_TEST_KEY="a-long-random-admin-key"
+# Optional tracker overrides. Attach a Railway volume for deploy-safe history:
+export SIGNAL_TRACKER_DB_PATH="/data/perpetual_pro_signals.db"
+export SIGNAL_TRACKER_RECONCILE_SECONDS="1800"
 # Optional outside Render; may be a base URL or the full webhook endpoint:
 export TELEGRAM_WEBHOOK_URL="https://your-api.example.com"
 
@@ -72,7 +89,8 @@ Streamlit: **Scan & analyze** with interactive closed-candle/volume/entry charts
 
 The FastAPI deployment starts the scheduler in-process when
 `SCHEDULER_ENABLED=1` (the default in `render.yaml`). Check `GET /telegram/status`,
-or send a live permission/delivery test with:
+`GET /health`, and `GET /signal-tracker/reliability`, or send a live
+permission/delivery test with:
 
 ```bash
 curl -X POST https://your-host/telegram/test \
@@ -111,6 +129,11 @@ group/channel IDs commonly begin with `-100`.
 > A scheduler embedded in a web service runs only while that process is awake.
 > On hosts that suspend free services, use an always-on instance or run
 > `scripts/run_scheduled_scans.py` in a dedicated worker/cron process.
+>
+> SQLite works without a volume, but Railway's container filesystem is
+> deployment-ephemeral. Mount a persistent volume (for example at `/data`) and
+> set `SIGNAL_TRACKER_DB_PATH=/data/perpetual_pro_signals.db` to preserve
+> lifecycle history across deployments.
 
 ---
 
@@ -129,6 +152,7 @@ perpetual_pro/
 │   ├── analysis/      # indicators, patterns, structure, confluence, risk
 │   ├── vision/        # capture, ocr, chart_detect, preprocess
 │   ├── report/        # rich + MD/JSON
+│   ├── tracking/      # SQLite lifecycle, active WebSocket, outcome calibration
 │   └── utils/         # config, helpers
 └── tests/
 ```
