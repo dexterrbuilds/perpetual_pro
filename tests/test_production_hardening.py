@@ -16,7 +16,11 @@ from src.api.security import (
 )
 from src.scoring.features import build_candidate_record
 from src.scoring.training import _prepare_rows
-from src.tracking.durable_repository import destination_hash, event_id_for
+from src.tracking.durable_repository import (
+    LifecycleRepository,
+    destination_hash,
+    event_id_for,
+)
 from src.tracking.signal_tracker import SignalStore, SignalTracker
 from src.utils.build_info import get_build_identity
 from src.utils.config import load_config
@@ -179,6 +183,59 @@ def test_durable_hashes_and_event_keys_are_stable_and_redacted():
     assert "-100123" not in destination_hash("-100123")
     event = {"signal_id": "sig", "lifecycle_version": 2, "event_type": "entered", "occurred_at": "now"}
     assert event_id_for(event) == event_id_for(event)
+
+
+@pytest.mark.parametrize(
+    "delivered,attempts,expected_status,message_id",
+    [(True, 1, "delivered", 42), (False, 6, "dead_letter", None)],
+)
+def test_terminal_notification_ack_preserves_nonnull_retry_timestamp(
+    monkeypatch, delivered, attempts, expected_status, message_id
+):
+    """Terminal ledger states must be durable under the SQL constraint."""
+    executed = []
+
+    class Cursor:
+        rowcount = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params):
+            executed.append((sql, params))
+
+        def fetchone(self):
+            return {"attempt_count": attempts}
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            return None
+
+    repository = LifecycleRepository("postgresql://configured")
+    monkeypatch.setattr(repository, "_connect", lambda: Connection())
+
+    assert repository.finish_notification(
+        7,
+        delivered=delivered,
+        message_id=message_id,
+        error_category="test_failure",
+    ) is True
+    update_params = executed[-1][1]
+    assert update_params[0] == expected_status
+    assert update_params[1] == message_id
+    assert update_params[3] is not None
 
 
 def test_scan_auth_rejects_unauthorized_and_rate_limits(monkeypatch):

@@ -498,10 +498,17 @@ class LifecycleRepository:
                 attempts = int(row.get("attempt_count") or 0)
                 if delivered:
                     status = "delivered"
-                    next_retry = None
+                    # ``next_retry_at`` is deliberately NOT NULL so every
+                    # ledger row has a sortable timestamp.  Delivered rows are
+                    # excluded by status, therefore retaining a final timestamp
+                    # is harmless and avoids losing the delivery acknowledgement
+                    # after Telegram has already accepted the message.
+                    next_retry = _now()
                 elif attempts >= MAX_NOTIFICATION_ATTEMPTS:
                     status = "dead_letter"
-                    next_retry = None
+                    # Terminal failures are also excluded from the due query;
+                    # retain a final timestamp to satisfy the ledger invariant.
+                    next_retry = _now()
                 else:
                     status = "retry"
                     base = max(float(retry_after_seconds or 0), min(1800.0, 30.0 * (2 ** max(0, attempts - 1))))
