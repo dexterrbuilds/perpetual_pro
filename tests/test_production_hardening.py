@@ -20,6 +20,7 @@ from src.tracking.durable_repository import (
     LifecycleRepository,
     destination_hash,
     event_id_for,
+    remaining_size_for,
 )
 from src.tracking.signal_tracker import SignalStore, SignalTracker
 from src.utils.build_info import get_build_identity
@@ -183,6 +184,21 @@ def test_durable_hashes_and_event_keys_are_stable_and_redacted():
     assert "-100123" not in destination_hash("-100123")
     event = {"signal_id": "sig", "lifecycle_version": 2, "event_type": "entered", "occurred_at": "now"}
     assert event_id_for(event) == event_id_for(event)
+
+
+def test_durable_remaining_size_is_zero_for_every_terminal_state():
+    allocations = [0.5, 0.5]
+    assert remaining_size_for("entered", allocations, 1) == pytest.approx(0.5)
+    for status in (
+        "completed",
+        "stopped",
+        "missed",
+        "expired",
+        "invalidated",
+        "time_exit",
+        "ambiguous_gap",
+    ):
+        assert remaining_size_for(status, allocations, 1) == 0.0
 
 
 @pytest.mark.parametrize(

@@ -56,6 +56,17 @@ def event_id_for(event: Mapping[str, Any]) -> str:
     return "evt_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
+def remaining_size_for(
+    status: str,
+    allocations: Sequence[float],
+    highest_tp: int,
+) -> float:
+    """Return recoverable open size; terminal lifecycle states own no position."""
+    if str(status or "") not in ACTIVE_STATES:
+        return 0.0
+    return max(0.0, 1.0 - sum(allocations[: max(0, int(highest_tp))]))
+
+
 class LifecycleRepository:
     """Connection-per-operation durable lifecycle repository.
 
@@ -162,7 +173,13 @@ class LifecycleRepository:
             total_allocation = sum(allocations)
             allocations = [value / total_allocation for value in allocations]
         highest_tp = int(signal.get("highest_tp") or 0)
-        remaining_size = max(0.0, 1.0 - sum(allocations[:highest_tp]))
+        remaining_size = remaining_size_for(
+            str(signal.get("status") or ""), allocations, highest_tp
+        )
+        protected = bool(signal.get("protected") or highest_tp >= 1)
+        lifecycle_state = self._state_payload(signal)
+        lifecycle_state["remaining_size"] = remaining_size
+        lifecycle_state["protected"] = protected
         params = {
             "signal_id": signal.get("id"),
             "candidate_id": row.get("candidate_id"),
@@ -190,9 +207,7 @@ class LifecycleRepository:
             "target_allocations": Jsonb(allocations),
             "highest_tp": highest_tp,
             "remaining_size": remaining_size,
-            "protected": bool(
-                signal.get("protected") or highest_tp >= 1
-            ),
+            "protected": protected,
             "realized_r": float(signal.get("realized_r") or 0),
             "mfe_r": float(signal.get("mfe_r") or 0),
             "mae_r": float(signal.get("mae_r") or 0),
@@ -212,7 +227,7 @@ class LifecycleRepository:
             "execution_policy_version": row.get("execution_policy_version"),
             "rank_policy_version": row.get("rank_policy_version"),
             "signal_payload": Jsonb(row),
-            "lifecycle_state": Jsonb(self._state_payload(signal)),
+            "lifecycle_state": Jsonb(lifecycle_state),
         }
         upsert = """
             insert into public.tracked_signals (
