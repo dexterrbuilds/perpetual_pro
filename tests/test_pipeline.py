@@ -142,7 +142,7 @@ def test_full_confluence_pipeline(tmp_path):
     assert analysis.scenarios is not None
     assert analysis.execution is not None
     assert analysis.trade_plan.entry_status in (
-        "ready",
+        "confirmation_pending",
         "wait_retest",
         "avoid_chase",
         "blocked",

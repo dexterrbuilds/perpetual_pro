@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -10,11 +10,16 @@ import pandas as pd
 from loguru import logger
 
 from src.analysis.execution import ExecutionProfile, build_execution_profile
+from src.analysis.execution_policy import (
+    DEFAULT_EXECUTION_POLICY,
+    RANK_POLICY_VERSION,
+    deterministic_rank_score,
+)
 from src.analysis.indicators import IndicatorSuite, compute_indicators
+from src.analysis.legacy_v2 import execution_aware_legacy_confidence
 from src.analysis.llm import (
     LLMNarrative,
     NarrativeLLM,
-    combined_rank_score,
     heuristic_llm_confidence,
 )
 from src.analysis.market_structure import MarketStructureAnalyzer, StructureReport
@@ -24,7 +29,7 @@ from src.data.exchange import MarketSnapshot
 from src.data.multi_tf import MultiTimeframeData
 from src.data.news import NewsBundle
 from src.utils.config import AppConfig
-from src.utils.helpers import clamp, format_price, safe_float, utc_now_iso
+from src.utils.helpers import clamp, format_price, safe_float, timeframe_to_minutes, utc_now_iso
 
 
 @dataclass
@@ -51,10 +56,10 @@ class FullAnalysis:
     direction: str = "flat"  # long | short | flat
     confidence: float = 0.0  # 0-100 (technical, pre-LLM blend)
     technical_confidence: float = 0.0  # pure technical score
-    llm_confidence: float = 0.0  # 0-100 play-out likelihood from LLM
+    llm_confidence: float = 0.0  # narrative context score; never alert authority
     llm_confidence_reason: str = ""
     llm_confidence_detail: Dict[str, Any] = field(default_factory=dict)
-    rank_score: float = 0.0  # combined LLM + technical ranking score
+    rank_score: float = 0.0  # deterministic technical/confluence/execution rank
     setup_name: str = ""
     strategy_tags: List[str] = field(default_factory=list)
 
@@ -277,6 +282,50 @@ class ConfluenceEngine:
             price=price,
             atr=atr,
             snapshot=mtf.snapshot,
+            max_pre_entry_tp1_progress_pct=float(
+                getattr(
+                    self.config.analysis,
+                    "max_pre_entry_tp1_progress_pct",
+                    70.0,
+                )
+            ),
+            setup_name=result.setup_name,
+            strategy_tags=result.strategy_tags,
+            remaining_expiry_minutes=float(
+                min(
+                    getattr(self.config.analysis, "max_entry_valid_minutes", 180),
+                    getattr(self.config.analysis, "retest_entry_expiry_bars", 6)
+                    * timeframe_to_minutes(mtf.primary_tf),
+                )
+            ),
+            expected_hold_hours=(
+                4.0 if "scalping" in result.strategy_tags else 8.0
+            ),
+            policy=replace(
+                DEFAULT_EXECUTION_POLICY,
+                default_taker_fee_bps_per_side=float(
+                    self.config.analysis.execution_taker_fee_bps_per_side
+                ),
+                default_slippage_bps_per_side=float(
+                    self.config.analysis.execution_slippage_bps_per_side
+                ),
+                default_funding_bps_per_8h=float(
+                    self.config.analysis.execution_funding_bps_per_8h
+                ),
+                reference_impact_notional_usd=float(
+                    self.config.analysis.execution_impact_notional_usd
+                ),
+                max_spread_bps=float(self.config.analysis.max_spread_bps),
+                max_ticker_age_seconds=float(
+                    self.config.analysis.max_ticker_age_seconds
+                ),
+                max_orderbook_age_seconds=float(
+                    self.config.analysis.max_orderbook_age_seconds
+                ),
+                minimum_execution_quality=float(
+                    self.config.analysis.execution_min_score
+                ),
+            ),
         )
         result.execution = execution
         quality_map = dict(mtf.quality or {})
@@ -305,23 +354,33 @@ class ConfluenceEngine:
             or [100.0]
         )
 
-        # Overall confidence is deterministic. Execution can confirm a clean
-        # entry or penalize one likely to stop immediately, but a language model
-        # is never allowed to promote a weak technical setup.
-        execution_adjustment = float(
-            clamp((execution.score - 70.0) * 0.12, -10.0, 3.0)
+        # Preserve the existing technical score. Legacy V2 changes only overall
+        # trade confidence by making execution a bottleneck instead of a small
+        # rank adjustment.
+        legacy_comparison = execution_aware_legacy_confidence(
+            technical_confidence=conf,
+            execution_score=execution.score,
+            immediate_sl_risk=execution.immediate_sl_risk,
+            data_quality_score=data_quality_score,
+            confidence_min=self.config.analysis.min_confidence,
+            confidence_max=self.config.analysis.max_confidence,
+            execution_confidence_buffer=getattr(
+                self.config.analysis,
+                "execution_confidence_buffer",
+                5.0,
+            ),
         )
-        sl_penalty = max(0.0, execution.immediate_sl_risk - 28.0) * 0.20
-        quality_penalty = max(0.0, 75.0 - data_quality_score) * 0.20
-        calibrated_conf = float(
-            clamp(
-                conf + execution_adjustment - sl_penalty - quality_penalty,
-                self.config.analysis.min_confidence,
-                self.config.analysis.max_confidence,
-            )
+        legacy_conf = legacy_comparison.legacy_confidence
+        legacy_v2_conf = legacy_comparison.legacy_v2_confidence
+        calibrated_conf = (
+            legacy_v2_conf
+            if bool(getattr(self.config.analysis, "legacy_v2_enabled", True))
+            else legacy_conf
         )
         if not data_quality_ok:
             calibrated_conf = min(calibrated_conf, 45.0)
+            legacy_conf = min(legacy_conf, 45.0)
+            legacy_v2_conf = min(legacy_v2_conf, 45.0)
         result.confidence = calibrated_conf
 
         # Trade plan — structure-clustered retest entry, stop, and targets.
@@ -491,10 +550,35 @@ class ConfluenceEngine:
             getattr(self.config.analysis, "directional_score_threshold", 0.20)
         )
         execution_floor = float(
-            getattr(self.config.analysis, "execution_min_score", 65.0)
+            getattr(self.config.analysis, "execution_min_score", 72.0)
+        )
+        legacy_execution_floor = float(
+            getattr(self.config.analysis, "legacy_execution_min_score", 65.0)
         )
         max_immediate_sl_risk = float(
             getattr(self.config.analysis, "max_immediate_sl_risk", 32.0)
+        )
+        plan_prop_safe_before_confidence_gate = bool(
+            getattr(plan, "prop_safe", True)
+        )
+        common_legacy_gate = bool(
+            direction in ("long", "short")
+            and abs(result.confluence_total) >= score_floor
+            and execution.status in ("confirmation_pending", "wait_retest")
+            and execution.immediate_sl_risk <= max_immediate_sl_risk
+            and execution.market_quality_ok
+            and data_quality_ok
+            and plan_prop_safe_before_confidence_gate
+        )
+        legacy_signal_eligible = bool(
+            common_legacy_gate
+            and legacy_conf >= confidence_floor
+            and execution.score >= legacy_execution_floor
+        )
+        legacy_v2_signal_eligible = bool(
+            common_legacy_gate
+            and legacy_v2_conf >= confidence_floor
+            and execution.score >= execution_floor
         )
         self.risk.apply_prop_confidence_gate(
             plan, result.confidence, minimum=confidence_floor
@@ -504,52 +588,132 @@ class ConfluenceEngine:
             and result.confidence >= confidence_floor
             and abs(result.confluence_total) >= score_floor
             and execution.score >= execution_floor
-            and execution.status in ("ready", "wait_retest")
+            and execution.status in ("confirmation_pending", "wait_retest")
             and execution.immediate_sl_risk <= max_immediate_sl_risk
             and execution.market_quality_ok
             and data_quality_ok
             and getattr(plan, "prop_safe", True)
         )
+        structured_rejections: List[Dict[str, Any]] = []
         if direction in ("long", "short") and not signal_eligible:
             gate_reasons: List[str] = []
             if result.confidence < confidence_floor:
-                gate_reasons.append(
-                    f"confidence {result.confidence:.0f}% < {confidence_floor:.0f}%"
+                detail = (
+                    f"confidence {result.confidence:.0f}% < "
+                    f"{confidence_floor:.0f}%"
+                )
+                gate_reasons.append(detail)
+                structured_rejections.append(
+                    {
+                        "code": "CONFIDENCE_BELOW_MINIMUM",
+                        "detail": detail,
+                        "value": round(result.confidence, 3),
+                        "threshold": confidence_floor,
+                    }
                 )
             if abs(result.confluence_total) < score_floor:
-                gate_reasons.append(
-                    f"confluence {abs(result.confluence_total):.2f} < {score_floor:.2f}"
+                detail = (
+                    f"confluence {abs(result.confluence_total):.2f} < "
+                    f"{score_floor:.2f}"
+                )
+                gate_reasons.append(detail)
+                structured_rejections.append(
+                    {
+                        "code": "CONFLUENCE_BELOW_MINIMUM",
+                        "detail": detail,
+                        "value": round(abs(result.confluence_total), 4),
+                        "threshold": score_floor,
+                    }
                 )
             if execution.score < execution_floor:
-                gate_reasons.append(
-                    f"execution {execution.score:.0f} < {execution_floor:.0f}"
+                detail = (
+                    f"execution {execution.score:.0f} < "
+                    f"{execution_floor:.0f}"
                 )
-            if execution.status not in ("ready", "wait_retest"):
-                gate_reasons.append(execution.status.replace("_", " "))
+                gate_reasons.append(detail)
+                structured_rejections.append(
+                    {
+                        "code": "EXECUTION_BELOW_MINIMUM",
+                        "detail": detail,
+                        "value": round(execution.score, 3),
+                        "threshold": execution_floor,
+                    }
+                )
+            if execution.status not in ("confirmation_pending", "wait_retest"):
+                detail = execution.status.replace("_", " ")
+                gate_reasons.append(detail)
+                structured_rejections.append(
+                    {
+                        "code": "ENTRY_STATUS_BLOCKED",
+                        "detail": detail,
+                        "value": execution.status,
+                    }
+                )
             if execution.immediate_sl_risk > max_immediate_sl_risk:
-                gate_reasons.append(
+                detail = (
                     f"immediate-SL risk {execution.immediate_sl_risk:.0f}%"
+                )
+                gate_reasons.append(detail)
+                structured_rejections.append(
+                    {
+                        "code": "IMMEDIATE_SL_RISK_HIGH",
+                        "detail": detail,
+                        "value": round(execution.immediate_sl_risk, 3),
+                        "threshold": max_immediate_sl_risk,
+                    }
                 )
             if not execution.market_quality_ok:
                 gate_reasons.append("wide spread / poor market quality")
+                structured_rejections.append(
+                    {
+                        "code": "MARKET_QUALITY_BLOCKED",
+                        "detail": "wide spread / poor market quality",
+                    }
+                )
             if not data_quality_ok:
                 failed_quality = [
                     f"{tf}:{q.get('reason', 'invalid')}"
                     for tf, q in required_quality.items()
                     if not q.get("ok", False)
                 ]
-                gate_reasons.append(
-                    (
-                        f"live price dislocation {live_move_atr:.1f} ATR"
-                        if not live_price_ok
-                        else (
-                            "market data quality: "
-                            + ", ".join(failed_quality or ["invalid"])
-                        )
+                detail = (
+                    f"live price dislocation {live_move_atr:.1f} ATR"
+                    if not live_price_ok
+                    else (
+                        "market data quality: "
+                        + ", ".join(failed_quality or ["invalid"])
                     )
+                )
+                gate_reasons.append(detail)
+                structured_rejections.append(
+                    {
+                        "code": "DATA_QUALITY_BLOCKED",
+                        "detail": detail,
+                    }
                 )
             if not plan.prop_safe:
                 gate_reasons.append("prop risk gate")
+                structured_rejections.append(
+                    {
+                        "code": "PROP_RISK_BLOCKED",
+                        "detail": "prop risk gate",
+                    }
+                )
+            logger.info(
+                "Signal rejected: symbol={} timeframe={} bias={} "
+                "technical={:.1f} legacy_conf={:.1f} v2_conf={:.1f} "
+                "execution={:.1f} reasons={}",
+                result.symbol,
+                result.primary_tf,
+                result.bias,
+                result.technical_confidence,
+                legacy_conf,
+                legacy_v2_conf,
+                execution.score,
+                "|".join(
+                    str(item.get("code") or "") for item in structured_rejections
+                ),
+            )
             result.direction = "flat"
             result.setup_name = "No Trade / Wait for Confirmation"
             plan.direction = "flat"
@@ -570,13 +734,23 @@ class ConfluenceEngine:
             if risk not in result.key_risks:
                 result.key_risks.append(risk)
 
-        result.rank_score = combined_rank_score(
-            direction=result.direction,
-            llm_confidence=result.llm_confidence,
-            technical_confidence=result.technical_confidence,
-            confluence_total=result.confluence_total,
-            execution_score=execution.score,
-        )
+        if result.direction in ("long", "short"):
+            result.rank_score, rank_breakdown = deterministic_rank_score(
+                overall_quality=result.confidence,
+                execution_quality=execution.score,
+                target_feasibility=execution.components.get("target_feasibility", 0.0),
+                stop_quality=execution.components.get("stop_quality", 0.0),
+                net_rr=(
+                    execution.net_risk_reward[1]
+                    if len(execution.net_risk_reward) > 1
+                    else (execution.net_risk_reward[0] if execution.net_risk_reward else 0.0)
+                ),
+                market_data_quality=execution.components.get("data_market_quality", 0.0),
+                setup_validity=100.0 if not execution.hard_failures else 0.0,
+                uncertainty_penalty=min(20.0, len(execution.uncertainties) * 3.0),
+            )
+        else:
+            result.rank_score, rank_breakdown = 0.0, {}
 
         result.meta = {
             "price": price,
@@ -596,13 +770,24 @@ class ConfluenceEngine:
             "simulated_capital": plan.simulated_capital,
             "is_simulation": True,
             "technical_confidence": result.technical_confidence,
+            "legacy_confidence": legacy_conf,
+            "legacy_v2_confidence": legacy_v2_conf,
+            "legacy_v2_enabled": bool(
+                getattr(self.config.analysis, "legacy_v2_enabled", True)
+            ),
+            "legacy_confidence_comparison": legacy_comparison.to_dict(),
             "llm_confidence": result.llm_confidence,
             "llm_confidence_reason": result.llm_confidence_reason,
             "llm_confidence_detail": result.llm_confidence_detail,
             "rank_score": result.rank_score,
+            "rank_policy_version": RANK_POLICY_VERSION,
+            "rank_breakdown": rank_breakdown,
             "prop_safe": bool(getattr(plan, "prop_safe", True)),
             "prop_flags": list(getattr(plan, "prop_flags", None) or []),
             "signal_eligible": signal_eligible,
+            "legacy_signal_eligible": legacy_signal_eligible,
+            "legacy_v2_signal_eligible": legacy_v2_signal_eligible,
+            "rejection_reasons": structured_rejections,
             "execution": execution.to_dict(),
             "data_quality": dict(mtf.quality or {}),
             "primary_data_quality_ok": data_quality_ok,
@@ -836,7 +1021,12 @@ class ConfluenceEngine:
             tags.append("momentum")
         if adx < 24 and (bb_pos <= 0.22 or bb_pos >= 0.78 or (rsi is not None and (rsi < 35 or rsi > 65))):
             tags.append("mean_reversion")
-        if struct.last_bos:
+        bos_agrees = (
+            direction == "long" and struct.last_bos == "bullish"
+        ) or (
+            direction == "short" and struct.last_bos == "bearish"
+        )
+        if bos_agrees:
             tags.append("breakout" if struct.last_bos == "bullish" else "breakdown")
             tags.append("breakout_retest")
         if abs(mom) > 0.25:
@@ -878,14 +1068,17 @@ class ConfluenceEngine:
         if direction == "flat":
             return "No Trade / Stand Aside"
         side = "Long" if direction == "long" else "Short"
+        wanted = "bullish" if direction == "long" else "bearish"
+        if "reversal" in tags and struct.last_choch == wanted:
+            return f"{side} Confirmed Reversal"
+        if "mean_reversion" in tags and struct.trend == "range":
+            return f"{side} Range Mean Reversion"
         if "breakout" in tags or "breakdown" in tags:
+            if "momentum" in tags and "volume_surge" in tags:
+                return f"{side} Breakout Continuation"
             return f"{side} Breakout Retest"
         if "momentum" in tags:
             return f"{side} Momentum"
-        if "mean_reversion" in tags:
-            return f"{side} Mean Reversion"
-        if "reversal" in tags:
-            return f"{side} Reversal"
         if "volume_surge" in tags and "momentum" in tags:
             return f"{side} Volume Momentum Burst"
         if "choch" in tags:

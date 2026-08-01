@@ -7,6 +7,7 @@ when derivatives endpoints are unavailable.
 from __future__ import annotations
 
 import copy
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -18,7 +19,7 @@ import pandas as pd
 from loguru import logger
 
 from src.utils.config import AppConfig, ExchangeConfig
-from src.utils.helpers import normalize_symbol, safe_float
+from src.utils.helpers import normalize_symbol, safe_float, timeframe_to_minutes
 
 
 # Public market data changes quickly, but duplicate requests inside a scan add
@@ -65,7 +66,7 @@ def _cache_get(key: Tuple[Any, ...]) -> Any:
         return value.copy(deep=True) if isinstance(value, pd.DataFrame) else copy.deepcopy(value)
 
 
-def _cache_put(key: Tuple[Any, ...], value: Any, ttl_seconds: int) -> None:
+def _cache_put(key: Tuple[Any, ...], value: Any, ttl_seconds: float) -> None:
     if ttl_seconds <= 0:
         return
     stored = value.copy(deep=True) if isinstance(value, pd.DataFrame) else copy.deepcopy(value)
@@ -77,6 +78,48 @@ def _cache_put(key: Tuple[Any, ...], value: Any, ttl_seconds: int) -> None:
             stale = [k for k, (expiry, _) in _MARKET_DATA_CACHE.items() if expiry <= now]
             for stale_key in stale:
                 _MARKET_DATA_CACHE.pop(stale_key, None)
+
+
+def _normalized_timestamp_ms(value: Any, fallback_ms: int) -> int:
+    """Return a plausible epoch-millisecond timestamp for source-age checks."""
+    numeric = safe_float(value)
+    if numeric <= 0:
+        return fallback_ms
+    # A few APIs expose epoch seconds rather than CCXT's usual milliseconds.
+    if numeric < 10_000_000_000:
+        numeric *= 1000.0
+    return int(numeric)
+
+
+def _source_age_seconds(timestamp_ms: Any, now_ms: Optional[int] = None) -> float:
+    current = int(now_ms if now_ms is not None else time.time() * 1000)
+    source = _normalized_timestamp_ms(timestamp_ms, current)
+    return max(0.0, (current - source) / 1000.0)
+
+
+def _ohlcv_cache_ttl_seconds(
+    frame: pd.DataFrame,
+    timeframe: str,
+    configured_ttl: float,
+    *,
+    now_ms: Optional[int] = None,
+) -> float:
+    """Never keep an OHLCV response across the close of its newest candle."""
+    ttl = max(0.0, float(configured_ttl or 0.0))
+    if ttl <= 0 or frame.empty or not isinstance(frame.index, pd.DatetimeIndex):
+        return ttl
+    last_open = frame.index[-1]
+    if last_open.tzinfo is None:
+        last_open = last_open.tz_localize("UTC")
+    else:
+        last_open = last_open.tz_convert("UTC")
+    closes_at_ms = int(
+        (last_open + pd.Timedelta(minutes=timeframe_to_minutes(timeframe))).timestamp()
+        * 1000
+    )
+    current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    until_close = max(0.25, (closes_at_ms - current_ms) / 1000.0)
+    return min(ttl, until_close)
 
 
 # Map friendly names → ccxt class names
@@ -186,7 +229,20 @@ class MarketSnapshot:
     orderbook_imbalance: Optional[float] = None
     orderbook_bid_depth: Optional[float] = None
     orderbook_ask_depth: Optional[float] = None
+    orderbook_bid_depth_usd: Optional[float] = None
+    orderbook_ask_depth_usd: Optional[float] = None
+    orderbook_depth_bands: Dict[str, Any] = field(default_factory=dict)
+    estimated_impact_bps: Optional[float] = None
+    impact_reference_notional_usd: Optional[float] = None
+    contract_size: Optional[float] = None
+    tick_size: Optional[float] = None
+    min_notional: Optional[float] = None
+    amount_precision: Optional[float] = None
     orderbook_timestamp: Optional[int] = None
+    ticker_timestamp: Optional[int] = None
+    ticker_age_seconds: Optional[float] = None
+    orderbook_age_seconds: Optional[float] = None
+    execution_data_fresh: Optional[bool] = None
     mark_index_basis_bps: Optional[float] = None
     raw: Dict[str, Any] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
@@ -196,6 +252,30 @@ class MarketSnapshot:
         if self.funding_rate is None:
             return None
         return self.funding_rate * 100.0
+
+    def refresh_source_ages(
+        self,
+        *,
+        max_ticker_age_seconds: float,
+        max_orderbook_age_seconds: float,
+    ) -> None:
+        """Recompute ages even when the aggregate snapshot came from cache."""
+        self.ticker_age_seconds = (
+            _source_age_seconds(self.ticker_timestamp)
+            if self.ticker_timestamp is not None
+            else None
+        )
+        self.orderbook_age_seconds = (
+            _source_age_seconds(self.orderbook_timestamp)
+            if self.orderbook_timestamp is not None
+            else None
+        )
+        freshness: List[bool] = []
+        if self.ticker_age_seconds is not None:
+            freshness.append(self.ticker_age_seconds <= max_ticker_age_seconds)
+        if self.orderbook_age_seconds is not None:
+            freshness.append(self.orderbook_age_seconds <= max_orderbook_age_seconds)
+        self.execution_data_fresh = all(freshness) if freshness else None
 
 
 class ExchangeClient:
@@ -368,11 +448,12 @@ class ExchangeClient:
         limit: int = 500,
         since: Optional[int] = None,
         max_retries: int = 3,
+        force_refresh: bool = False,
     ) -> pd.DataFrame:
         """Fetch OHLCV and return a clean DataFrame indexed by datetime UTC."""
         resolved = self.resolve_symbol(symbol)
         cache_key = ("ohlcv", self.exchange_id, resolved, timeframe, int(limit), since)
-        cached = _cache_get(cache_key)
+        cached = None if force_refresh else _cache_get(cache_key)
         if isinstance(cached, pd.DataFrame) and not cached.empty:
             logger.debug("OHLCV cache hit {} {} {}", self.exchange_id, resolved, timeframe)
             return cached
@@ -392,7 +473,35 @@ class ExchangeClient:
                 df = df.set_index("timestamp")
                 for col in ("open", "high", "low", "close", "volume"):
                     df[col] = pd.to_numeric(df[col], errors="coerce")
-                df = df.dropna(subset=["open", "high", "low", "close"])
+                required = ["open", "high", "low", "close", "volume"]
+                finite = df[required].apply(
+                    lambda series: series.map(
+                        lambda value: math.isfinite(float(value))
+                        if value is not None
+                        else False
+                    )
+                ).all(axis=1)
+                coherent = (
+                    (df["open"] > 0)
+                    & (df["high"] > 0)
+                    & (df["low"] > 0)
+                    & (df["close"] > 0)
+                    & (df["volume"] >= 0)
+                    & (df["high"] >= df[["open", "close"]].max(axis=1))
+                    & (df["low"] <= df[["open", "close"]].min(axis=1))
+                    & (df["high"] >= df["low"])
+                )
+                rejected = int((~(finite & coherent)).sum())
+                df = df.loc[finite & coherent].copy()
+                if rejected:
+                    logger.warning(
+                        "Rejected {} malformed/nonfinite {} candles for {}",
+                        rejected,
+                        timeframe,
+                        resolved,
+                    )
+                if df.empty:
+                    raise ValueError(f"No finite coherent OHLCV for {resolved} {timeframe}")
                 logger.debug(
                     "Fetched {} candles for {} {} on {}",
                     len(df),
@@ -400,7 +509,15 @@ class ExchangeClient:
                     timeframe,
                     self.exchange_id,
                 )
-                _cache_put(cache_key, df, getattr(self, "cache_ttl_seconds", 300))
+                _cache_put(
+                    cache_key,
+                    df,
+                    _ohlcv_cache_ttl_seconds(
+                        df,
+                        timeframe,
+                        getattr(self, "cache_ttl_seconds", 300),
+                    ),
+                )
                 return df
             except ccxt.RateLimitExceeded as exc:
                 last_err = exc
@@ -423,12 +540,12 @@ class ExchangeClient:
                 time.sleep(sleep_s)
         raise RuntimeError(f"Failed to fetch OHLCV for {symbol}: {last_err}")
 
-    def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
+    def fetch_ticker(self, symbol: str, force_refresh: bool = False) -> Dict[str, Any]:
         normalized_symbol = normalize_symbol(symbol)
         logger.info("Ticker input '{}' -> cleaned symbol '{}'", symbol, normalized_symbol)
         resolved = self.resolve_symbol(normalized_symbol)
         cache_key = ("ticker", self.exchange_id, resolved)
-        cached = _cache_get(cache_key)
+        cached = None if force_refresh else _cache_get(cache_key)
         if isinstance(cached, dict) and cached:
             return cached
         candidates = [resolved, *self._build_symbol_candidates(normalized_symbol, symbol)]
@@ -441,15 +558,23 @@ class ExchangeClient:
                 if result:
                     price = None
                     for key in ("last", "close", "mark", "index", "ask", "bid"):
-                        price = result.get(key)
-                        if price is not None:
+                        candidate_price = safe_float(result.get(key))
+                        if candidate_price > 0:
+                            price = candidate_price
                             break
-                    if price is not None:
+                    numeric_price = safe_float(price)
+                    if numeric_price > 0:
+                        observed_ms = int(time.time() * 1000)
+                        result = dict(result)
+                        result["_perpetual_pro_observed_at_ms"] = observed_ms
+                        result["_perpetual_pro_source_timestamp_ms"] = (
+                            _normalized_timestamp_ms(result.get("timestamp"), observed_ms)
+                        )
                         logger.debug(
                             "Ticker fetch success for '{}' using '{}' -> price={}",
                             symbol,
                             candidate,
-                            price,
+                            numeric_price,
                         )
                         # Ticker is used as the live execution reference. Keep
                         # the five-minute cache for closed OHLCV, not live price.
@@ -603,19 +728,35 @@ class ExchangeClient:
         self,
         symbol: str,
         limit: int = 25,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
-        """Best-effort L2 spread and depth imbalance for execution filtering."""
+        """L2 spread and quote-notional depth normalized across contracts."""
         resolved = self.resolve_symbol(symbol)
         cache_key = ("orderbook_summary", self.exchange_id, resolved, int(limit))
-        cached = _cache_get(cache_key)
+        cached = None if force_refresh else _cache_get(cache_key)
         if isinstance(cached, dict) and cached:
             return cached
         try:
             if not self._exchange.has.get("fetchOrderBook"):
                 return {}
             book = self._exchange.fetch_order_book(resolved, limit=limit) or {}
-            bids = list(book.get("bids") or [])[:limit]
-            asks = list(book.get("asks") or [])[:limit]
+            def valid_level(row: Any) -> bool:
+                if not isinstance(row, (list, tuple)) or len(row) < 2:
+                    return False
+                try:
+                    level_price = float(row[0])
+                    amount = float(row[1])
+                except (TypeError, ValueError):
+                    return False
+                return bool(
+                    math.isfinite(level_price)
+                    and math.isfinite(amount)
+                    and level_price > 0
+                    and amount >= 0
+                )
+
+            bids = [row for row in list(book.get("bids") or []) if valid_level(row)][:limit]
+            asks = [row for row in list(book.get("asks") or []) if valid_level(row)][:limit]
             if not bids or not asks:
                 return {}
             best_bid = safe_float(bids[0][0])
@@ -626,32 +767,98 @@ class ExchangeClient:
                 if mid > 0 and best_ask >= best_bid
                 else None
             )
-            # Amount units vary for derivatives, but the same contract units on
-            # each side make this normalized imbalance useful.
-            bid_depth = sum(
-                max(0.0, safe_float(row[1]))
-                for row in bids
-                if isinstance(row, (list, tuple)) and len(row) >= 2
-            )
-            ask_depth = sum(
-                max(0.0, safe_float(row[1]))
-                for row in asks
-                if isinstance(row, (list, tuple)) and len(row) >= 2
-            )
+            try:
+                market = self._exchange.market(resolved) or {}
+            except Exception:  # noqa: BLE001
+                market = {}
+            contract_size = max(0.0, safe_float(market.get("contractSize"), 1.0)) or 1.0
+            inverse = bool(market.get("inverse", False))
+
+            def quote_notional(level: Any) -> float:
+                level_price = safe_float(level[0])
+                amount = max(0.0, safe_float(level[1]))
+                # Linear/spot quantity is base units; inverse contract size is
+                # already quote value per contract on major CCXT venues.
+                return amount * contract_size * (1.0 if inverse else level_price)
+
+            bid_depth = sum(quote_notional(row) for row in bids)
+            ask_depth = sum(quote_notional(row) for row in asks)
             total_depth = bid_depth + ask_depth
             imbalance = (
                 (bid_depth - ask_depth) / total_depth
                 if total_depth > 0
                 else None
             )
+            observed_ms = int(time.time() * 1000)
+            source_timestamp = _normalized_timestamp_ms(
+                book.get("timestamp"), observed_ms
+            )
+            depth_bands: Dict[str, Any] = {}
+            for band in (5, 10, 25):
+                bid_band = sum(
+                    quote_notional(row)
+                    for row in bids
+                    if (mid - safe_float(row[0])) / mid * 10_000.0 <= band
+                )
+                ask_band = sum(
+                    quote_notional(row)
+                    for row in asks
+                    if (safe_float(row[0]) - mid) / mid * 10_000.0 <= band
+                )
+                band_total = bid_band + ask_band
+                depth_bands[str(band)] = {
+                    "bid_usd": bid_band,
+                    "ask_usd": ask_band,
+                    "imbalance": (
+                        (bid_band - ask_band) / band_total if band_total > 0 else None
+                    ),
+                }
+
+            reference_notional = 10_000.0
+            analysis_cfg = getattr(self.config, "analysis", None)
+            reference_notional = float(
+                getattr(analysis_cfg, "execution_impact_notional_usd", reference_notional)
+                or reference_notional
+            )
+
+            def impact_for(levels: List[Any], side: str) -> Optional[float]:
+                cumulative = 0.0
+                worst = mid
+                for row in levels:
+                    cumulative += quote_notional(row)
+                    worst = safe_float(row[0], mid)
+                    if cumulative >= reference_notional:
+                        move = (worst - mid) / mid * 10_000.0
+                        return abs(move)
+                return None
+
+            bid_impact = impact_for(bids, "sell")
+            ask_impact = impact_for(asks, "buy")
+            impact_values = [x for x in (bid_impact, ask_impact) if x is not None]
             result = {
                 "best_bid": best_bid,
                 "best_ask": best_ask,
                 "spread_bps": spread_bps,
+                # Compatibility names now contain quote-notional USD, not raw
+                # contracts. Explicit names remove ambiguity for new callers.
                 "bid_depth": bid_depth,
                 "ask_depth": ask_depth,
+                "bid_depth_usd": bid_depth,
+                "ask_depth_usd": ask_depth,
+                "bid_depth_usd_10bps": depth_bands["10"]["bid_usd"],
+                "ask_depth_usd_10bps": depth_bands["10"]["ask_usd"],
+                "depth_bands_bps": depth_bands,
                 "imbalance": imbalance,
-                "timestamp": book.get("timestamp"),
+                "estimated_impact_bps": max(impact_values) if impact_values else None,
+                "impact_reference_notional_usd": reference_notional,
+                "contract_size": contract_size,
+                "inverse_contract": inverse,
+                "tick_size": (market.get("precision") or {}).get("price"),
+                "amount_precision": (market.get("precision") or {}).get("amount"),
+                "min_notional": ((market.get("limits") or {}).get("cost") or {}).get("min"),
+                "timestamp": source_timestamp,
+                "observed_at_ms": observed_ms,
+                "age_seconds": _source_age_seconds(source_timestamp, observed_ms),
             }
             # Order books age faster than OHLCV; never hold this for five minutes.
             _cache_put(cache_key, result, min(15, self.cache_ttl_seconds))
@@ -660,12 +867,25 @@ class ExchangeClient:
             logger.debug("Order book unavailable for {}: {}", resolved, exc)
             return {}
 
-    def fetch_market_snapshot(self, symbol: str) -> MarketSnapshot:
+    def fetch_market_snapshot(
+        self,
+        symbol: str,
+        force_refresh: bool = False,
+    ) -> MarketSnapshot:
         """Compose ticker + funding + OI + L/S into one snapshot."""
         resolved = self.resolve_symbol(symbol)
         cache_key = ("snapshot", self.exchange_id, resolved)
-        cached = _cache_get(cache_key)
+        cached = None if force_refresh else _cache_get(cache_key)
         if isinstance(cached, MarketSnapshot):
+            analysis_cfg = getattr(self.config, "analysis", None)
+            cached.refresh_source_ages(
+                max_ticker_age_seconds=float(
+                    getattr(analysis_cfg, "max_ticker_age_seconds", 45.0)
+                ),
+                max_orderbook_age_seconds=float(
+                    getattr(analysis_cfg, "max_orderbook_age_seconds", 30.0)
+                ),
+            )
             logger.debug("Snapshot cache hit {} {}", self.exchange_id, resolved)
             return cached
         snap = MarketSnapshot(symbol=resolved, exchange_id=self.exchange_id)
@@ -675,11 +895,16 @@ class ExchangeClient:
         # fast without creating an unbounded burst against the venue.
         with ThreadPoolExecutor(max_workers=min(4, getattr(self, "fetch_workers", 4))) as pool:
             futures = {
-                "ticker": pool.submit(self.fetch_ticker, resolved),
+                "ticker": pool.submit(self.fetch_ticker, resolved, force_refresh),
                 "funding": pool.submit(self.fetch_funding_rate, resolved),
                 "oi": pool.submit(self.fetch_open_interest, resolved),
                 "ls": pool.submit(self.fetch_long_short_ratio, resolved),
-                "orderbook": pool.submit(self.fetch_order_book_summary, resolved, 25),
+                "orderbook": pool.submit(
+                    self.fetch_order_book_summary,
+                    resolved,
+                    25,
+                    force_refresh,
+                ),
                 "oi_history": pool.submit(
                     self.fetch_open_interest_history, resolved, "1h", 24
                 ),
@@ -697,7 +922,17 @@ class ExchangeClient:
 
         ticker = fetched["ticker"]
         if ticker:
-            snap.last = safe_float(ticker.get("last") or ticker.get("close"))
+            snap.last = next(
+                (
+                    candidate
+                    for candidate in (
+                        safe_float(ticker.get("last")),
+                        safe_float(ticker.get("close")),
+                    )
+                    if candidate > 0
+                ),
+                0.0,
+            )
             snap.bid = safe_float(ticker.get("bid"))
             snap.ask = safe_float(ticker.get("ask"))
             snap.percentage_24h = (
@@ -712,6 +947,11 @@ class ExchangeClient:
             if index is not None:
                 snap.index = safe_float(index)
             snap.raw["ticker"] = ticker
+            snap.ticker_timestamp = int(
+                ticker.get("_perpetual_pro_source_timestamp_ms")
+                or ticker.get("_perpetual_pro_observed_at_ms")
+                or int(time.time() * 1000)
+            )
         else:
             errors.append("ticker_unavailable")
 
@@ -801,6 +1041,33 @@ class ExchangeClient:
             )
             snap.orderbook_bid_depth = safe_float(orderbook.get("bid_depth")) or None
             snap.orderbook_ask_depth = safe_float(orderbook.get("ask_depth")) or None
+            snap.orderbook_bid_depth_usd = safe_float(orderbook.get("bid_depth_usd")) or None
+            snap.orderbook_ask_depth_usd = safe_float(orderbook.get("ask_depth_usd")) or None
+            snap.orderbook_depth_bands = dict(orderbook.get("depth_bands_bps") or {})
+            snap.estimated_impact_bps = (
+                safe_float(orderbook.get("estimated_impact_bps"))
+                if orderbook.get("estimated_impact_bps") is not None
+                else None
+            )
+            snap.impact_reference_notional_usd = safe_float(
+                orderbook.get("impact_reference_notional_usd")
+            ) or None
+            snap.contract_size = safe_float(orderbook.get("contract_size")) or None
+            snap.tick_size = (
+                safe_float(orderbook.get("tick_size"))
+                if orderbook.get("tick_size") is not None
+                else None
+            )
+            snap.amount_precision = (
+                safe_float(orderbook.get("amount_precision"))
+                if orderbook.get("amount_precision") is not None
+                else None
+            )
+            snap.min_notional = (
+                safe_float(orderbook.get("min_notional"))
+                if orderbook.get("min_notional") is not None
+                else None
+            )
             snap.orderbook_timestamp = orderbook.get("timestamp")
             snap.raw["orderbook_summary"] = orderbook
         else:
@@ -814,6 +1081,18 @@ class ExchangeClient:
             midpoint = (snap.bid + snap.ask) / 2.0
             if midpoint > 0:
                 snap.spread_bps = (snap.ask - snap.bid) / midpoint * 10_000.0
+
+        analysis_cfg = getattr(self.config, "analysis", None)
+        snap.refresh_source_ages(
+            max_ticker_age_seconds=float(
+                getattr(analysis_cfg, "max_ticker_age_seconds", 45.0)
+            ),
+            max_orderbook_age_seconds=float(
+                getattr(analysis_cfg, "max_orderbook_age_seconds", 30.0)
+            ),
+        )
+        if snap.execution_data_fresh is False:
+            errors.append("execution_source_stale")
 
         # A mark/index quote is a safer last-price fallback than returning zero.
         if not snap.last:

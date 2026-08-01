@@ -21,6 +21,15 @@ class StructureLevel:
     confidence: float
     note: str = ""
     index: Optional[int] = None
+    creation_time: Optional[str] = None
+    age_bars: Optional[int] = None
+    first_touch_time: Optional[str] = None
+    touch_count: int = 0
+    mitigation_fraction: float = 0.0
+    partially_mitigated: bool = False
+    fully_mitigated: bool = False
+    invalidated: bool = False
+    relevant: bool = True
 
     @property
     def mid(self) -> float:
@@ -109,6 +118,11 @@ class MarketStructureAnalyzer:
                 )
             )
 
+        # Lifecycle is derived only from candles after each level was created.
+        # This prevents old or already-consumed zones from being treated as
+        # equivalent to fresh structure without altering their historical side.
+        self._annotate_level_lifecycle(report.levels, work)
+
         # Wyckoff heuristic
         report.wyckoff_phase, report.wyckoff_notes = self._wyckoff(c, v, h, l, atr)
 
@@ -119,6 +133,53 @@ class MarketStructureAnalyzer:
         report.structure_score = self._score(report, c[-1], atr)
         report.summary = self._summarize(report, c[-1])
         return report
+
+    @staticmethod
+    def _annotate_level_lifecycle(
+        levels: List[StructureLevel],
+        frame: pd.DataFrame,
+    ) -> None:
+        """Annotate age, touches, mitigation and invalidation without look-ahead."""
+        if frame is None or frame.empty:
+            return
+        highs = frame["high"].astype(float).to_numpy()
+        lows = frame["low"].astype(float).to_numpy()
+        closes = frame["close"].astype(float).to_numpy()
+        index = frame.index
+        n = len(frame)
+        lifecycle_kinds = {"order_block", "fvg", "liquidity", "support", "resistance"}
+        for level in levels:
+            if level.kind not in lifecycle_kinds or level.index is None:
+                continue
+            created = max(0, min(int(level.index), n - 1))
+            level.creation_time = str(index[created])
+            level.age_bars = max(0, n - 1 - created)
+            start = min(n, created + 1)
+            width = max(level.price_high - level.price_low, abs(level.mid) * 1e-9)
+            in_touch = False
+            max_mitigation = 0.0
+            for i in range(start, n):
+                overlaps = highs[i] >= level.price_low and lows[i] <= level.price_high
+                if overlaps and not in_touch:
+                    level.touch_count += 1
+                    if level.first_touch_time is None:
+                        level.first_touch_time = str(index[i])
+                in_touch = overlaps
+                if level.side == "bullish":
+                    penetration = (level.price_high - lows[i]) / width
+                    if closes[i] < level.price_low:
+                        level.invalidated = True
+                elif level.side == "bearish":
+                    penetration = (highs[i] - level.price_low) / width
+                    if closes[i] > level.price_high:
+                        level.invalidated = True
+                else:
+                    penetration = 1.0 if overlaps else 0.0
+                max_mitigation = max(max_mitigation, float(np.clip(penetration, 0.0, 1.0)))
+            level.mitigation_fraction = max_mitigation
+            level.partially_mitigated = 0.0 < max_mitigation < 0.95
+            level.fully_mitigated = max_mitigation >= 0.95
+            level.relevant = not level.invalidated and not level.fully_mitigated
 
     @staticmethod
     def _swing_indices(arr: np.ndarray, mode: str, order: int = 3) -> List[int]:

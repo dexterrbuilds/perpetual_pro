@@ -47,6 +47,17 @@ Built to feel like a senior prop trader sitting next to you.
 ### Prop account toolkit
 - **Prop risk** (default): **0.5–1% risk per trade**, **max 5x leverage**, flags for high drawdown / wide stop / low R:R
 - **LLM context/veto only** with supporting vs opposing factors; it cannot promote deterministic confidence
+- **Immediate execution-aware Legacy V2 scoring**: technical calculations stay
+  unchanged, while overall confidence is capped by Execution + 5 and the default
+  execution gate is 72. Rejected candidates retain structured reasons for
+  historical old-versus-V2 outcome comparison.
+- **Outcome-calibrated scoring (shadow-first)**: every directional candidate,
+  including unfilled/blocked setups, can be journaled to Supabase PostgreSQL.
+  Walk-forward models separately estimate technical direction, valid-entry fill,
+  complete TP1-before-SL probability, and conservative expected R. A model cannot
+  affect production until unseen-data calibration and EV gates pass and it is
+  explicitly promoted; its first production stage remains veto-only. See
+  [Outcome-calibrated scoring](docs/OUTCOME_SCORING.md).
 - **Backtest**: `python main.py BTC --backtest --bars 500` (pending retest fills, fees/slippage, unfilled signals, early stop-out rate, expectancy in R, Wilson win-rate lower bound, MFE/MAE, profit factor, max DD)
 - **DST-aware scheduled scans** after the first London candle, after the common
   8:30 a.m. ET macro window, after the first New York cash-session candle, and
@@ -152,7 +163,8 @@ perpetual_pro/
 │   ├── analysis/      # indicators, patterns, structure, confluence, risk
 │   ├── vision/        # capture, ocr, chart_detect, preprocess
 │   ├── report/        # rich + MD/JSON
-│   ├── tracking/      # SQLite lifecycle, active WebSocket, outcome calibration
+│   ├── tracking/      # SQLite lifecycle + active WebSocket
+│   ├── scoring/       # Supabase journal, replay, calibration, EV ranking
 │   └── utils/         # config, helpers
 └── tests/
 ```

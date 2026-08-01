@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -59,9 +60,16 @@ class TradePlan:
     prop_flags: List[str] = field(default_factory=list)
     max_leverage_allowed: float = 5.0
     # Execution quality: prevents treating a directional bias as a market order.
-    entry_status: str = "blocked"  # ready | wait_retest | avoid_chase | blocked
+    entry_status: str = "blocked"  # confirmation_pending | wait_retest | avoid_chase | blocked
     entry_reason: str = ""
     execution_score: float = 0.0
+    execution_quality: float = 0.0
+    execution_policy_version: str = ""
+    execution_components: Dict[str, float] = field(default_factory=dict)
+    target_feasibility: List[float] = field(default_factory=list)
+    gross_risk_reward: List[float] = field(default_factory=list)
+    net_risk_reward: List[float] = field(default_factory=list)
+    estimated_total_cost_bps: float = 0.0
     immediate_sl_risk: float = 100.0
     chase_distance_atr: float = 0.0
     order_flow_score: float = 0.0
@@ -137,6 +145,13 @@ class TradePlan:
             "entry_status": self.entry_status,
             "entry_reason": self.entry_reason,
             "execution_score": self.execution_score,
+            "execution_quality": self.execution_quality,
+            "execution_policy_version": self.execution_policy_version,
+            "execution_components": dict(self.execution_components),
+            "target_feasibility": list(self.target_feasibility),
+            "gross_risk_reward": list(self.gross_risk_reward or self.risk_reward),
+            "net_risk_reward": list(self.net_risk_reward),
+            "estimated_total_cost_bps": self.estimated_total_cost_bps,
             "hold_hours_min": self.hold_hours_min,
             "hold_hours_typical_max": self.hold_hours_typical_max,
             "hold_hours_max": self.hold_hours_max,
@@ -175,6 +190,13 @@ class TradePlan:
             "entry_status": self.entry_status,
             "entry_reason": self.entry_reason,
             "execution_score": self.execution_score,
+            "execution_quality": self.execution_quality,
+            "execution_policy_version": self.execution_policy_version,
+            "execution_components": dict(self.execution_components),
+            "target_feasibility": list(self.target_feasibility),
+            "gross_risk_reward": list(self.gross_risk_reward or self.risk_reward),
+            "net_risk_reward": list(self.net_risk_reward),
+            "estimated_total_cost_bps": self.estimated_total_cost_bps,
             "immediate_sl_risk": self.immediate_sl_risk,
             "chase_distance_atr": self.chase_distance_atr,
             "order_flow_score": self.order_flow_score,
@@ -266,7 +288,11 @@ class RiskManager:
         risk_pct: Optional[float] = None,
     ) -> None:
         self.config = config
-        self.risk = risk_cfg or (config.risk if config else RiskConfig())
+        # Request-level sizing overrides must never mutate the process-wide
+        # AppConfig shared by later API or scheduler requests.
+        self.risk = copy.deepcopy(
+            risk_cfg or (config.risk if config else RiskConfig())
+        )
         if simulated_capital is not None:
             self.risk.simulated_capital = float(simulated_capital)
         elif getattr(self.risk, "simulated_capital", None) is None:
@@ -387,18 +413,8 @@ class RiskManager:
                 for x in (execution.get("targets") or [])
                 if safe_float(x) > 0
             ]
-            if len(tps) < 4:
-                entry_ref = (entry_low + entry_high) / 2.0
-                sign = 1.0 if direction == "long" else -1.0
-                risk_hint = max(abs(entry_ref - stop), atr * 0.7)
-                for rr in (0.8, 1.3, 2.0, 2.8):
-                    candidate = entry_ref + sign * risk_hint * rr
-                    if len(tps) >= 4:
-                        break
-                    if not tps or (
-                        candidate > tps[-1] if direction == "long" else candidate < tps[-1]
-                    ):
-                        tps.append(candidate)
+            # Phase 2A: do not manufacture missing TPs to satisfy a reporting
+            # count or minimum-R gate. Fewer feasible targets are valid.
             tps = tps[:4]
             alt_note = str(execution.get("entry_reason") or "")
             invalidation = str(execution.get("invalidation_reason") or "")
@@ -472,6 +488,16 @@ class RiskManager:
         entry_reference = (entry_low + entry_high) / 2.0
         risk_per_unit = max(abs(entry_reference - stop), entry_reference * 1e-6)
         rrs = [abs(tp - entry_reference) / risk_per_unit for tp in tps]
+        net_rrs = [safe_float(x) for x in (execution.get("net_risk_reward") or [])]
+        if len(net_rrs) != len(rrs):
+            cost_price = entry_reference * safe_float(
+                execution.get("estimated_total_cost_bps"), 0.0
+            ) / 10_000.0
+            net_rrs = [
+                max(0.0, abs(tp - entry_reference) - cost_price)
+                / max(risk_per_unit + cost_price, 1e-12)
+                for tp in tps
+            ]
 
         lev, lev_reason = self._dynamic_leverage(
             atr_pct=atr_pct,
@@ -517,7 +543,10 @@ class RiskManager:
         primary_rr = rrs[0] if rrs else 0.0
         # TP1 is a partial/de-risk target. Prop quality is evaluated at TP2,
         # where the planned trade is expected to meet its minimum R:R.
-        evaluation_rr = rrs[1] if len(rrs) > 1 else primary_rr
+        evaluation_rr = (
+            net_rrs[1] if len(net_rrs) > 1
+            else (net_rrs[0] if net_rrs else primary_rr)
+        )
         quality = self._quality(evaluation_rr, confidence, min_rr)
 
         hold_label, hold_detail, hold_max = suggest_hold_window(
@@ -562,7 +591,9 @@ class RiskManager:
             confidence=confidence,
             lev=lev,
             entry_status=str(execution.get("status") or "ready"),
-            execution_score=safe_float(execution.get("score"), 100.0),
+            execution_score=safe_float(
+                execution.get("execution_quality", execution.get("score")), 100.0
+            ),
             immediate_sl_risk=safe_float(
                 execution.get("immediate_sl_risk"),
                 0.0,
@@ -659,7 +690,22 @@ class RiskManager:
             max_leverage_allowed=float(max_lev),
             entry_status=str(execution.get("status") or "ready"),
             entry_reason=str(execution.get("entry_reason") or "Entry zone validated."),
-            execution_score=safe_float(execution.get("score"), 100.0),
+            execution_score=safe_float(
+                execution.get("execution_quality", execution.get("score")), 100.0
+            ),
+            execution_quality=safe_float(
+                execution.get("execution_quality", execution.get("score")), 100.0
+            ),
+            execution_policy_version=str(execution.get("policy_version") or ""),
+            execution_components=dict(execution.get("components") or {}),
+            target_feasibility=[
+                safe_float(value) for value in (execution.get("target_feasibility") or [])
+            ],
+            gross_risk_reward=[float(x) for x in rrs],
+            net_risk_reward=[float(x) for x in net_rrs],
+            estimated_total_cost_bps=safe_float(
+                execution.get("estimated_total_cost_bps"), 0.0
+            ),
             immediate_sl_risk=safe_float(execution.get("immediate_sl_risk"), 0.0),
             chase_distance_atr=safe_float(execution.get("chase_distance_atr"), 0.0),
             order_flow_score=safe_float(execution.get("order_flow_score"), 0.0),

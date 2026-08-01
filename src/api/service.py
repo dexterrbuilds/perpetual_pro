@@ -21,6 +21,12 @@ from src.data.multi_tf import fetch_multi_timeframe_with_fallback
 from src.data.news import NewsAnalyzer
 from src.report.charts import build_market_chart_payload
 from src.report.generator import ReportGenerator
+from src.scoring.features import build_candidate_record
+from src.scoring.runtime import (
+    get_outcome_scoring_status,
+    journal_scan_candidates,
+    score_candidate_shadow,
+)
 from src.utils.config import AppConfig, load_config
 from src.utils.helpers import clamp, normalize_symbol
 from src.vision.chart_detect import ChartVision
@@ -29,6 +35,14 @@ from src.vision.url_symbol import parse_chart_url
 
 # Web / scan UI prioritizes conservative display leverage (model may suggest higher)
 SCAN_LEVERAGE_CAP = 5
+
+
+def apply_diagnostic_backtest_to_rank(
+    live_rank_score: float,
+    backtest_summary: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Quick proxy backtests are diagnostics and never alter live rank."""
+    return float(live_rank_score)
 
 
 @dataclass
@@ -567,7 +581,7 @@ def scan_symbols(
     config: Optional[AppConfig] = None,
 ) -> Dict[str, Any]:
     """
-    Multi-symbol scan ranked by LLM confidence + technical confluence.
+    Multi-symbol scan ranked by deterministic technical/execution quality.
 
     Flat/neutral setups are excluded from the leaderboard (low priority).
     """
@@ -579,11 +593,14 @@ def scan_symbols(
 
     primary_tf = req.timeframe or cfg.timeframes.primary
     ex_id = _resolve_exchange_id(req.exchange, cfg)
-    # Prefer LLM scoring for ranking; still works via heuristic fallback without keys
+    # LLM output is explanation/warnings only; deterministic code owns approval.
     use_llm = bool(getattr(req, "use_llm", True))
 
     ranked_results: List[Dict[str, Any]] = []
     skipped_flat: List[Dict[str, Any]] = []
+    journal_records: List[Dict[str, Any]] = []
+    analysis_failures: List[Dict[str, str]] = []
+    analyzed_count = 0
     for symbol in symbol_list[:40]:
         try:
             normalized_symbol = normalize_symbol(symbol)
@@ -604,6 +621,12 @@ def scan_symbols(
                         "Scan skip {}: empty OHLCV after {}",
                         normalized_symbol,
                         " → ".join(fetch.attempted_exchanges),
+                    )
+                    analysis_failures.append(
+                        {
+                            "symbol": normalized_symbol,
+                            "reason": "no_primary_market_data",
+                        }
                     )
                     continue
 
@@ -667,6 +690,8 @@ def scan_symbols(
                         )
                     )
                     backtest_summary = {
+                        "strategy_scope": "diagnostic_proxy_not_production_engine",
+                        "live_authority": False,
                         "sample_ok": sample_ok,
                         "sample_reliable": sample_reliable,
                         "n_signals": bt.n_signals,
@@ -682,7 +707,7 @@ def scan_symbols(
                         "max_drawdown_pct": bt.max_drawdown_pct,
                         "net_pnl_pct": bt.net_pnl_pct,
                         "validation_score": round(validation_score, 1),
-                        "historical_edge_ok": historical_edge_ok,
+                        "diagnostic_historical_edge_ok": historical_edge_ok,
                     }
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Scan backtest skipped for {}: {}", normalized_symbol, exc)
@@ -714,11 +739,11 @@ def scan_symbols(
                     limit=100,
                 )
                 live_rank_score = float(analysis.rank_score)
-                scan_rank_score = (
-                    live_rank_score
-                    + float(clamp((validation_score - 50.0) * 0.08, -6.0, 3.0))
-                    if sample_ok
-                    else live_rank_score
+                # This quick backtest uses a proxy strategy, not the production
+                # signal lifecycle. It is diagnostic only and has no live rank,
+                # approval, or rejection authority.
+                scan_rank_score = apply_diagnostic_backtest_to_rank(
+                    live_rank_score, backtest_summary
                 )
                 primary_quality = dict(
                     (analysis.meta.get("data_quality") or {}).get(primary_tf) or {}
@@ -732,12 +757,32 @@ def scan_symbols(
                     "direction": analysis.direction,
                     "bias": analysis.bias,
                     "confidence": round(float(analysis.confidence), 1),
+                    "legacy_confidence": round(
+                        float(analysis.meta.get("legacy_confidence", analysis.confidence)),
+                        1,
+                    ),
+                    "legacy_v2_confidence": round(
+                        float(
+                            analysis.meta.get(
+                                "legacy_v2_confidence",
+                                analysis.confidence,
+                            )
+                        ),
+                        1,
+                    ),
+                    "scoring_policy": (
+                        "legacy_v2"
+                        if analysis.meta.get("legacy_v2_enabled", False)
+                        else "legacy"
+                    ),
                     "technical_confidence": round(float(analysis.technical_confidence), 1),
                     "llm_confidence": round(float(analysis.llm_confidence), 1),
                     "llm_confidence_reason": analysis.llm_confidence_reason,
                     "llm_confidence_detail": getattr(analysis, "llm_confidence_detail", {}) or {},
                     "rank_score": round(scan_rank_score, 2),
                     "live_rank_score": round(live_rank_score, 2),
+                    "rank_policy_version": analysis.meta.get("rank_policy_version"),
+                    "rank_breakdown": dict(analysis.meta.get("rank_breakdown") or {}),
                     "confluence_score": round(float(analysis.confluence_total), 3),
                     "setup_name": analysis.setup_name,
                     "leverage": leverage,
@@ -747,9 +792,19 @@ def scan_symbols(
                     "signal_eligible": bool(
                         analysis.meta.get("signal_eligible", False) if analysis.meta else False
                     ),
+                    "legacy_signal_eligible": bool(
+                        analysis.meta.get("legacy_signal_eligible", False)
+                    ),
+                    "legacy_v2_signal_eligible": bool(
+                        analysis.meta.get("legacy_v2_signal_eligible", False)
+                    ),
+                    "rejection_reasons": list(
+                        analysis.meta.get("rejection_reasons") or []
+                    ),
                     "prop_flags": prop_flags,
                     "reason": reason,
                     "price": analysis.meta.get("price") if analysis.meta else None,
+                    "atr": analysis.meta.get("atr") if analysis.meta else None,
                     "support": analysis.key_levels[0].get("mid") if analysis.key_levels else None,
                     "resistance": analysis.key_levels[1].get("mid") if len(analysis.key_levels) > 1 else None,
                     "entry_low": getattr(plan, "entry_low", None) if plan else None,
@@ -784,7 +839,8 @@ def scan_symbols(
                         getattr(plan, "time_stop_reason", "") if plan else ""
                     ),
                     "backtest": backtest_summary,
-                    "historical_edge_ok": historical_edge_ok,
+                    "historical_edge_ok": True,
+                    "diagnostic_historical_edge_ok": historical_edge_ok,
                     "data_quality_ok": bool(
                         analysis.meta.get("primary_data_quality_ok", True)
                     ),
@@ -794,12 +850,50 @@ def scan_symbols(
                     ),
                     "data_quality_reason": primary_quality.get("reason"),
                     "entry_status": execution.get("status", "blocked"),
-                    "execution_score": round(float(execution.get("score") or 0), 1),
+                    "execution_score": round(float(execution.get("execution_quality", execution.get("score")) or 0), 1),
+                    "execution_quality": round(float(execution.get("execution_quality", execution.get("score")) or 0), 1),
+                    "legacy_execution_score": round(float(execution.get("legacy_execution_score") or 0), 1),
+                    "legacy_execution_status": execution.get("legacy_status"),
+                    "legacy_execution_targets": list(execution.get("legacy_targets") or []),
+                    "execution_policy_version": execution.get("policy_version"),
+                    "execution_setup_type": execution.get("setup_type"),
+                    "entry_mode": execution.get("entry_mode"),
+                    "execution_components": dict(execution.get("components") or {}),
+                    "entry_accessibility": (execution.get("components") or {}).get("entry_accessibility"),
+                    "pre_entry_survival": (execution.get("components") or {}).get("pre_entry_survival"),
+                    "confirmation_quality": (execution.get("components") or {}).get("confirmation_quality"),
+                    "stop_quality": (execution.get("components") or {}).get("stop_quality"),
+                    "target_feasibility": list(execution.get("target_feasibility") or []),
+                    "gross_risk_reward": list(execution.get("gross_risk_reward") or []),
+                    "net_risk_reward": list(execution.get("net_risk_reward") or []),
+                    "estimated_total_cost_bps": execution.get("estimated_total_cost_bps"),
+                    "estimated_fee_bps": execution.get("estimated_fee_bps"),
+                    "estimated_slippage_bps": execution.get("estimated_slippage_bps"),
+                    "estimated_funding_bps": execution.get("estimated_funding_bps"),
+                    "estimated_impact_bps": execution.get("estimated_impact_bps"),
+                    "depth_bands_bps": dict(execution.get("depth_bands_bps") or {}),
+                    "structural_obstacle_distances_atr": list(execution.get("structural_obstacle_distances_atr") or []),
+                    "data_freshness_state": execution.get("data_freshness_state"),
+                    "entry_distance_atr": execution.get("entry_distance_atr"),
+                    "entry_distance_pct": execution.get("entry_distance_pct"),
+                    "entry_zone_width_atr": execution.get("entry_zone_width_atr"),
+                    "remaining_expiry_minutes": execution.get("remaining_expiry_minutes"),
+                    "stop_distance_atr": execution.get("stop_distance_atr"),
+                    "hard_failures": list(execution.get("hard_failures") or []),
+                    "execution_uncertainties": list(execution.get("uncertainties") or []),
                     "immediate_sl_risk": round(
                         float(execution.get("immediate_sl_risk") or 100), 1
                     ),
                     "chase_distance_atr": round(
                         float(execution.get("chase_distance_atr") or 0), 2
+                    ),
+                    "entry_zone_relation": execution.get(
+                        "entry_zone_relation",
+                        "unknown",
+                    ),
+                    "tp1_progress_pct": round(
+                        float(execution.get("tp1_progress_pct") or 0),
+                        1,
                     ),
                     "order_flow_score": round(
                         float(execution.get("order_flow_score") or 0), 3
@@ -807,6 +901,8 @@ def scan_symbols(
                     "spread_bps": execution.get("spread_bps"),
                     "orderbook_imbalance": execution.get("orderbook_imbalance"),
                     "orderbook_alignment": execution.get("orderbook_alignment"),
+                    "ticker_age_seconds": execution.get("ticker_age_seconds"),
+                    "orderbook_age_seconds": execution.get("orderbook_age_seconds"),
                     "market_quality_ok": bool(
                         execution.get("market_quality_ok", True)
                     ),
@@ -829,6 +925,23 @@ def scan_symbols(
                         "bias": analysis.bias,
                         "direction": analysis.direction,
                         "confidence": analysis.confidence,
+                        "legacy_confidence": analysis.meta.get(
+                            "legacy_confidence",
+                            analysis.confidence,
+                        ),
+                        "legacy_v2_confidence": analysis.meta.get(
+                            "legacy_v2_confidence",
+                            analysis.confidence,
+                        ),
+                        "legacy_confidence_comparison": analysis.meta.get(
+                            "legacy_confidence_comparison"
+                        )
+                        or {},
+                        "scoring_policy": (
+                            "legacy_v2"
+                            if analysis.meta.get("legacy_v2_enabled", False)
+                            else "legacy"
+                        ),
                         "technical_confidence": analysis.technical_confidence,
                         "llm_confidence": analysis.llm_confidence,
                         "llm_confidence_reason": analysis.llm_confidence_reason,
@@ -847,11 +960,95 @@ def scan_symbols(
                         "primary_setup": primary,
                         "prop_safe": prop_safe,
                         "prop_flags": prop_flags,
+                        "legacy_signal_eligible": analysis.meta.get(
+                            "legacy_signal_eligible",
+                            False,
+                        ),
+                        "legacy_v2_signal_eligible": analysis.meta.get(
+                            "legacy_v2_signal_eligible",
+                            False,
+                        ),
+                        "rejection_reasons": list(
+                            analysis.meta.get("rejection_reasons") or []
+                        ),
                         "position_simulation": (
                             plan.to_position_simulation() if plan else None
                         ),
                     },
                 }
+                candidate = build_candidate_record(
+                    analysis,
+                    row,
+                    source="watchlist",
+                    feature_schema_version=cfg.outcome_scoring.feature_schema_version,
+                )
+                shadow_scores = score_candidate_shadow(candidate, cfg)
+                if shadow_scores is not None:
+                    candidate["shadow_model_version"] = shadow_scores.get(
+                        "model_version"
+                    )
+                    candidate["shadow_scores"] = shadow_scores
+                else:
+                    candidate["shadow_model_version"] = None
+                    candidate["shadow_scores"] = None
+                row["candidate_id"] = candidate["id"]
+                row["outcome_scoring"] = shadow_scores or {
+                    "status": "collecting_data",
+                    "mode": cfg.outcome_scoring.mode,
+                }
+                row["scoring_source"] = "legacy_production"
+                if (
+                    cfg.outcome_scoring.mode == "production"
+                    and shadow_scores
+                    and shadow_scores.get("calibration_ready")
+                ):
+                    legacy_scores = {
+                        "technical_confidence": row["technical_confidence"],
+                        "execution_score": row["execution_score"],
+                        "confidence": row["confidence"],
+                        "rank_score": row["rank_score"],
+                    }
+                    row["legacy_scores"] = legacy_scores
+                    row["technical_confidence"] = round(
+                        float(shadow_scores.get("technical_score") or 0), 1
+                    )
+                    row["execution_score"] = round(
+                        float(shadow_scores.get("execution_score") or 0), 1
+                    )
+                    row["confidence"] = round(
+                        float(shadow_scores.get("confidence") or 0), 1
+                    )
+                    row["rank_score"] = round(
+                        float(shadow_scores.get("rank_score") or 0), 2
+                    )
+                    outcome_gate = bool(
+                        row["confidence"]
+                        >= float(cfg.outcome_scoring.confidence_floor)
+                        and float(
+                            shadow_scores.get("conservative_ev_r") or 0
+                        )
+                        > 0
+                        and bool(shadow_scores.get("model_applicable", False))
+                    )
+                    # Initial champion deployment is veto-only: it may reject or
+                    # reorder a legacy-eligible plan, never resurrect a setup
+                    # whose deterministic safety gates already blocked it.
+                    row["signal_eligible"] = bool(
+                        row.get("signal_eligible") and outcome_gate
+                    )
+                    row["scoring_source"] = "outcome_champion_veto"
+                    row["payload"]["confidence"] = row["confidence"]
+                    row["payload"]["technical_confidence"] = row[
+                        "technical_confidence"
+                    ]
+                    row["payload"]["rank_score"] = row["rank_score"]
+                    row["payload"]["execution"]["score"] = row[
+                        "execution_score"
+                    ]
+                row["payload"]["candidate_id"] = candidate["id"]
+                row["payload"]["outcome_scoring"] = row["outcome_scoring"]
+                journal_records.append(candidate)
+                analyzed_count += 1
 
                 direction = (analysis.direction or "flat").lower()
                 if direction not in ("long", "short"):
@@ -863,7 +1060,13 @@ def scan_symbols(
                             "bias": analysis.bias,
                             "llm_confidence": row["llm_confidence"],
                             "technical_confidence": row["technical_confidence"],
+                            "legacy_confidence": row["legacy_confidence"],
+                            "legacy_v2_confidence": row[
+                                "legacy_v2_confidence"
+                            ],
+                            "execution_score": row["execution_score"],
                             "confluence_score": row["confluence_score"],
+                            "rejection_reasons": row["rejection_reasons"],
                             "reason": analysis.llm_confidence_reason
                             or "Flat/neutral — not ranked",
                         }
@@ -881,30 +1084,41 @@ def scan_symbols(
                 client.close()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Scan failed for {}: {}", symbol, exc)
+            analysis_failures.append(
+                {"symbol": str(symbol), "reason": type(exc).__name__}
+            )
 
-    # Rank directional only: LLM confidence primary, then rank_score, then confluence
+    journaled_count = journal_scan_candidates(journal_records, cfg)
+
+    # Rank directional signals deterministically. LLM numbers are never a tie
+    # breaker because that would still grant them delivery authority.
     ranked_results.sort(
         key=lambda item: (
             float(item.get("rank_score") or 0),
-            float(item.get("llm_confidence") or 0),
             abs(float(item.get("confluence_score") or 0)),
         ),
         reverse=True,
     )
     return {
-        "ok": True,
+        "ok": analyzed_count > 0,
+        "error": None if analyzed_count > 0 else "scan_analysis_unavailable",
         "ranked_results": ranked_results[:10],
         "skipped_flat": skipped_flat[:20],
         "count": len(ranked_results),
         "flat_count": len(skipped_flat),
+        "analyzed_count": analyzed_count,
+        "analysis_failures": analysis_failures,
         "timeframe": primary_tf,
         "exchange": ex_id,
         "leverage_display_cap": SCAN_LEVERAGE_CAP,
         "ranking": (
             "Deterministic closed-candle confluence/execution with bounded "
-            "robust-sample backtest adjustment (LLM cannot promote signals)"
+            "robust-sample backtest adjustment; outcome model remains shadow-only "
+            "until calibrated and explicitly promoted"
         ),
         "prop_mode": bool(getattr(cfg.risk, "prop_mode", True)),
+        "candidate_journaled_count": journaled_count,
+        "outcome_scoring": get_outcome_scoring_status(cfg),
     }
 
 

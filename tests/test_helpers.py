@@ -27,7 +27,7 @@ from src.analysis.risk import (
     suggest_hold_window,
     suggest_trade_lifecycle,
 )
-from src.utils.config import load_config
+from src.utils.config import DEFAULT_CRYPTO_WATCHLIST, SchedulerConfig, load_config
 
 
 def test_normalize_symbol_variants():
@@ -248,3 +248,35 @@ def test_load_config_defaults():
     assert cfg.exchange.default
     assert cfg.risk.risk_per_trade_pct > 0
     assert cfg.timeframes.primary
+
+
+def test_liquid_crypto_watchlist_is_consistent():
+    expected = [
+        "BTC",
+        "ETH",
+        "SOL",
+        "BNB",
+        "TRX",
+        "UNI",
+        "XRP",
+        "DOGE",
+        "LTC",
+        "LINK",
+        "BCH",
+        "HBAR",
+        "XLM",
+        "HYPE",
+        "ZEC",
+        "XMR",
+        "ICP",
+        "ALGO",
+        "AVAX",
+        "PENGU",
+        "WIF",
+        "BONK",
+    ]
+    cfg = load_config(ROOT / "config.yaml")
+
+    assert DEFAULT_CRYPTO_WATCHLIST == expected
+    assert SchedulerConfig().watchlist == expected
+    assert cfg.scheduler.watchlist == expected

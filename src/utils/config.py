@@ -16,6 +16,33 @@ from loguru import logger
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 
+# Canonical liquid crypto-perpetual universe used by scheduled scans, Telegram
+# commands, and historical replay when no explicit symbol override is supplied.
+DEFAULT_CRYPTO_WATCHLIST = [
+    "BTC",
+    "ETH",
+    "SOL",
+    "BNB",
+    "TRX",
+    "UNI",
+    "XRP",
+    "DOGE",
+    "LTC",
+    "LINK",
+    "BCH",
+    "HBAR",
+    "XLM",
+    "HYPE",
+    "ZEC",
+    "XMR",
+    "ICP",
+    "ALGO",
+    "AVAX",
+    "PENGU",
+    "WIF",
+    "BONK",
+]
+
 
 @dataclass
 class ExchangeConfig:
@@ -118,14 +145,25 @@ class AnalysisConfig:
     max_confidence: float = 92.0
     directional_score_threshold: float = 0.20
     directional_confidence_threshold: float = 68.0
-    execution_min_score: float = 65.0
+    legacy_v2_enabled: bool = True
+    legacy_execution_min_score: float = 65.0
+    execution_min_score: float = 72.0
+    execution_confidence_buffer: float = 5.0
     max_immediate_sl_risk: float = 32.0
     max_chase_distance_atr: float = 1.0
+    max_pre_entry_tp1_progress_pct: float = 70.0
     max_spread_bps: float = 12.0
+    max_ticker_age_seconds: float = 45.0
+    max_orderbook_age_seconds: float = 30.0
     min_tp2_rr: float = 1.25
     ready_entry_expiry_bars: int = 3
     retest_entry_expiry_bars: int = 6
     max_entry_valid_minutes: int = 180
+    execution_policy_version: str = "execution_quality_v2a.1"
+    execution_taker_fee_bps_per_side: float = 5.0
+    execution_slippage_bps_per_side: float = 1.5
+    execution_funding_bps_per_8h: float = 1.0
+    execution_impact_notional_usd: float = 10000.0
 
 
 @dataclass
@@ -192,7 +230,7 @@ class TelegramConfig:
     # Runtime-only; populated exclusively from env in _apply_env_overrides
     bot_token: str = ""
     chat_id: str = ""
-    min_llm_confidence: float = 65.0
+    min_llm_confidence: float = 65.0  # deprecated compatibility; not a signal gate
     min_rank_score: float = 50.0
     parse_mode: str = "HTML"
     notify_on_empty: bool = True
@@ -231,7 +269,9 @@ class SchedulerConfig:
             },
         ]
     )
-    watchlist: List[str] = field(default_factory=list)
+    watchlist: List[str] = field(
+        default_factory=lambda: list(DEFAULT_CRYPTO_WATCHLIST)
+    )
     exchange: str = "okx"
     timeframe: str = "15m"
     no_news: bool = False
@@ -255,6 +295,27 @@ class SignalTrackerConfig:
 
 
 @dataclass
+class OutcomeScoringConfig:
+    """Outcome-calibrated scorer and durable candidate journal.
+
+    ``database_url`` is populated only from DATABASE_URL.  Shadow mode records
+    and evaluates candidates without changing production alerts.
+    """
+
+    enabled: bool = True
+    mode: str = "shadow"  # off | shadow | production
+    database_url: str = ""
+    feature_schema_version: str = "3.0"
+    model_refresh_seconds: int = 300
+    minimum_training_samples: int = 500
+    minimum_calibration_samples: int = 200
+    confidence_floor: float = 80.0
+    conservative_quantile: float = 0.10
+    promotion_max_ece: float = 0.05
+    promotion_minimum_unseen_samples: int = 200
+
+
+@dataclass
 class AppConfig:
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -270,6 +331,7 @@ class AppConfig:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     signal_tracker: SignalTrackerConfig = field(default_factory=SignalTrackerConfig)
+    outcome_scoring: OutcomeScoringConfig = field(default_factory=OutcomeScoringConfig)
     config_path: Optional[Path] = None
 
     def resolve_path(self, path: str) -> Path:
@@ -307,6 +369,7 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
     tg = data.get("telegram", {}) or {}
     sched = data.get("scheduler", {}) or {}
     tracker = data.get("signal_tracker", {}) or {}
+    outcome_scoring = data.get("outcome_scoring", {}) or {}
 
     sim_cap = risk.get("simulated_capital", risk.get("account_balance", 1000.0))
     prop_mode = bool(risk.get("prop_mode", True))
@@ -391,12 +454,29 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             directional_confidence_threshold=float(
                 an.get("directional_confidence_threshold", 68)
             ),
-            execution_min_score=float(an.get("execution_min_score", 65)),
+            legacy_v2_enabled=bool(an.get("legacy_v2_enabled", True)),
+            legacy_execution_min_score=float(
+                an.get("legacy_execution_min_score", 65)
+            ),
+            execution_min_score=float(an.get("execution_min_score", 72)),
+            execution_confidence_buffer=max(
+                0.0,
+                float(an.get("execution_confidence_buffer", 5.0)),
+            ),
             max_immediate_sl_risk=float(an.get("max_immediate_sl_risk", 32)),
             max_chase_distance_atr=float(
                 an.get("max_chase_distance_atr", 1.0)
             ),
+            max_pre_entry_tp1_progress_pct=float(
+                an.get("max_pre_entry_tp1_progress_pct", 70.0)
+            ),
             max_spread_bps=float(an.get("max_spread_bps", 12.0)),
+            max_ticker_age_seconds=max(
+                1.0, float(an.get("max_ticker_age_seconds", 45.0))
+            ),
+            max_orderbook_age_seconds=max(
+                1.0, float(an.get("max_orderbook_age_seconds", 30.0))
+            ),
             min_tp2_rr=float(an.get("min_tp2_rr", 1.25)),
             ready_entry_expiry_bars=max(
                 1, int(an.get("ready_entry_expiry_bars", 3))
@@ -406,6 +486,21 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             ),
             max_entry_valid_minutes=max(
                 30, int(an.get("max_entry_valid_minutes", 180))
+            ),
+            execution_policy_version=str(
+                an.get("execution_policy_version", "execution_quality_v2a.1")
+            ),
+            execution_taker_fee_bps_per_side=max(
+                0.0, float(an.get("execution_taker_fee_bps_per_side", 5.0))
+            ),
+            execution_slippage_bps_per_side=max(
+                0.0, float(an.get("execution_slippage_bps_per_side", 1.5))
+            ),
+            execution_funding_bps_per_8h=max(
+                0.0, float(an.get("execution_funding_bps_per_8h", 1.0))
+            ),
+            execution_impact_notional_usd=max(
+                100.0, float(an.get("execution_impact_notional_usd", 10000.0))
             ),
         ),
         news=NewsConfig(
@@ -503,7 +598,13 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
                 )
                 if isinstance(item, dict)
             ],
-            watchlist=list(sched.get("watchlist", [])),
+            watchlist=[
+                str(symbol).strip().upper()
+                for symbol in (
+                    sched.get("watchlist") or DEFAULT_CRYPTO_WATCHLIST
+                )
+                if str(symbol).strip()
+            ],
             exchange=str(sched.get("exchange", "okx") or "okx"),
             timeframe=str(sched.get("timeframe", "15m") or "15m"),
             no_news=bool(sched.get("no_news", False)),
@@ -545,6 +646,48 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
                 )[:4]
             ],
         ),
+        outcome_scoring=OutcomeScoringConfig(
+            enabled=bool(outcome_scoring.get("enabled", True)),
+            mode=str(outcome_scoring.get("mode", "shadow") or "shadow").lower(),
+            database_url="",
+            feature_schema_version=str(
+                outcome_scoring.get("feature_schema_version", "3.0") or "3.0"
+            ),
+            model_refresh_seconds=max(
+                30,
+                int(outcome_scoring.get("model_refresh_seconds", 300)),
+            ),
+            minimum_training_samples=max(
+                100,
+                int(outcome_scoring.get("minimum_training_samples", 500)),
+            ),
+            minimum_calibration_samples=max(
+                50,
+                int(outcome_scoring.get("minimum_calibration_samples", 200)),
+            ),
+            confidence_floor=float(
+                outcome_scoring.get("confidence_floor", 80.0)
+            ),
+            conservative_quantile=float(
+                outcome_scoring.get("conservative_quantile", 0.10)
+            ),
+            promotion_max_ece=min(
+                0.20,
+                max(
+                    0.01,
+                    float(outcome_scoring.get("promotion_max_ece", 0.05)),
+                ),
+            ),
+            promotion_minimum_unseen_samples=max(
+                100,
+                int(
+                    outcome_scoring.get(
+                        "promotion_minimum_unseen_samples",
+                        200,
+                    )
+                ),
+            ),
+        ),
         config_path=config_path,
     )
 
@@ -572,6 +715,19 @@ def _apply_env_overrides(cfg: AppConfig) -> AppConfig:
         cfg.risk.risk_per_trade_pct = float(os.environ["RISK_PER_TRADE_PCT"])
     if os.getenv("PROP_MODE"):
         cfg.risk.prop_mode = os.environ["PROP_MODE"].strip().lower() in ("1", "true", "yes", "on")
+    if os.getenv("LEGACY_V2_ENABLED"):
+        cfg.analysis.legacy_v2_enabled = os.environ[
+            "LEGACY_V2_ENABLED"
+        ].strip().lower() in ("1", "true", "yes", "on")
+    if os.getenv("LEGACY_V2_EXECUTION_MIN_SCORE"):
+        cfg.analysis.execution_min_score = float(
+            os.environ["LEGACY_V2_EXECUTION_MIN_SCORE"]
+        )
+    if os.getenv("LEGACY_V2_CONFIDENCE_BUFFER"):
+        cfg.analysis.execution_confidence_buffer = max(
+            0.0,
+            float(os.environ["LEGACY_V2_CONFIDENCE_BUFFER"]),
+        )
     # Telegram secrets: environment only — never from config.yaml
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     chat_id = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
@@ -613,6 +769,17 @@ def _apply_env_overrides(cfg: AppConfig) -> AppConfig:
         cfg.signal_tracker.reconcile_interval_seconds = max(
             60,
             int(os.environ["SIGNAL_TRACKER_RECONCILE_SECONDS"]),
+        )
+    database_url = (os.getenv("DATABASE_URL") or "").strip()
+    cfg.outcome_scoring.database_url = database_url
+    if os.getenv("OUTCOME_SCORING_ENABLED"):
+        cfg.outcome_scoring.enabled = os.environ[
+            "OUTCOME_SCORING_ENABLED"
+        ].strip().lower() in ("1", "true", "yes", "on")
+    if os.getenv("OUTCOME_SCORING_MODE"):
+        mode = os.environ["OUTCOME_SCORING_MODE"].strip().lower()
+        cfg.outcome_scoring.mode = (
+            mode if mode in ("off", "shadow", "production") else "shadow"
         )
     if os.getenv("OKX_PUBLIC_WEBSOCKET_URL"):
         cfg.signal_tracker.websocket_url = os.environ[

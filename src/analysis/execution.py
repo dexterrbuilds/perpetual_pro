@@ -13,6 +13,11 @@ import numpy as np
 import pandas as pd
 
 from src.analysis.indicators import IndicatorSuite
+from src.analysis.execution_policy import (
+    DEFAULT_EXECUTION_POLICY,
+    ExecutionQualityPolicy,
+    weighted_execution_quality,
+)
 from src.analysis.market_structure import StructureLevel, StructureReport
 from src.utils.helpers import clamp, safe_float
 
@@ -40,23 +45,59 @@ class CandleContext:
 @dataclass
 class ExecutionProfile:
     direction: str
-    status: str = "blocked"  # ready | wait_retest | avoid_chase | blocked
+    status: str = "blocked"  # confirmation_pending | wait_retest | avoid_chase | blocked
+    # ``score`` remains as a compatibility alias for execution_quality.
     score: float = 0.0
+    execution_quality: float = 0.0
+    legacy_execution_score: float = 0.0
+    legacy_status: str = "blocked"
+    legacy_targets: List[float] = field(default_factory=list)
+    policy_version: str = DEFAULT_EXECUTION_POLICY.version
+    setup_type: str = "retest_continuation"
+    entry_mode: str = "retest"
+    components: Dict[str, float] = field(default_factory=dict)
+    component_contributions: Dict[str, float] = field(default_factory=dict)
     entry_low: float = 0.0
     entry_high: float = 0.0
     stop_loss: float = 0.0
     targets: List[float] = field(default_factory=list)
+    target_feasibility: List[float] = field(default_factory=list)
+    gross_risk_reward: List[float] = field(default_factory=list)
+    net_risk_reward: List[float] = field(default_factory=list)
     entry_reason: str = ""
     invalidation_reason: str = ""
     chase_distance_atr: float = 0.0
     stop_distance_atr: float = 0.0
     immediate_sl_risk: float = 100.0
+    entry_zone_relation: str = "unknown"
+    tp1_progress_pct: float = 0.0
     order_flow_score: float = 0.0
     spread_bps: Optional[float] = None
     orderbook_imbalance: Optional[float] = None
     orderbook_alignment: float = 0.0
     mark_index_basis_bps: Optional[float] = None
     market_quality_ok: bool = True
+    ticker_age_seconds: Optional[float] = None
+    orderbook_age_seconds: Optional[float] = None
+    data_freshness_state: str = "unknown"
+    entry_distance_pct: float = 0.0
+    entry_distance_atr: float = 0.0
+    entry_zone_width_atr: float = 0.0
+    remaining_expiry_minutes: float = 0.0
+    estimated_fee_bps: float = 0.0
+    estimated_slippage_bps: float = 0.0
+    estimated_funding_bps: float = 0.0
+    estimated_total_cost_bps: float = 0.0
+    estimated_impact_bps: Optional[float] = None
+    depth_bands_bps: Dict[str, Any] = field(default_factory=dict)
+    impact_reference_notional_usd: Optional[float] = None
+    contract_size: Optional[float] = None
+    tick_size: Optional[float] = None
+    min_notional: Optional[float] = None
+    amount_precision: Optional[float] = None
+    structural_obstacle_distances_atr: List[float] = field(default_factory=list)
+    hard_failures: List[str] = field(default_factory=list)
+    uncertainties: List[str] = field(default_factory=list)
     candle_score: float = 0.0
     anchor_sources: List[str] = field(default_factory=list)
     reasons: List[str] = field(default_factory=list)
@@ -70,7 +111,21 @@ class ExecutionProfile:
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         data["entry_mid"] = self.entry_mid
+        data["execution_score"] = self.execution_quality
         return data
+
+
+@dataclass(frozen=True)
+class EntryAnchor:
+    mid: float
+    low: float
+    high: float
+    source: str
+    confidence: float
+    age_bars: Optional[int] = None
+    touch_count: int = 0
+    mitigation_fraction: float = 0.0
+    relevant: bool = True
 
 
 def analyze_candles(df: pd.DataFrame, atr: float, direction: str) -> CandleContext:
@@ -159,27 +214,58 @@ def build_execution_profile(
     price: float,
     atr: float,
     snapshot: Optional[Any] = None,
+    max_pre_entry_tp1_progress_pct: float = 70.0,
+    setup_name: str = "",
+    strategy_tags: Optional[List[str]] = None,
+    remaining_expiry_minutes: float = 90.0,
+    expected_hold_hours: float = 8.0,
+    policy: ExecutionQualityPolicy = DEFAULT_EXECUTION_POLICY,
 ) -> ExecutionProfile:
-    """Create a structure-clustered limit/retest entry and realistic targets."""
+    """Build an explainable, setup-specific deterministic execution plan."""
     if direction not in ("long", "short") or not price or not atr:
         return ExecutionProfile(direction=direction, status="blocked")
 
     candle = analyze_candles(df, atr, direction)
-    anchors = _entry_anchors(indicators, structure, direction, price, atr)
-    anchor, anchor_sources, anchor_bounds, cluster_strength = _select_anchor(
-        anchors, direction, price, atr
+    setup_type = _canonical_setup_type(setup_name, strategy_tags or [], structure)
+    wanted_structure = "bullish" if direction == "long" else "bearish"
+    if (
+        setup_type == "retest_continuation"
+        and "breakout" in setup_name.lower()
+        and structure.last_bos == wanted_structure
+        and candle.volume_ratio >= 1.10
+        and candle.score >= 0.15
+    ):
+        setup_type = "breakout_continuation"
+    anchors = _entry_anchors(indicators, structure, direction, price, atr, policy)
+    anchor, anchor_sources, anchor_bounds, cluster_strength, anchor_health = _select_anchor(
+        anchors, direction, price, atr, policy
     )
     if anchor is None:
         anchor = price - atr * 0.35 if direction == "long" else price + atr * 0.35
         anchor_bounds = (anchor - atr * 0.08, anchor + atr * 0.08)
         anchor_sources = ["ATR pullback fallback"]
         cluster_strength = 0.0
+        anchor_health = 35.0
+
+    # Breakout continuation may use a confirmed close near CMP; other setups
+    # retain a structural zone. This does not record an immediate fill.
+    bos_agrees = structure.last_bos == ("bullish" if direction == "long" else "bearish")
+    breakout_cmp = bool(
+        setup_type == "breakout_continuation"
+        and bos_agrees
+        and candle.volume_ratio >= 1.10
+        and candle.score >= 0.15
+    )
+    if breakout_cmp:
+        anchor = price
+        anchor_bounds = (price - atr * 0.08, price + atr * 0.08)
+        anchor_sources = ["confirmed breakout close"]
+        anchor_health = max(anchor_health, 72.0)
 
     zone_half = float(clamp(atr * 0.12, price * 0.0005, atr * 0.22))
     entry_low = min(anchor_bounds[0], anchor - zone_half)
     entry_high = max(anchor_bounds[1], anchor + zone_half)
-    # Keep the entry compact even when an old OB candle is unusually wide.
-    if entry_high - entry_low > atr * 0.45:
+    if entry_high - entry_low > atr * policy.max_entry_zone_width_atr:
         entry_low, entry_high = anchor - atr * 0.20, anchor + atr * 0.20
     if direction == "long" and entry_high > price + atr * 0.05:
         entry_high = price + atr * 0.05
@@ -201,7 +287,12 @@ def build_execution_profile(
         stop = max(relevant_edge + noise_buffer, entry_mid + min_stop_distance)
     stop_distance = abs(entry_mid - stop)
 
-    targets = _structure_targets(
+    legacy_targets = _legacy_structure_targets(
+        structure, df, direction=direction, entry=entry_mid, stop=stop,
+        atr=atr, current_price=price,
+    )
+
+    targets, target_quality, obstacles = _feasible_structure_targets(
         structure,
         df,
         direction=direction,
@@ -209,11 +300,8 @@ def build_execution_profile(
         stop=stop,
         atr=atr,
         current_price=price,
-    )
-    target_rr2 = (
-        abs(targets[1] - entry_mid) / max(stop_distance, 1e-12)
-        if len(targets) > 1
-        else 0.0
+        expected_hold_hours=expected_hold_hours,
+        policy=policy,
     )
 
     direction_sign = 1.0 if direction == "long" else -1.0
@@ -245,42 +333,214 @@ def build_execution_profile(
             or (direction == "short" and basis_bps < -18.0)
         )
     )
-    market_quality_ok = bool(spread_bps is None or spread_bps <= 12.0)
-    score = 52.0
-    score += min(18.0, cluster_strength * 6.0)
-    score += candle.score * 11.0
-    score += flow_alignment * 10.0
-    score += book_alignment * 7.0
-    score += 4.0 if candle.volume_ratio >= 1.05 else -4.0
-    score -= 18.0 if candle.adverse_rejection else 0.0
-    score -= 10.0 if candle.absorption else 0.0
-    score -= max(0.0, chase_distance - 0.5) * 15.0
-    score += 6.0 if target_rr2 >= 1.25 else -18.0
-    if spread_bps is not None:
-        if spread_bps <= 2.0:
-            score += 3.0
-        elif spread_bps > 12.0:
-            score -= 25.0
-        elif spread_bps > 7.0:
-            score -= 10.0
-    if adverse_basis:
-        score -= 6.0
-    score = float(clamp(score, 0, 100))
+    ticker_age_seconds = getattr(snapshot, "ticker_age_seconds", None)
+    orderbook_age_seconds = getattr(snapshot, "orderbook_age_seconds", None)
+    sources_fresh = getattr(snapshot, "execution_data_fresh", None)
+    raw_book = dict(getattr(snapshot, "raw", {}) or {}).get("orderbook_summary") or {}
+    impact_bps = raw_book.get("estimated_impact_bps", getattr(snapshot, "estimated_impact_bps", None))
+    bands = dict(getattr(snapshot, "orderbook_depth_bands", {}) or {})
+    bid_depth_usd = safe_float(
+        raw_book.get("bid_depth_usd_10bps", (bands.get("10") or {}).get("bid_usd")), 0.0
+    )
+    ask_depth_usd = safe_float(
+        raw_book.get("ask_depth_usd_10bps", (bands.get("10") or {}).get("ask_usd")), 0.0
+    )
+    market_quality_ok = bool(
+        (spread_bps is None or spread_bps <= policy.max_spread_bps)
+        and sources_fresh is not False
+    )
+
+    entry_distance_pct = abs(price - entry_mid) / max(price, 1e-12) * 100.0
+    zone_width_atr = (entry_high - entry_low) / max(atr, 1e-12)
+    spread_price = price * (spread_bps or 0.0) / 10_000.0
+    zone_spread_multiple = (entry_high - entry_low) / max(spread_price, price * 1e-9)
+    recent_velocity = _directional_velocity(df, direction, atr)
+    movement_toward_entry = -recent_velocity if (
+        (direction == "long" and price > entry_high)
+        or (direction == "short" and price < entry_low)
+    ) else recent_velocity
+
+    fee_bps = policy.default_taker_fee_bps_per_side * 2.0
+    slippage_bps = policy.default_slippage_bps_per_side * 2.0
+    if impact_bps is not None:
+        slippage_bps += max(0.0, safe_float(impact_bps))
+    funding_bps = abs(safe_float(getattr(snapshot, "funding_rate", None), 0.0)) * 10_000.0 * max(0.0, expected_hold_hours / 8.0)
+    if funding_bps <= 0:
+        funding_bps = policy.default_funding_bps_per_8h * max(0.0, expected_hold_hours / 8.0)
+    total_cost_bps = fee_bps + slippage_bps + funding_bps + max(0.0, spread_bps or 0.0)
+    cost_price = entry_mid * total_cost_bps / 10_000.0
+    gross_rr = [abs(tp - entry_mid) / max(stop_distance, 1e-12) for tp in targets]
+    net_rr = [
+        max(0.0, abs(tp - entry_mid) - cost_price) / max(stop_distance + cost_price, 1e-12)
+        for tp in targets
+    ]
+
+    legacy_rr = [
+        abs(target - entry_mid) / max(stop_distance, 1e-12)
+        for target in legacy_targets
+    ]
+    legacy_target_rr2 = legacy_rr[1] if len(legacy_rr) > 1 else (legacy_rr[0] if legacy_rr else 0.0)
+    legacy_score = _legacy_execution_score(
+        cluster_strength=cluster_strength,
+        candle=candle,
+        flow_alignment=flow_alignment,
+        book_alignment=book_alignment,
+        chase_distance=chase_distance,
+        target_rr2=legacy_target_rr2,
+        spread_bps=spread_bps,
+        adverse_basis=adverse_basis,
+    )
 
     inside = entry_low <= price <= entry_high
-    if not market_quality_ok:
+    favorable_beyond = (
+        price > entry_high if direction == "long" else price < entry_low
+    )
+    entry_zone_relation = (
+        "inside"
+        if inside
+        else ("favorable_beyond" if favorable_beyond else "adverse_side")
+    )
+    tp1_distance = abs(targets[0] - entry_mid) if targets else 0.0
+    favorable_distance = (
+        price - entry_mid if direction == "long" else entry_mid - price
+    )
+    tp1_progress_pct = float(
+        clamp(
+            favorable_distance / max(tp1_distance, 1e-12) * 100.0,
+            0.0,
+            200.0,
+        )
+    )
+    target_already_traded = bool(
+        targets
+        and (
+            price >= targets[0]
+            if direction == "long"
+            else price <= targets[0]
+        )
+    )
+    late_before_entry = bool(
+        favorable_beyond
+        and tp1_progress_pct
+        >= float(clamp(max_pre_entry_tp1_progress_pct, 0.0, 100.0))
+    )
+    legacy_tp1_distance = abs(legacy_targets[0] - entry_mid) if legacy_targets else 0.0
+    legacy_progress = float(clamp(
+        favorable_distance / max(legacy_tp1_distance, 1e-12) * 100.0, 0.0, 200.0
+    ))
+    legacy_target_traded = bool(
+        legacy_targets and (
+            price >= legacy_targets[0] if direction == "long" else price <= legacy_targets[0]
+        )
+    )
+    legacy_late = bool(
+        favorable_beyond
+        and legacy_progress >= float(clamp(max_pre_entry_tp1_progress_pct, 0.0, 100.0))
+    )
+    if not market_quality_ok or (inside and (candle.adverse_rejection or candle.absorption)):
+        legacy_status = "blocked"
+    elif chase_distance > 1.35 or legacy_score < 55:
+        legacy_status = "avoid_chase"
+    elif legacy_target_traded or legacy_late:
+        legacy_status = "avoid_chase"
+    elif inside:
+        legacy_status = "confirmation_pending"
+    else:
+        legacy_status = "wait_retest"
+
+    # Component scores are deliberately independent: target mathematical R:R
+    # is not an input to target feasibility, and technical direction is not
+    # counted again in liquidity or freshness.
+    entry_accessibility = _entry_accessibility_quality(
+        chase_distance, entry_distance_pct, zone_width_atr,
+        zone_spread_multiple, remaining_expiry_minutes, movement_toward_entry,
+        tp1_progress_pct, policy,
+    )
+    entry_zone_quality = float(clamp(
+        0.65 * anchor_health + 0.35 * min(100.0, cluster_strength * 24.0), 0, 100
+    ))
+    pre_entry_survival = _pre_entry_survival_quality(
+        direction=direction, price=price, entry=entry_mid, stop=stop, atr=atr,
+        candle=candle, structure=structure, remaining_minutes=remaining_expiry_minutes,
+        anchor_health=anchor_health,
+    )
+    confirmation_quality = _confirmation_quality(
+        candle, flow_alignment, book_alignment, setup_type, bos_agrees, structure
+    )
+    stop_quality = _stop_quality(
+        stop_distance / atr, candle, spread_bps, slippage_bps, anchor_health, expected_hold_hours
+    )
+    target_feasibility_score = (
+        float(clamp(0.60 * target_quality[0] + 0.40 * np.mean(target_quality), 0, 100))
+        if target_quality else 0.0
+    )
+    liquidity_cost_quality, liquidity_uncertainties = _liquidity_cost_quality(
+        spread_bps=spread_bps, book_alignment=book_alignment,
+        bid_depth_usd=bid_depth_usd, ask_depth_usd=ask_depth_usd,
+        impact_bps=impact_bps, total_cost_bps=total_cost_bps, policy=policy,
+    )
+    data_market_quality, data_uncertainties = _data_market_quality(
+        ticker_age_seconds, orderbook_age_seconds, sources_fresh, policy
+    )
+    metadata_uncertainties = []
+    if snapshot is not None and getattr(snapshot, "contract_size", None) is None:
+        metadata_uncertainties.append("contract_size_unknown")
+    if snapshot is not None and getattr(snapshot, "tick_size", None) is None:
+        metadata_uncertainties.append("tick_size_unknown")
+    components = {
+        "entry_accessibility": entry_accessibility,
+        "entry_zone_quality": entry_zone_quality,
+        "pre_entry_survival": pre_entry_survival,
+        "confirmation_quality": confirmation_quality,
+        "stop_quality": stop_quality,
+        "target_feasibility": target_feasibility_score,
+        "liquidity_cost_quality": liquidity_cost_quality,
+        "data_market_quality": data_market_quality,
+    }
+    score, contributions = weighted_execution_quality(components, setup_type, policy)
+    hard_failures: List[str] = []
+    if sources_fresh is False:
+        hard_failures.append("stale_execution_data")
+    if spread_bps is not None and spread_bps > policy.max_spread_bps:
+        hard_failures.append("spread_above_hard_limit")
+    if not targets:
+        hard_failures.append("no_feasible_target")
+    if obstacles and min(obstacles) < 0.35:
+        hard_failures.append("tp1_blocked_by_nearby_structure")
+    if targets and abs(targets[0] - entry_mid) < cost_price * policy.min_net_tp1_cost_multiple:
+        hard_failures.append("tp1_reward_does_not_cover_cost_buffer")
+    if stop_distance / atr > policy.max_stop_atr:
+        hard_failures.append("stop_beyond_maximum_structure_distance")
+    if setup_type == "range_mean_reversion" and structure.trend != "range":
+        hard_failures.append("range_setup_during_trend_expansion")
+    if setup_type == "reversal" and not _reversal_confirmed(direction, structure, candle):
+        hard_failures.append("reversal_confirmation_insufficient")
+    zone_position = (price - entry_low) / max(entry_high - entry_low, 1e-12)
+    if inside and setup_type in ("cmp_confirmation", "breakout_continuation"):
+        acceptable = zone_position <= 0.80 if direction == "long" else zone_position >= 0.20
+        if not acceptable:
+            hard_failures.append("cmp_position_excessively_extended_inside_zone")
+        conflicting = structure.last_bos == ("bearish" if direction == "long" else "bullish")
+        if conflicting:
+            hard_failures.append("adverse_structure_change_before_confirmation")
+
+    if hard_failures:
         status = "blocked"
-    elif chase_distance > 1.35 or score < 55:
+    elif inside and (candle.adverse_rejection or candle.absorption):
+        status = "blocked"
+    elif chase_distance > policy.max_retest_distance_atr or score < 55:
         status = "avoid_chase"
-    elif inside and not candle.adverse_rejection and not candle.absorption:
-        status = "ready"
+    elif target_already_traded or late_before_entry:
+        status = "avoid_chase"
+    elif inside or breakout_cmp:
+        status = "confirmation_pending"
     else:
         status = "wait_retest"
 
     reasons = [
         f"Entry clustered at {', '.join(anchor_sources[:4])}",
         f"Order-flow approximation {candle.order_flow_score:+.2f}",
-        f"TP2 planned at {target_rr2:.2f}R",
+        f"Execution Quality {score:.0f}/100 ({policy.version})",
     ]
     if spread_bps is not None:
         reasons.append(
@@ -293,33 +553,43 @@ def build_execution_profile(
         risks.append("Absorption candle: wait for a decisive close")
     if chase_distance > 0.45:
         risks.append(f"Price is {chase_distance:.2f} ATR from the entry; use a limit/retest")
-    if target_rr2 < 1.25:
-        risks.append("Structure does not offer at least 1.25R to TP2")
+    if target_already_traded:
+        risks.append("TP1 had already traded before the setup could be published")
+    elif late_before_entry:
+        risks.append(
+            f"Price already completed {tp1_progress_pct:.0f}% of the Entry-to-TP1 move"
+        )
+    if gross_rr and max(gross_rr[:2]) < 1.25:
+        risks.append("Feasible targets do not offer at least 1.25 gross R")
+    if net_rr and net_rr[0] < gross_rr[0] * 0.85:
+        risks.append("Trading costs materially reduce TP1 net R:R")
     if not market_quality_ok:
-        risks.append(f"Order-book spread is too wide ({spread_bps:.2f} bps)")
+        risks.append(
+            f"Execution market quality failed"
+            + (f" ({spread_bps:.2f} bps spread)" if spread_bps is not None else " (stale source)")
+        )
     if book_alignment < -0.45:
         risks.append("Order-book depth is strongly adverse to the setup")
     if adverse_basis:
         risks.append(f"Mark/index premium is crowded against entry ({basis_bps:+.1f} bps)")
-    immediate_risk = float(
-        clamp(
-            100.0
-            - score
-            + (18.0 if candle.adverse_rejection else 0.0)
-            + max(0.0, 0.95 - stop_distance / atr) * 22.0
-            + (15.0 if not market_quality_ok else 0.0)
-            + (8.0 if book_alignment < -0.45 else 0.0),
-            0,
-            100,
-        )
-    )
+    risks.extend(reason.replace("_", " ") for reason in hard_failures)
+    immediate_risk = float(clamp(
+        0.38 * (100.0 - stop_quality)
+        + 0.27 * (100.0 - confirmation_quality)
+        + 0.20 * (100.0 - pre_entry_survival)
+        + 0.15 * (100.0 - liquidity_cost_quality), 0, 100
+    ))
     entry_reason = (
         "Price is inside the validated zone; enter only after candle confirmation."
-        if status == "ready"
+        if status == "confirmation_pending"
         else (
             "Place no market order; wait for price to retest this demand/supply cluster."
             if status == "wait_retest"
-            else "Setup is extended or poorly confirmed; skip rather than chase."
+            else (
+                "Price is inside the zone but confirmation is weak; wait for a fresh scan."
+                if inside and status == "blocked"
+                else "Setup is extended or poorly confirmed; skip rather than chase."
+            )
         )
     )
     invalidation = (
@@ -330,21 +600,58 @@ def build_execution_profile(
         direction=direction,
         status=status,
         score=score,
+        execution_quality=score,
+        legacy_execution_score=legacy_score,
+        legacy_status=legacy_status,
+        legacy_targets=[float(x) for x in legacy_targets],
+        policy_version=policy.version,
+        setup_type=setup_type,
+        entry_mode=("cmp_confirmation" if (inside or breakout_cmp) else "retest"),
+        components=components,
+        component_contributions=contributions,
         entry_low=float(min(entry_low, entry_high)),
         entry_high=float(max(entry_low, entry_high)),
         stop_loss=float(stop),
         targets=[float(x) for x in targets],
+        target_feasibility=[float(x) for x in target_quality],
+        gross_risk_reward=[float(x) for x in gross_rr],
+        net_risk_reward=[float(x) for x in net_rr],
         entry_reason=entry_reason,
         invalidation_reason=invalidation,
         chase_distance_atr=float(chase_distance),
         stop_distance_atr=float(stop_distance / atr),
         immediate_sl_risk=immediate_risk,
+        entry_zone_relation=entry_zone_relation,
+        tp1_progress_pct=tp1_progress_pct,
         order_flow_score=candle.order_flow_score,
         spread_bps=spread_bps,
         orderbook_imbalance=book_imbalance,
         orderbook_alignment=book_alignment,
         mark_index_basis_bps=basis_bps,
         market_quality_ok=market_quality_ok,
+        ticker_age_seconds=ticker_age_seconds,
+        orderbook_age_seconds=orderbook_age_seconds,
+        data_freshness_state=("stale" if sources_fresh is False else ("fresh" if sources_fresh is True else "unknown")),
+        entry_distance_pct=float(entry_distance_pct),
+        entry_distance_atr=float(abs(price - entry_mid) / max(atr, 1e-12)),
+        entry_zone_width_atr=float(zone_width_atr),
+        remaining_expiry_minutes=float(max(0.0, remaining_expiry_minutes)),
+        estimated_fee_bps=float(fee_bps),
+        estimated_slippage_bps=float(slippage_bps),
+        estimated_funding_bps=float(funding_bps),
+        estimated_total_cost_bps=float(total_cost_bps),
+        estimated_impact_bps=(safe_float(impact_bps) if impact_bps is not None else None),
+        depth_bands_bps=dict(raw_book.get("depth_bands_bps") or bands),
+        impact_reference_notional_usd=getattr(snapshot, "impact_reference_notional_usd", None),
+        contract_size=getattr(snapshot, "contract_size", None),
+        tick_size=getattr(snapshot, "tick_size", None),
+        min_notional=getattr(snapshot, "min_notional", None),
+        amount_precision=getattr(snapshot, "amount_precision", None),
+        structural_obstacle_distances_atr=[float(x) for x in obstacles],
+        hard_failures=hard_failures,
+        uncertainties=list(dict.fromkeys([
+            *liquidity_uncertainties, *data_uncertainties, *metadata_uncertainties
+        ])),
         candle_score=candle.score,
         anchor_sources=anchor_sources,
         reasons=reasons,
@@ -359,9 +666,10 @@ def _entry_anchors(
     direction: str,
     price: float,
     atr: float,
-) -> List[Tuple[float, float, float, str, float]]:
-    """Return (mid, low, high, source, confidence) anchors on the entry side."""
-    anchors: List[Tuple[float, float, float, str, float]] = []
+    policy: ExecutionQualityPolicy = DEFAULT_EXECUTION_POLICY,
+) -> List[EntryAnchor]:
+    """Return only directionally relevant, not-invalidated entry anchors."""
+    anchors: List[EntryAnchor] = []
     wanted = "bullish" if direction == "long" else "bearish"
     for level in structure.levels:
         if level.side != wanted or level.kind not in (
@@ -372,12 +680,24 @@ def _entry_anchors(
             "resistance",
         ):
             continue
+        if getattr(level, "invalidated", False) or getattr(level, "fully_mitigated", False):
+            continue
+        if (
+            getattr(level, "age_bars", None) is not None
+            and int(level.age_bars) > policy.expired_level_bars
+        ):
+            continue
         mid = level.mid
         on_side = mid <= price + atr * 0.10 if direction == "long" else mid >= price - atr * 0.10
         if on_side and abs(mid - price) <= atr * 2.2:
-            anchors.append(
-                (mid, level.price_low, level.price_high, level.kind, level.confidence / 100.0)
-            )
+            anchors.append(EntryAnchor(
+                mid, level.price_low, level.price_high, level.kind,
+                level.confidence / 100.0,
+                age_bars=getattr(level, "age_bars", None),
+                touch_count=int(getattr(level, "touch_count", 0) or 0),
+                mitigation_fraction=float(getattr(level, "mitigation_fraction", 0.0) or 0.0),
+                relevant=bool(getattr(level, "relevant", True)),
+            ))
 
     summary = indicators.summary or {}
     for key, label, confidence in (
@@ -393,7 +713,7 @@ def _entry_anchors(
             continue
         on_side = val <= price + atr * 0.08 if direction == "long" else val >= price - atr * 0.08
         if on_side and abs(val - price) <= atr * 1.8:
-            anchors.append((val, val, val, label, confidence))
+            anchors.append(EntryAnchor(val, val, val, label, confidence))
 
     vp = (
         (structure.volume_profile_val, "volume VAL", 0.88),
@@ -405,25 +725,31 @@ def _entry_anchors(
             continue
         on_side = value <= price if direction == "long" else value >= price
         if on_side and abs(value - price) <= atr * 2.0:
-            anchors.append((value, value, value, label, confidence))
+            anchors.append(EntryAnchor(value, value, value, label, confidence))
     return anchors
 
 
 def _select_anchor(
-    anchors: List[Tuple[float, float, float, str, float]],
+    anchors: List[EntryAnchor],
     direction: str,
     price: float,
     atr: float,
-) -> Tuple[Optional[float], List[str], Tuple[float, float], float]:
+    policy: ExecutionQualityPolicy = DEFAULT_EXECUTION_POLICY,
+) -> Tuple[Optional[float], List[str], Tuple[float, float], float, float]:
     if not anchors:
-        return None, [], (0.0, 0.0), 0.0
-    best: Optional[Tuple[float, float, float, str, float]] = None
+        return None, [], (0.0, 0.0), 0.0, 0.0
+    best: Optional[EntryAnchor] = None
     best_score = -1e9
-    best_cluster: List[Tuple[float, float, float, str, float]] = []
+    best_cluster: List[EntryAnchor] = []
     for candidate in anchors:
-        mid = candidate[0]
-        cluster = [a for a in anchors if abs(a[0] - mid) <= atr * 0.28]
-        confidence = sum(a[4] for a in cluster)
+        mid = candidate.mid
+        cluster = [a for a in anchors if abs(a.mid - mid) <= atr * 0.28]
+        confidence = sum(
+            a.confidence
+            * max(0.20, 1.0 - 0.80 * a.touch_count / max(1, policy.max_level_touches))
+            * max(0.15, 1.0 - 0.70 * a.mitigation_fraction)
+            for a in cluster
+        )
         distance = abs(price - mid) / atr
         # Slight preference for a meaningful pullback instead of an entry at the
         # current wick, while rejecting deep/outdated zones.
@@ -432,16 +758,33 @@ def _select_anchor(
         if score > best_score:
             best, best_score, best_cluster = candidate, score, cluster
     assert best is not None
-    weights = np.array([max(a[4], 0.1) for a in best_cluster], dtype=float)
-    mids = np.array([a[0] for a in best_cluster], dtype=float)
+    weights = np.array([max(a.confidence, 0.1) for a in best_cluster], dtype=float)
+    mids = np.array([a.mid for a in best_cluster], dtype=float)
     anchor = float(np.average(mids, weights=weights))
-    lows = [a[1] for a in best_cluster]
-    highs = [a[2] for a in best_cluster]
-    sources = list(dict.fromkeys(a[3] for a in best_cluster))
-    return anchor, sources, (float(min(lows)), float(max(highs))), float(best_score)
+    lows = [a.low for a in best_cluster]
+    highs = [a.high for a in best_cluster]
+    sources = list(dict.fromkeys(a.source for a in best_cluster))
+    health_values = [
+        100.0
+        * max(0.20, 1.0 - 0.80 * a.touch_count / max(1, policy.max_level_touches))
+        * max(0.15, 1.0 - 0.70 * a.mitigation_fraction)
+        * (
+            1.0
+            if a.age_bars is None
+            else max(
+                0.25,
+                1.0
+                - max(0, a.age_bars - policy.stale_level_bars)
+                / max(1, policy.expired_level_bars - policy.stale_level_bars),
+            )
+        )
+        for a in best_cluster
+    ]
+    health = float(np.average(health_values, weights=weights)) if health_values else 0.0
+    return anchor, sources, (float(min(lows)), float(max(highs))), float(best_score), health
 
 
-def _structure_targets(
+def _legacy_structure_targets(
     structure: StructureReport,
     df: pd.DataFrame,
     *,
@@ -497,3 +840,269 @@ def _structure_targets(
                 selected = min(selected, targets[-1] - atr * 0.20)
         targets.append(float(selected))
     return targets
+
+
+def _canonical_setup_type(
+    setup_name: str,
+    tags: List[str],
+    structure: StructureReport,
+) -> str:
+    text = " ".join([setup_name.lower(), *(str(tag).lower() for tag in tags)])
+    if "reversal" in text:
+        return "reversal"
+    if "mean_reversion" in text or "mean reversion" in text or "range" in text:
+        return "range_mean_reversion"
+    if "breakout" in text or "breakdown" in text:
+        if "retest" in text:
+            return "retest_continuation"
+        return "breakout_continuation"
+    if "momentum" in text and structure.last_bos:
+        return "breakout_continuation"
+    if "momentum" in text:
+        return "cmp_confirmation"
+    return "retest_continuation"
+
+
+def _directional_velocity(df: pd.DataFrame, direction: str, atr: float) -> float:
+    if df is None or len(df) < 4:
+        return 0.0
+    close = df["close"].astype(float)
+    raw = (safe_float(close.iloc[-1]) - safe_float(close.iloc[-4])) / max(atr, 1e-12)
+    return float(clamp(raw * (1.0 if direction == "long" else -1.0), -2.0, 2.0))
+
+
+def _entry_accessibility_quality(
+    distance_atr: float,
+    distance_pct: float,
+    width_atr: float,
+    zone_spread_multiple: float,
+    remaining_minutes: float,
+    movement_toward_entry: float,
+    tp1_progress_pct: float,
+    policy: ExecutionQualityPolicy,
+) -> float:
+    distance = 100.0 - abs(distance_atr - policy.ideal_retest_distance_atr) * 48.0
+    if distance_atr > policy.max_retest_distance_atr:
+        distance -= (distance_atr - policy.max_retest_distance_atr) * 45.0
+    width = 100.0 - abs(width_atr - 0.24) * 120.0
+    precision = min(100.0, zone_spread_multiple / policy.min_zone_spread_multiple * 100.0)
+    time_quality = float(clamp(remaining_minutes / 90.0 * 100.0, 20.0, 100.0))
+    velocity = float(clamp(55.0 + movement_toward_entry * 28.0, 0.0, 100.0))
+    progress = float(clamp(100.0 - tp1_progress_pct * 1.25, 0.0, 100.0))
+    percent_penalty = max(0.0, distance_pct - 1.5) * 12.0
+    return float(clamp(
+        0.27 * distance + 0.17 * width + 0.13 * precision
+        + 0.13 * time_quality + 0.15 * velocity + 0.15 * progress
+        - percent_penalty
+        - max(0.0, distance_atr - policy.max_retest_distance_atr) * 32.0,
+        0, 100
+    ))
+
+
+def _pre_entry_survival_quality(
+    *, direction: str, price: float, entry: float, stop: float, atr: float,
+    candle: CandleContext, structure: StructureReport, remaining_minutes: float,
+    anchor_health: float,
+) -> float:
+    price_to_invalidation = abs(price - stop) / max(atr, 1e-12)
+    entry_to_invalidation = abs(entry - stop) / max(atr, 1e-12)
+    stop_room = float(clamp((min(price_to_invalidation, entry_to_invalidation) - 0.45) / 1.2 * 100.0, 0, 100))
+    wanted = "bullish" if direction == "long" else "bearish"
+    bos = 82.0 if structure.last_bos == wanted else (38.0 if structure.last_bos else 58.0)
+    choch = 80.0 if structure.last_choch == wanted else (35.0 if structure.last_choch else 58.0)
+    adverse = 25.0 if candle.adverse_rejection else (42.0 if candle.absorption else 78.0)
+    expiry = float(clamp(remaining_minutes / 90.0 * 100.0, 20.0, 100.0))
+    return float(clamp(
+        0.27 * stop_room + 0.18 * bos + 0.10 * choch + 0.15 * adverse
+        + 0.20 * anchor_health + 0.10 * expiry, 0, 100
+    ))
+
+
+def _confirmation_quality(
+    candle: CandleContext,
+    flow_alignment: float,
+    book_alignment: float,
+    setup_type: str,
+    bos_agrees: bool,
+    structure: StructureReport,
+) -> float:
+    candle_value = (candle.score + 1.0) * 50.0
+    flow_value = (float(clamp(flow_alignment, -1, 1)) + 1.0) * 50.0
+    book_value = (float(clamp(book_alignment, -1, 1)) + 1.0) * 50.0
+    structure_value = 78.0 if bos_agrees else 52.0
+    score = 0.36 * candle_value + 0.27 * flow_value + 0.12 * book_value + 0.25 * structure_value
+    if candle.adverse_rejection:
+        score -= 24.0
+    if candle.absorption:
+        score -= 14.0
+    if setup_type == "reversal" and structure.last_choch is None:
+        score -= 20.0
+    return float(clamp(score, 0, 100))
+
+
+def _stop_quality(
+    stop_atr: float,
+    candle: CandleContext,
+    spread_bps: Optional[float],
+    slippage_bps: float,
+    anchor_health: float,
+    expected_hold_hours: float,
+) -> float:
+    noise_floor = max(0.70, candle.noise_atr * 0.82)
+    tight = max(0.0, noise_floor - stop_atr) * 85.0
+    wide = max(0.0, stop_atr - 2.20) * (18.0 + min(12.0, expected_hold_hours))
+    friction = max(0.0, (spread_bps or 0.0) + slippage_bps - 12.0) * 1.5
+    wick_risk = 14.0 if candle.adverse_rejection else 0.0
+    structural = 0.20 * anchor_health
+    return float(clamp(82.0 + structural - tight - wide - friction - wick_risk, 0, 100))
+
+
+def _data_market_quality(
+    ticker_age: Optional[float],
+    orderbook_age: Optional[float],
+    sources_fresh: Optional[bool],
+    policy: ExecutionQualityPolicy,
+) -> Tuple[float, List[str]]:
+    uncertainties: List[str] = []
+    score = 100.0
+    if ticker_age is None:
+        score -= policy.important_missing_penalty
+        uncertainties.append("ticker_age_missing")
+    else:
+        score -= max(0.0, ticker_age - policy.max_ticker_age_seconds * 0.5) * 1.2
+    if orderbook_age is None:
+        score -= policy.important_missing_penalty
+        uncertainties.append("orderbook_age_missing")
+    else:
+        score -= max(0.0, orderbook_age - policy.max_orderbook_age_seconds * 0.5) * 1.5
+    if sources_fresh is False:
+        score = 0.0
+    return float(clamp(score, 0, 100)), uncertainties
+
+
+def _liquidity_cost_quality(
+    *, spread_bps: Optional[float], book_alignment: float,
+    bid_depth_usd: float, ask_depth_usd: float, impact_bps: Optional[float],
+    total_cost_bps: float, policy: ExecutionQualityPolicy,
+) -> Tuple[float, List[str]]:
+    uncertainties: List[str] = []
+    score = 88.0
+    if spread_bps is None:
+        score -= policy.important_missing_penalty
+        uncertainties.append("spread_missing")
+    else:
+        score -= max(0.0, spread_bps - 2.0) * 4.0
+    score += book_alignment * 8.0
+    if bid_depth_usd <= 0 or ask_depth_usd <= 0:
+        score -= policy.important_missing_penalty
+        uncertainties.append("notional_depth_missing")
+    else:
+        shallow = min(bid_depth_usd, ask_depth_usd)
+        score += float(clamp((shallow / policy.reference_impact_notional_usd - 1.0) * 5.0, -15.0, 8.0))
+    if impact_bps is None:
+        score -= policy.optional_missing_penalty
+        uncertainties.append("market_impact_unknown")
+    else:
+        score -= max(0.0, safe_float(impact_bps) - 1.0) * 4.0
+    score -= max(0.0, total_cost_bps - 15.0) * 1.2
+    return float(clamp(score, 0, 100)), uncertainties
+
+
+def _reversal_confirmed(
+    direction: str,
+    structure: StructureReport,
+    candle: CandleContext,
+) -> bool:
+    wanted = "bullish" if direction == "long" else "bearish"
+    structure_shift = structure.last_choch == wanted or structure.last_bos == wanted
+    rejection = (
+        candle.lower_wick_ratio >= 0.35 if direction == "long"
+        else candle.upper_wick_ratio >= 0.35
+    )
+    return bool(structure_shift and (rejection or candle.score >= 0.18))
+
+
+def _feasible_structure_targets(
+    structure: StructureReport,
+    df: pd.DataFrame,
+    *, direction: str, entry: float, stop: float, atr: float,
+    current_price: float, expected_hold_hours: float,
+    policy: ExecutionQualityPolicy,
+) -> Tuple[List[float], List[float], List[float]]:
+    """Choose reachable structure targets; never manufacture a minimum R:R."""
+    sign = 1.0 if direction == "long" else -1.0
+    target_side = "bearish" if direction == "long" else "bullish"
+    candidates: List[Tuple[float, float, str]] = []
+    for level in structure.levels:
+        beyond = level.mid > entry if direction == "long" else level.mid < entry
+        if not beyond or level.side != target_side:
+            continue
+        if getattr(level, "invalidated", False):
+            continue
+        quality = float(level.confidence)
+        if getattr(level, "fully_mitigated", False):
+            quality -= 25.0
+        candidates.append((float(level.mid), quality, level.kind))
+    for value, quality, name in (
+        (structure.volume_profile_poc, 62.0, "volume_poc"),
+        (structure.volume_profile_vah if direction == "long" else structure.volume_profile_val, 70.0, "value_area"),
+        *((value, 68.0, "swing") for value in (
+            structure.swing_highs if direction == "long" else structure.swing_lows
+        )),
+    ):
+        if value is not None and ((value > entry) if direction == "long" else (value < entry)):
+            candidates.append((float(value), quality, name))
+    candidates.sort(key=lambda item: abs(item[0] - entry))
+    targets: List[float] = []
+    qualities: List[float] = []
+    obstacles: List[float] = []
+    seen: List[float] = []
+    hold_scale = float(clamp(expected_hold_hours / 8.0, 0.55, 1.35))
+    for value, base_quality, _source in candidates:
+        distance_atr = abs(value - entry) / max(atr, 1e-12)
+        if distance_atr < 0.35:
+            if _source != "volume_poc":
+                obstacles.append(distance_atr)
+            continue
+        index = len(targets)
+        if index >= len(policy.max_target_atr_by_index):
+            break
+        max_distance = policy.max_target_atr_by_index[index] * hold_scale
+        if distance_atr > max_distance:
+            continue
+        if any(abs(value - prior) < atr * 0.18 for prior in seen):
+            continue
+        temporal = float(clamp(100.0 - distance_atr / max(max_distance, 1e-9) * 45.0, 25.0, 100.0))
+        quality = float(clamp(0.60 * base_quality + 0.40 * temporal, 0, 100))
+        targets.append(value)
+        qualities.append(quality)
+        seen.append(value)
+    # A volatility projection is allowed for TP1 only when no real structure
+    # level exists; it is not moved to satisfy the minimum-R gate.
+    if not targets:
+        projection_atr = min(1.0 * hold_scale, policy.max_target_atr_by_index[0])
+        projected = entry + sign * atr * projection_atr
+        targets = [float(projected)]
+        qualities = [48.0]
+    ordered = sorted(zip(targets, qualities), key=lambda item: item[0], reverse=direction == "short")
+    return [x for x, _ in ordered], [q for _, q in ordered], obstacles
+
+
+def _legacy_execution_score(
+    *, cluster_strength: float, candle: CandleContext, flow_alignment: float,
+    book_alignment: float, chase_distance: float, target_rr2: float,
+    spread_bps: Optional[float], adverse_basis: bool,
+) -> float:
+    """Frozen pre-Phase-2A formula used only for shadow comparison."""
+    score = 52.0 + min(18.0, cluster_strength * 6.0)
+    score += candle.score * 11.0 + flow_alignment * 10.0 + book_alignment * 7.0
+    score += 4.0 if candle.volume_ratio >= 1.05 else -4.0
+    score -= 18.0 if candle.adverse_rejection else 0.0
+    score -= 10.0 if candle.absorption else 0.0
+    score -= max(0.0, chase_distance - 0.5) * 15.0
+    score += 6.0 if target_rr2 >= 1.25 else -18.0
+    if spread_bps is not None:
+        score += 3.0 if spread_bps <= 2.0 else (-25.0 if spread_bps > 12.0 else (-10.0 if spread_bps > 7.0 else 0.0))
+    if adverse_basis:
+        score -= 6.0
+    return float(clamp(score, 0, 100))

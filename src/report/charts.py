@@ -168,7 +168,7 @@ def render_signal_chart_png(
     )
     draw.text(
         (right - 280, 32),
-        f"CONF {confidence:.0f}%   {status}",
+        f"QUALITY {confidence:.0f}/100   {status}",
         fill="#dbeafe",
         font=font_body,
     )
@@ -183,7 +183,9 @@ def render_signal_chart_png(
         raise ValueError("Chart candles contain invalid OHLC values")
 
     trade = chart.get("trade") if isinstance(chart.get("trade"), dict) else {}
+    scan_price = _finite(row.get("price"), np.nan)
     plan_values = [
+        scan_price,
         trade.get("entry_low"),
         trade.get("entry_high"),
         trade.get("stop_loss"),
@@ -286,6 +288,29 @@ def render_signal_chart_png(
         side = str(level.get("side") or "neutral")
         color = "#236b59" if side == "bullish" else ("#713849" if side == "bearish" else "#40566f")
         _dashed_line(draw, left, right, y_of(value), color, dash=8, gap=8, width=1)
+
+    if np.isfinite(scan_price) and scan_price > 0:
+        scan_y = y_of(scan_price)
+        _dashed_line(
+            draw,
+            left,
+            right,
+            scan_y,
+            "#e5e7eb",
+            dash=5,
+            gap=6,
+            width=1,
+        )
+        draw.rectangle(
+            (left + 4, scan_y - 22, left + 178, scan_y + 1),
+            fill="#07111f",
+        )
+        draw.text(
+            (left + 9, scan_y - 21),
+            f"CMP AT SCAN {_price(scan_price)}",
+            fill="#e5e7eb",
+            font=font_small,
+        )
 
     entry_low = _finite(trade.get("entry_low"), np.nan)
     entry_high = _finite(trade.get("entry_high"), np.nan)

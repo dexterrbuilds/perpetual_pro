@@ -70,12 +70,12 @@ def test_format_prop_scan_report_with_rows():
     assert "Prop Scan" in text
     assert "BTC" in text
     assert "112,300" in text or "112300" in text
-    assert "84% Confidence" in text
-    assert "Technical 82%" in text
+    assert "Overall Quality 84/100" in text
+    assert "Technical Quality 82/100" in text
     assert "MTF aligned" in text
     assert "Entry" in text
     assert "Retest Only" in text
-    assert "Execution 76/100" in text
+    assert "Execution Quality 76/100" in text
     assert "TP1" in text
     assert "NFA · DYOR · Trade at your own risk" in text
     assert "Educational" not in text
@@ -237,6 +237,24 @@ def test_filter_rejects_immediate_stop_market_data_and_backtest_risks():
         )
         == []
     )
+
+    late_entry = {
+        **base,
+        "entry_zone_relation": "favorable_beyond",
+        "tp1_progress_pct": 82,
+    }
+    assert (
+        filter_high_confidence(
+            [late_entry],
+            min_llm=65,
+            min_rank=50,
+            only_prop_safe=True,
+        )
+        == []
+    )
+    assert "ENTRY_MOVE_MOSTLY_MISSED" in late_entry[
+        "delivery_rejection_reasons"
+    ]
 
 
 def test_scheduled_signal_dedup_lasts_only_for_entry_validity(monkeypatch):
@@ -452,11 +470,13 @@ def test_signal_photo_caption_is_clean_and_actionable():
         "symbol": "BTC/USDT:USDT",
         "direction": "long",
         "primary_tf": "15m",
-        "confidence": 87,
+        "confidence": 84,
         "technical_confidence": 84,
         "llm_confidence": 90,
         "entry_status": "wait_retest",
-        "execution_score": 76,
+        "execution_score": 79,
+        "price": 112900,
+        "entry_zone_relation": "favorable_beyond",
         "entry_low": 112300,
         "entry_high": 112500,
         "stop_loss": 111900,
@@ -489,23 +509,25 @@ def test_signal_photo_caption_is_clean_and_actionable():
     }
     caption = format_signal_photo_caption(row, slot_label="New York open")
     assert "BTC LONG — RETEST" in caption
-    assert "87% Confidence" in caption
-    assert "Technical 84%" in caption
-    assert "Execution 76/100" in caption
+    assert "Overall Quality 84/100" in caption
+    assert "Technical Quality 84/100" in caption
+    assert "Execution Quality 79/100" in caption
     assert "Intraday" in caption
     assert "NY open" in caption
     assert "<b>Entry valid:</b> 90m · until 14:30 UTC" in caption
     assert "<b>Hold after fill:</b> 1–8h · hard max 12h" in caption
+    assert "<b>Price at scan:</b> $112,900.00" in caption
+    assert "already beyond Entry toward TP1" in caption
     assert "cancel at expiry" in caption
     assert "<b>Entry:</b>" in caption
     assert "<b>Entry mode:</b> RETEST ONLY" in caption
     assert "<b>Stop:</b>" in caption
     assert "<b>TP1:</b>" in caption
     assert "<b>Setup:</b> Long Momentum" in caption
-    assert "<b>R:R (TP2):</b> 2.40" in caption
+    assert "<b>R:R (TP2):</b> gross 2.40R" in caption
     assert "<b>Why:</b>" in caption
     assert "<b>Beginner rule:</b>" in caption
-    assert "Once Entry touches" in caption
+    assert "after TP1, move it to breakeven" in caption
     assert "Educational" not in caption
     assert caption.endswith("NFA · DYOR · Trade at your own risk")
     assert len(caption) <= 1024
@@ -519,6 +541,8 @@ def test_signal_photo_caption_explains_cmp_ready_entry():
         "technical_confidence": 86,
         "entry_status": "ready",
         "execution_score": 82,
+        "price": 3804,
+        "entry_zone_relation": "inside",
         "entry_low": 3800,
         "entry_high": 3810,
         "stop_loss": 3830,
@@ -539,10 +563,11 @@ def test_signal_photo_caption_explains_cmp_ready_entry():
         },
     }
     caption = format_signal_photo_caption(row)
-    assert "ETH SHORT — CMP READY" in caption
-    assert "<b>Entry mode:</b> CMP ALLOWED" in caption
-    assert "If it leaves before you act, wait for a new scan." in caption
-    assert "candle finishes above Stop" in caption
+    assert "ETH SHORT — CMP CONFIRMATION" in caption
+    assert "<b>Price at scan:</b> $3,804.00 · inside Entry zone" in caption
+    assert "<b>Entry mode:</b> CMP PENDING" in caption
+    assert "closed candle before the tracker records a fill" in caption
+    assert "candle closes above Stop" in caption
 
 
 def test_telegram_diagnostics_checks_bot_chat_and_membership(monkeypatch):
@@ -635,6 +660,11 @@ def test_scheduled_scan_calls_detailed_sender(monkeypatch):
         "scan_symbols",
         lambda *a, **k: {"ok": True, "ranked_results": [row]},
     )
+    monkeypatch.setattr(
+        scan_job,
+        "revalidate_candidate_for_delivery",
+        lambda row, cfg: {"ok": True, "row": row, "reasons": []},
+    )
     sent = []
     monkeypatch.setattr(
         scan_job,
@@ -704,6 +734,11 @@ def test_scheduled_scan_sends_chart_alert_without_text_fallback(monkeypatch):
         "scan_symbols",
         lambda *a, **k: {"ok": True, "ranked_results": [row]},
     )
+    monkeypatch.setattr(
+        scan_job,
+        "revalidate_candidate_for_delivery",
+        lambda row, cfg: {"ok": True, "row": row, "reasons": []},
+    )
     monkeypatch.setattr(scan_job, "render_signal_chart_png", lambda row: b"png")
     monkeypatch.setattr(
         scan_job,
@@ -754,6 +789,11 @@ def test_scheduled_scan_fans_out_but_manual_override_stays_private(monkeypatch):
         scan_job,
         "scan_symbols",
         lambda *a, **k: {"ok": True, "ranked_results": [row]},
+    )
+    monkeypatch.setattr(
+        scan_job,
+        "revalidate_candidate_for_delivery",
+        lambda row, cfg: {"ok": True, "row": row, "reasons": []},
     )
     monkeypatch.setattr(scan_job, "render_signal_chart_png", lambda row: b"png")
     monkeypatch.setattr(

@@ -546,9 +546,9 @@ def build_heuristic_confidence_detail(
     else:
         opposing.append(f"Weak confluence ({confluence_total:+.3f})")
     if technical_confidence < 45:
-        opposing.append(f"Technical confidence only {technical_confidence:.0f}%")
+        opposing.append(f"Technical quality only {technical_confidence:.0f}/100")
     elif technical_confidence >= 65:
-        supporting.append(f"Technical confidence {technical_confidence:.0f}%")
+        supporting.append(f"Technical quality {technical_confidence:.0f}/100")
     if direction in ("flat", "neutral", ""):
         opposing.append("No clear directional bias — prefer stand aside")
     return _normalize_confidence_detail(
@@ -570,25 +570,38 @@ def combined_rank_score(
     technical_confidence: float,
     confluence_total: float = 0.0,
     execution_score: float = 50.0,
+    overall_quality: Optional[float] = None,
+    target_feasibility: Optional[float] = None,
+    stop_quality: Optional[float] = None,
+    net_rr: Optional[float] = None,
+    market_data_quality: Optional[float] = None,
+    setup_validity: Optional[float] = None,
+    uncertainty_penalty: float = 0.0,
 ) -> float:
     """
     Rank score for directional setups only.
 
     Flat/neutral → 0 (excluded from leaderboard).
-    LLM is context only. Ranking is 95% deterministic technical/confluence/
-    execution quality and 5% model agreement.
+    LLM is context only and has no numerical influence on eligibility or rank.
+    Existing deterministic contributions are normalized from their previous
+    95-point subtotal to a 100-point score.
     """
     direction = (direction or "flat").lower()
     if direction not in ("long", "short"):
         return 0.0
-    llm_c = max(0.0, min(100.0, float(llm_confidence or 0.0)))
-    tech_c = max(0.0, min(100.0, float(technical_confidence or 0.0)))
-    conf_boost = abs(float(confluence_total or 0.0)) * 100.0
+    # Phase 2A intentionally ignores the raw confluence magnitude because it
+    # is already embedded in Technical/Legacy V2 quality.
+    from src.analysis.execution_policy import deterministic_rank_score
+
     execution_c = max(0.0, min(100.0, float(execution_score or 0.0)))
-    return round(
-        0.55 * tech_c
-        + 0.20 * conf_boost
-        + 0.20 * execution_c
-        + 0.05 * llm_c,
-        3,
+    score, _ = deterministic_rank_score(
+        overall_quality=float(overall_quality if overall_quality is not None else technical_confidence),
+        execution_quality=execution_c,
+        target_feasibility=float(target_feasibility if target_feasibility is not None else execution_c),
+        stop_quality=float(stop_quality if stop_quality is not None else execution_c),
+        net_rr=float(net_rr if net_rr is not None else 1.25),
+        market_data_quality=float(market_data_quality if market_data_quality is not None else execution_c),
+        setup_validity=float(setup_validity if setup_validity is not None else execution_c),
+        uncertainty_penalty=uncertainty_penalty,
     )
+    return round(score, 3)

@@ -78,7 +78,30 @@ scheduler:
     - "09:00"
     - "15:00"
     - "20:00"
-  watchlist: []          # empty → built-in default coins
+  # Deep-liquidity crypto-perpetual universe shared with Telegram scans.
+  watchlist:
+    - BTC
+    - ETH
+    - SOL
+    - BNB
+    - TRX
+    - UNI
+    - XRP
+    - DOGE
+    - LTC
+    - LINK
+    - BCH
+    - HBAR
+    - XLM
+    - HYPE
+    - ZEC
+    - XMR
+    - ICP
+    - ALGO
+    - AVAX
+    - PENGU
+    - WIF
+    - BONK
   exchange: okx
   timeframe: "15m"
   no_news: false
@@ -95,6 +118,20 @@ signal_tracker:
   lifecycle_check_seconds: 15
   notification_retry_seconds: 60
   target_allocations: [0.25, 0.25, 0.25, 0.25]
+
+# Outcome-calibrated scoring. DATABASE_URL is read from the backend environment
+# only. Shadow mode cannot change production signal eligibility or ordering.
+outcome_scoring:
+  enabled: true
+  mode: "shadow"
+  feature_schema_version: "3.0"
+  model_refresh_seconds: 300
+  minimum_training_samples: 500
+  minimum_calibration_samples: 200
+  confidence_floor: 80
+  conservative_quantile: 0.10
+  promotion_max_ece: 0.05
+  promotion_minimum_unseen_samples: 200
 
 # Pure day-trade stack: 15m execution, 1h drive, 4h confirmation
 timeframes:
@@ -135,16 +172,34 @@ analysis:
   # a bias only and explicitly says to stand aside.
   directional_score_threshold: 0.20
   directional_confidence_threshold: 68
-  execution_min_score: 65
+  # Interim Legacy V2: preserve Technical Score, but overall confidence cannot
+  # exceed Execution + 5. The old 65 floor is retained only for comparison.
+  legacy_v2_enabled: true
+  legacy_execution_min_score: 65
+  execution_min_score: 72
+  execution_confidence_buffer: 5
   # Hard execution-quality gates used before any Telegram alert.
   max_immediate_sl_risk: 32
   max_chase_distance_atr: 1.0
+  # Suppress late retest alerts after most of the Entry→TP1 move is gone.
+  max_pre_entry_tp1_progress_pct: 70
   max_spread_bps: 12
+  # Execution sources older than these limits are rejected as stale.
+  max_ticker_age_seconds: 45
+  max_orderbook_age_seconds: 30
   min_tp2_rr: 1.25
   # Pending entry lifetime: READY resolves faster; RETEST gets six 15m candles.
   ready_entry_expiry_bars: 3
   retest_entry_expiry_bars: 6
   max_entry_valid_minutes: 180
+  # Phase 2A deterministic quality/cost policy. These are conservative
+  # estimates used only when venue/account-specific costs are unavailable.
+  execution_policy_version: execution_quality_v2a.1
+  execution_taker_fee_bps_per_side: 5.0
+  execution_slippage_bps_per_side: 1.5
+  execution_funding_bps_per_8h: 1.0
+  # Reference depth-impact size; this is not an order and no order is placed.
+  execution_impact_notional_usd: 10000
 
 news:
   enabled: true

@@ -45,7 +45,7 @@ def test_combined_rank_score_zeros_flat():
     ) == 0.0
 
 
-def test_combined_rank_score_prefers_higher_llm():
+def test_combined_rank_score_ignores_numerical_llm_confidence():
     low = combined_rank_score(
         direction="long",
         llm_confidence=40,
@@ -58,7 +58,7 @@ def test_combined_rank_score_prefers_higher_llm():
         technical_confidence=70,
         confluence_total=0.3,
     )
-    assert high > low
+    assert high == low
 
 
 def test_combined_rank_is_dominated_by_deterministic_quality_not_llm():

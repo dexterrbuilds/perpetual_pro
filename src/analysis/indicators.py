@@ -160,9 +160,21 @@ def _cci(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 20) ->
 
 
 def _session_vwap(df: pd.DataFrame) -> pd.Series:
+    """VWAP reset at the explicit crypto trading-day boundary: 00:00 UTC."""
     typical = (df["high"] + df["low"] + df["close"]) / 3.0
-    cum_vol = df["volume"].cumsum().replace(0, np.nan)
-    return (typical * df["volume"]).cumsum() / cum_vol
+    volume = df["volume"]
+    if isinstance(df.index, pd.DatetimeIndex):
+        index = df.index
+        if index.tz is None:
+            index = index.tz_localize("UTC")
+        else:
+            index = index.tz_convert("UTC")
+        session = pd.Series(index.normalize(), index=df.index)
+        cumulative_volume = volume.groupby(session).cumsum().replace(0, np.nan)
+        cumulative_value = (typical * volume).groupby(session).cumsum()
+        return cumulative_value / cumulative_volume
+    cumulative_volume = volume.cumsum().replace(0, np.nan)
+    return (typical * volume).cumsum() / cumulative_volume
 
 
 def compute_indicators(

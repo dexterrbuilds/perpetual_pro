@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Event, Lock, Thread
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,6 +12,7 @@ from zoneinfo import ZoneInfo
 from loguru import logger
 
 from src.api.service import AnalyzeRequest, scan_symbols
+from src.analysis.revalidation import revalidate_candidate_for_delivery
 from src.notify.telegram import (
     format_signal_photo_caption,
     format_prop_scan_report,
@@ -21,13 +23,14 @@ from src.notify.telegram import (
 )
 from src.report.charts import render_signal_chart_png
 from src.tracking.signal_tracker import register_delivered_signals
-from src.utils.config import AppConfig, load_config
+from src.utils.config import (
+    DEFAULT_CRYPTO_WATCHLIST,
+    AppConfig,
+    load_config,
+)
 
 # Fallback watchlist when scheduler.watchlist is empty
-DEFAULT_WATCHLIST = [
-    "BTC", "ETH", "SOL", "BNB", "AAVE", "ARB", "NEAR", "INJ", "SEI", "TIA",
-    "SUI", "APT", "AVAX", "TRX", "UNI",
-]
+DEFAULT_WATCHLIST = list(DEFAULT_CRYPTO_WATCHLIST)
 MIN_TELEGRAM_SIGNAL_CONFIDENCE = 80.0
 
 _STATUS_LOCK = Lock()
@@ -151,55 +154,82 @@ def filter_high_confidence(
     min_execution_score: float = 65.0,
     max_immediate_sl_risk: float = 32.0,
     max_chase_distance_atr: float = 1.0,
+    max_pre_entry_tp1_progress_pct: float = 70.0,
     min_tp2_rr: float = 1.25,
     max_spread_bps: float = 12.0,
 ) -> List[Dict[str, Any]]:
+    """Apply deterministic delivery gates; ``min_llm`` is legacy API-only."""
     confidence_floor = max(
         MIN_TELEGRAM_SIGNAL_CONFIDENCE,
         float(min_confidence or 0),
     )
     out: List[Dict[str, Any]] = []
     for row in ranked or []:
+        rejection_codes: List[str] = []
         direction = str(row.get("direction") or "").lower()
         if direction not in ("long", "short"):
-            continue
-        llm = float(row.get("llm_confidence") or 0)
+            rejection_codes.append("NOT_DIRECTIONAL")
         rank = float(row.get("rank_score") or 0)
         overall_confidence = float(row.get("confidence") or 0)
         if overall_confidence < confidence_floor:
-            continue
-        if llm < min_llm or rank < min_rank:
-            continue
+            rejection_codes.append("CONFIDENCE_BELOW_ALERT_MINIMUM")
+        if rank < min_rank:
+            rejection_codes.append("RANK_BELOW_MINIMUM")
         if row.get("signal_eligible") is False:
-            continue
+            rejection_codes.append("ANALYSIS_SIGNAL_GATE")
         execution_score = row.get("execution_score")
         if execution_score is not None and float(execution_score or 0) < min_execution_score:
-            continue
+            rejection_codes.append("EXECUTION_BELOW_ALERT_MINIMUM")
         immediate_sl_risk = row.get("immediate_sl_risk")
         if (
             immediate_sl_risk is not None
             and float(immediate_sl_risk) > max_immediate_sl_risk
         ):
-            continue
+            rejection_codes.append("IMMEDIATE_SL_RISK_HIGH")
         chase_distance = row.get("chase_distance_atr")
         if chase_distance is not None and float(chase_distance) > max_chase_distance_atr:
-            continue
+            rejection_codes.append("CHASE_DISTANCE_HIGH")
+        tp1_progress = row.get("tp1_progress_pct")
+        if (
+            str(row.get("entry_zone_relation") or "") == "favorable_beyond"
+            and tp1_progress is not None
+            and float(tp1_progress) >= max_pre_entry_tp1_progress_pct
+        ):
+            rejection_codes.append("ENTRY_MOVE_MOSTLY_MISSED")
         spread_bps = row.get("spread_bps")
         if spread_bps is not None and float(spread_bps) > max_spread_bps:
-            continue
+            rejection_codes.append("SPREAD_TOO_WIDE")
         if row.get("market_quality_ok") is False:
-            continue
+            rejection_codes.append("MARKET_QUALITY_BLOCKED")
         if row.get("data_quality_ok") is False:
-            continue
+            rejection_codes.append("DATA_QUALITY_BLOCKED")
         if row.get("historical_edge_ok") is False:
-            continue
+            rejection_codes.append("HISTORICAL_EDGE_BLOCKED")
         tp2_rr = _row_tp2_rr(row)
         if tp2_rr is not None and tp2_rr < min_tp2_rr:
-            continue
+            rejection_codes.append("TP2_RR_BELOW_MINIMUM")
         entry_status = row.get("entry_status")
-        if entry_status is not None and entry_status not in ("ready", "wait_retest"):
-            continue
+        if entry_status is not None and entry_status not in (
+            "ready",  # backward-compatible alias for old persisted rows
+            "confirmation_pending",
+            "wait_retest",
+        ):
+            rejection_codes.append("ENTRY_STATUS_BLOCKED")
         if only_prop_safe and row.get("prop_safe") is False:
+            rejection_codes.append("PROP_RISK_BLOCKED")
+        if rejection_codes:
+            row["delivery_rejection_reasons"] = list(
+                dict.fromkeys(rejection_codes)
+            )
+            logger.info(
+                "Telegram candidate rejected: symbol={} direction={} "
+                "confidence={:.1f} execution={} reasons={}",
+                row.get("symbol"),
+                direction,
+                overall_confidence,
+                execution_score,
+                "|".join(row["delivery_rejection_reasons"]),
+            )
             continue
         out.append(row)
     out.sort(
@@ -399,6 +429,13 @@ def _run_scheduled_scan_once_unlocked(
         max_chase_distance_atr=float(
             getattr(cfg.analysis, "max_chase_distance_atr", 1.0)
         ),
+        max_pre_entry_tp1_progress_pct=float(
+            getattr(
+                cfg.analysis,
+                "max_pre_entry_tp1_progress_pct",
+                70.0,
+            )
+        ),
         min_tp2_rr=float(getattr(cfg.analysis, "min_tp2_rr", 1.25)),
         max_spread_bps=float(getattr(cfg.analysis, "max_spread_bps", 12.0)),
     )
@@ -433,17 +470,60 @@ def _run_scheduled_scan_once_unlocked(
             len(portfolio_risk_excluded),
             float(getattr(cfg.risk, "max_open_risk_pct", 2.0) or 2.0),
         )
-    report = format_prop_scan_report(
-        filtered,
-        slot_label=slot_label or "scan",
-        timezone=cfg.scheduler.timezone or "Africa/Lagos",
-        min_signal_confidence=max(
-            MIN_TELEGRAM_SIGNAL_CONFIDENCE,
-            float(getattr(cfg.analysis, "directional_confidence_threshold", 68.0)),
-        ),
-        scanned_count=len(watchlist),
-        ranked_count=len(ranked),
-    )
+    pre_delivery_rejected: List[Dict[str, Any]] = []
+    if send and filtered:
+        accepted: List[Optional[Dict[str, Any]]] = [None] * len(filtered)
+        with ThreadPoolExecutor(max_workers=min(4, len(filtered))) as pool:
+            futures = {
+                pool.submit(revalidate_candidate_for_delivery, row, cfg): index
+                for index, row in enumerate(filtered)
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                original = filtered[index]
+                try:
+                    validation = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    validation = {
+                        "ok": False,
+                        "row": original,
+                        "reasons": [f"PRE_SEND_INTERNAL_FAILURE:{type(exc).__name__}"],
+                    }
+                if validation.get("ok"):
+                    accepted[index] = dict(validation.get("row") or original)
+                else:
+                    rejected = dict(original)
+                    rejected["pre_delivery_rejection_reasons"] = list(
+                        validation.get("reasons") or ["PRE_SEND_REJECTED"]
+                    )
+                    pre_delivery_rejected.append(rejected)
+                    logger.warning(
+                        "Telegram candidate failed final revalidation: symbol={} reasons={}",
+                        original.get("symbol"),
+                        "|".join(rejected["pre_delivery_rejection_reasons"]),
+                    )
+        filtered = [row for row in accepted if row is not None]
+
+    scan_failed = not bool(result.get("ok"))
+    if scan_failed:
+        report = (
+            "⚠️ <b>SCAN UNAVAILABLE</b>\n\n"
+            "Market data or analysis failed for the complete watchlist. "
+            "No trade decision was produced; this is not a no-setup result.\n\n"
+            "NFA · DYOR · Trade at your own risk"
+        )
+    else:
+        report = format_prop_scan_report(
+            filtered,
+            slot_label=slot_label or "scan",
+            timezone=cfg.scheduler.timezone or "Africa/Lagos",
+            min_signal_confidence=max(
+                MIN_TELEGRAM_SIGNAL_CONFIDENCE,
+                float(getattr(cfg.analysis, "directional_confidence_threshold", 68.0)),
+            ),
+            scanned_count=len(watchlist),
+            ranked_count=len(ranked),
+        )
     sent = False
     delivery: Optional[Dict[str, Any]] = None
     tracking: Optional[Dict[str, Any]] = None
@@ -622,7 +702,7 @@ def _run_scheduled_scan_once_unlocked(
                 "signal(s) were already sent and remain valid",
                 len(suppressed_duplicates),
             )
-        elif (
+        elif scan_failed or (
             bool(notify_on_empty)
             if notify_on_empty is not None
             else cfg.telegram.notify_on_empty
@@ -649,7 +729,7 @@ def _run_scheduled_scan_once_unlocked(
             )
             if sent:
                 delivery_status = (
-                    "sent_empty_report"
+                    ("sent_scan_failure" if scan_failed else "sent_empty_report")
                     if sent_count == len(destination_results)
                     else "partial_delivery"
                 )
@@ -702,6 +782,8 @@ def _run_scheduled_scan_once_unlocked(
         "alert_count": len(filtered),
         "duplicate_signal_count": len(suppressed_duplicates),
         "portfolio_risk_excluded_count": len(portfolio_risk_excluded),
+        "pre_delivery_rejected_count": len(pre_delivery_rejected),
+        "pre_delivery_rejected": pre_delivery_rejected,
         "filtered": filtered,
         "report": report,
         "telegram_sent": sent,

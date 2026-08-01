@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,12 +22,13 @@ def ensure_dir(path: Union[str, Path]) -> Path:
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
-    """Coerce value to float; return default on failure."""
+    """Coerce value to a finite float; return ``default`` on failure."""
     try:
         if value is None:
             return default
-        return float(value)
-    except (TypeError, ValueError):
+        result = float(value)
+        return result if math.isfinite(result) else default
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -36,7 +38,7 @@ def safe_int(value: Any, default: int = 0) -> int:
         if value is None:
             return default
         return int(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 

@@ -469,7 +469,7 @@ class ReportGenerator:
             f"- **Bias:** {analysis.bias.upper()} ({analysis.confidence:.1f}% confidence)",
             f"- **LLM Confidence:** {getattr(analysis, 'llm_confidence', 0):.0f}%",
             f"- **LLM reason:** {getattr(analysis, 'llm_confidence_reason', '') or '—'}",
-            f"- **Technical confidence:** {getattr(analysis, 'technical_confidence', analysis.confidence):.1f}%",
+            f"- **Technical quality:** {getattr(analysis, 'technical_confidence', analysis.confidence):.1f}/100",
             f"- **Rank score:** {getattr(analysis, 'rank_score', 0):.1f}",
             f"- **Setup:** {analysis.setup_name}",
             f"- **Tags:** {', '.join(analysis.strategy_tags)}",

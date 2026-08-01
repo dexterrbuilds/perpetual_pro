@@ -382,22 +382,25 @@ def format_signal_photo_caption(
     symbol = str(row.get("symbol") or "—").split("/")[0].split(":")[0]
     confidence = _number(row.get("confidence"))
     technical = _number(row.get("technical_confidence"))
-    execution_score = _number(row.get("execution_score") or execution.get("score"))
+    execution_score = _number(
+        row.get("execution_quality")
+        or row.get("execution_score")
+        or execution.get("execution_quality")
+        or execution.get("score")
+    )
+    components = dict(row.get("execution_components") or execution.get("components") or {})
     status = str(row.get("entry_status") or execution.get("status") or "blocked")
     timeframe = str(row.get("primary_tf") or chart.get("timeframe") or "15m")
     setup_name = str(row.get("setup_name") or payload.get("setup_name") or "").strip()
     risk_rewards = list(primary.get("risk_reward") or [])
     if status == "wait_retest":
         call = f"{direction} — RETEST"
+        entry_mode = "RETEST ONLY — wait for Entry. Do not chase."
+    elif status in ("ready", "confirmation_pending"):
+        call = f"{direction} — CMP CONFIRMATION"
         entry_mode = (
-            "RETEST ONLY — wait for price to return to the Entry zone; "
-            "do not enter at the current price."
-        )
-    elif status == "ready":
-        call = f"{direction} — CMP READY"
-        entry_mode = (
-            "CMP ALLOWED — price is already inside the Entry zone after "
-            "confirmation. If it leaves before you act, wait for a new scan."
+            "CMP PENDING — price is inside Entry; wait for a confirming "
+            "closed candle before the tracker records a fill."
         )
     else:
         call = f"{direction} — CONDITIONAL"
@@ -418,6 +421,13 @@ def format_signal_photo_caption(
 
     entry_low = row.get("entry_low")
     entry_high = row.get("entry_high")
+    scan_price = row.get("price")
+    zone_relation = str(row.get("entry_zone_relation") or "").strip().lower()
+    relation_label = {
+        "inside": "inside Entry zone",
+        "favorable_beyond": "already beyond Entry toward TP1",
+        "adverse_side": "waiting on the opposite side of Entry",
+    }.get(zone_relation, "")
     stop = row.get("stop_loss")
     targets = list(row.get("take_profits") or [])
     leverage = row.get("leverage") or row.get("display_leverage") or 5
@@ -461,9 +471,17 @@ def format_signal_photo_caption(
     sl_risk = row.get("immediate_sl_risk")
     spread_bps = row.get("spread_bps")
     backtest = row.get("backtest") if isinstance(row.get("backtest"), dict) else {}
+    outcome = (
+        row.get("outcome_scoring")
+        if isinstance(row.get("outcome_scoring"), dict)
+        else {}
+    )
+    outcome_active = str(row.get("scoring_source") or "").startswith(
+        "outcome_champion"
+    )
     quality_bits = []
     if sl_risk is not None:
-        quality_bits.append(f"SL risk {_number(sl_risk):.0f}%")
+        quality_bits.append(f"immediate-SL risk index {_number(sl_risk):.0f}/100")
     if spread_bps is not None:
         quality_bits.append(f"spread {_number(spread_bps):.1f} bps")
     if backtest.get("sample_reliable") and backtest.get("expectancy_r") is not None:
@@ -474,12 +492,15 @@ def format_signal_photo_caption(
     lines = [
         f"{icon} <b>{html.escape(symbol)} {call}</b>",
         (
-            f"<b>{confidence:.0f}% Confidence</b> · "
-            f"Technical {technical:.0f}% · Execution {execution_score:.0f}/100"
+            (
+                f"<b>Calibrated TP1 probability {confidence:.0f}%</b> · "
+                if outcome_active else f"<b>Overall Quality {confidence:.0f}/100</b> · "
+            )
+            + f"Technical Quality {technical:.0f}/100 · Execution Quality {execution_score:.0f}/100"
         ),
         "",
         (
-            f"⏱ {html.escape(timeframe)} · 1h/4h confirmation · "
+            f"⏱ {html.escape(timeframe)} · 1h/4h · "
             f"{html.escape(hold_style)}"
             + (f" · {html.escape(session)}" if session else "")
         ),
@@ -499,6 +520,12 @@ def format_signal_photo_caption(
         )
         if hold_min and hold_typical_max
         else "",
+        (
+            f"📍 <b>Price at scan:</b> {_caption_price(scan_price)}"
+            + (f" · {html.escape(relation_label)}" if relation_label else "")
+        )
+        if scan_price is not None
+        else "",
         f"🎯 <b>Entry:</b> {_caption_price(entry_low)} – {_caption_price(entry_high)}",
         f"🚦 <b>Entry mode:</b> {html.escape(entry_mode)}",
         f"🛑 <b>Stop:</b> {_caption_price(stop)}",
@@ -513,27 +540,48 @@ def format_signal_photo_caption(
     lines += [
         "",
         f"📐 <b>Setup:</b> {html.escape(setup_label)}",
-        (
-            f"📊 <b>R:R (TP2):</b> {rr_tp2:.2f} · "
-            f"Risk {risk_pct:g}% · ≤{leverage}x"
-        ),
+        _telegram_rr_line(row, primary, rr_tp2, risk_pct, leverage),
         f"🧠 <b>Why:</b> {html.escape(reason)}",
     ]
+    if components:
+        component_bits = [
+            f"Entry {_number(components.get('entry_accessibility')):.0f}",
+            f"Stop {_number(components.get('stop_quality')):.0f}",
+            f"Targets {_number(components.get('target_feasibility')):.0f}",
+        ]
+        freshness = str(row.get("data_freshness_state") or execution.get("data_freshness_state") or "unknown")
+        lines.append(
+            "🔎 <b>Execution:</b> "
+            + " · ".join(component_bits)
+            + f" · data {html.escape(freshness)}"
+        )
+    risks = list(execution.get("risks") or row.get("rejection_reasons") or [])
+    if risks:
+        risk_text = risks[0]
+        if isinstance(risk_text, dict):
+            risk_text = risk_text.get("detail") or risk_text.get("code") or "Execution uncertainty"
+        lines.append(f"⚠️ <b>Primary risk:</b> {html.escape(str(risk_text)[:150])}")
+    if outcome_active:
+        lines.append(
+            "🧮 <b>Calibrated EV:</b> "
+            f"{_number(outcome.get('conservative_ev_r')):+.2f}R · "
+            f"Rank {_number(outcome.get('rank_score')):.0f}/100"
+        )
     if quality_bits:
         lines.append(f"🛡 <b>Quality:</b> {html.escape(' · '.join(quality_bits))}")
     execution_note = entry_reason
     if not execution_note and status == "wait_retest":
         execution_note = "Wait for retest of the zone. Do not chase."
-    elif not execution_note and status == "ready":
+    elif not execution_note and status in ("ready", "confirmation_pending"):
         execution_note = "Enter only after the confirmation candle closes."
     if execution_note:
         lines += ["", f"📌 {html.escape(execution_note)}"]
     invalidation_side = "below" if direction == "LONG" else "above"
     lines.append(
-        "🧱 <b>Beginner rule:</b> Before entry, cancel at expiry, if TP1 "
-        f"trades first, or if a {html.escape(timeframe)} candle finishes "
-        f"{invalidation_side} Stop (a brief spike does not count). Once Entry "
-        "touches, Stop is hard—do not wait for close."
+        "🧱 <b>Beginner rule:</b> Before fill: cancel at expiry, if TP1 trades, "
+        f"or if a {html.escape(timeframe)} candle closes {invalidation_side} Stop; "
+        "wicks alone do not count. After fill, honor Stop; "
+        "after TP1, move it to breakeven."
     )
     lines += [
         "",
@@ -541,6 +589,28 @@ def format_signal_photo_caption(
     ]
     caption = "\n".join(lines)
     return caption
+
+
+def _telegram_rr_line(
+    row: Dict[str, Any],
+    primary: Dict[str, Any],
+    fallback_rr: float,
+    risk_pct: float,
+    leverage: Any,
+) -> str:
+    gross = list(row.get("gross_risk_reward") or primary.get("gross_risk_reward") or [])
+    net = list(row.get("net_risk_reward") or primary.get("net_risk_reward") or [])
+    index = 1 if (len(gross) > 1 or len(list(primary.get("risk_reward") or [])) > 1) else 0
+    gross_value = _number(gross[index], fallback_rr) if gross else fallback_rr
+    net_value = _number(net[index], gross_value) if net else gross_value
+    rr_label = "TP2" if index == 1 else "TP1"
+    rr_text = f"gross {gross_value:.2f}R"
+    if abs(net_value - gross_value) >= 0.01:
+        rr_text += f" · net {net_value:.2f}R"
+    return (
+        f"📊 <b>R:R ({rr_label}):</b> {rr_text} · "
+        f"Risk {risk_pct:g}% · ≤{leverage}x"
+    )
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -891,12 +961,13 @@ def format_prop_scan_report(
         )
         raw_entry_status = str(row.get("entry_status") or "ready")
         entry_status = {
-            "ready": "CMP Ready",
+            "ready": "CMP Confirmation",
+            "confirmation_pending": "CMP Confirmation",
             "wait_retest": "Retest Only",
             "avoid_chase": "Avoid Chase",
             "blocked": "Blocked",
         }.get(raw_entry_status, raw_entry_status.replace("_", " ").title())
-        execution_score = row.get("execution_score")
+        execution_score = row.get("execution_quality", row.get("execution_score"))
         execution_s = (
             f"{float(execution_score):.0f}/100"
             if execution_score is not None
@@ -915,10 +986,23 @@ def format_prop_scan_report(
         hold_min = _number(row.get("hold_hours_min"), 0.0)
         hold_typical = _number(row.get("hold_hours_typical_max"), 0.0)
         safe_reason = html.escape(str(reason))
+        outcome = (
+            row.get("outcome_scoring")
+            if isinstance(row.get("outcome_scoring"), dict)
+            else {}
+        )
+        outcome_line = (
+            f"\n   EV {_number(outcome.get('conservative_ev_r')):+.2f}R · "
+            f"model rank {_number(outcome.get('rank_score')):.0f}/100"
+            if str(row.get("scoring_source") or "").startswith(
+                "outcome_champion"
+            )
+            else ""
+        )
         lines.append(
             f"{side_icon} <b>{i}. {html.escape(base)} {direction}</b> · "
-            f"<b>{confidence:.0f}% Confidence</b>\n"
-            f"   Technical {technical:.0f}% · Execution {execution_s} · {entry_status}\n"
+            f"<b>{'Calibrated TP1 probability ' + format(confidence, '.0f') + '%' if str(row.get('scoring_source') or '').startswith('outcome_champion') else 'Overall Quality ' + format(confidence, '.0f') + '/100'}</b>\n"
+            f"   Technical Quality {technical:.0f}/100 · Execution Quality {execution_s} · {entry_status}\n"
             f"   Entry {entry_s}{target_line}\n"
             f"   SL {fmt_price(row.get('stop_loss'))} · {lev}x · risk {risk_s} · {hold}\n"
             + (
@@ -926,12 +1010,21 @@ def format_prop_scan_report(
                 if valid_minutes and hold_min and hold_typical
                 else ""
             )
+            + outcome_line
             + (f"\n   Why: {safe_reason}" if safe_reason else "")
             + (f"\n   ⚠ {html.escape(', '.join(flags))}" if flags else "")
         )
         lines.append("")
+    displayed_rows = ranked[:max_rows]
+    calibrated = bool(displayed_rows) and all(
+        str(row.get("scoring_source") or "").startswith("outcome_champion")
+        for row in displayed_rows
+    )
+    confidence_label = (
+        "calibrated confidence" if calibrated else "signal confidence"
+    )
     lines.append(
-        f"🛡 Prop gate: <b>≥{min_signal_confidence:.0f}% calibrated confidence</b> · "
+        f"🛡 Prop gate: <b>≥{min_signal_confidence:.0f}% {confidence_label}</b> · "
         "clean execution · TP2 ≥1.25R · 0.5–1% each · ≤2% total open risk · ≤5x"
     )
     lines.append("NFA · DYOR · Trade at your own risk")

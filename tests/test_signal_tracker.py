@@ -64,7 +64,7 @@ def test_tp1_before_entry_marks_setup_missed(tmp_path):
     store.close()
 
 
-def test_entry_then_tp1_remains_active_and_stop_accounts_for_partial(tmp_path):
+def test_entry_then_tp1_protects_profit_and_never_sends_stop_alert(tmp_path):
     now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
     store = _store(tmp_path)
     signal, _ = store.register_signal(
@@ -101,28 +101,106 @@ def test_entry_then_tp1_remains_active_and_stop_accounts_for_partial(tmp_path):
     assert [event["event_type"] for event in events] == [
         "entered",
         "target_hit",
-        "stopped",
+        "protected_exit",
     ]
-    stopped = events[-1]
-    assert stopped["payload"]["highest_tp"] == 1
-    assert stopped["payload"]["result_r"] > -1.0
+    protected = events[-1]
+    assert protected["payload"]["highest_tp"] == 1
+    assert protected["payload"]["result_r"] > 0
+    message = format_tracker_event(protected)
+    assert "PROFIT SECURED" in message
+    assert "STOP HIT" not in message
+    assert "not a stop-loss" in message
     store.close()
 
 
-def test_cmp_ready_starts_entered_without_redundant_followup(tmp_path):
+def test_legacy_queued_stop_after_tp1_is_formatted_as_profit():
+    message = format_tracker_event(
+        {
+            "event_type": "stopped",
+            "price": 98.0,
+            "payload": {"highest_tp": 1, "result_r": -0.5},
+            "signal": {
+                "symbol": "BTC/USDT:USDT",
+                "direction": "long",
+            },
+        }
+    )
+
+    assert "PROFIT SECURED" in message
+    assert "STOP HIT" not in message
+    assert "No stop-loss is recorded after TP1" in message
+
+
+def test_cmp_starts_pending_and_closed_candle_confirms_entry(tmp_path):
     now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
     store = _store(tmp_path)
     signal, created = store.register_signal(
-        _row(now, entry_status="ready", price=100.4),
+        _row(now, entry_status="confirmation_pending", price=100.4),
         ["123"],
         source="test",
         now=now,
     )
 
     assert created is True
-    assert signal["status"] == "entered"
-    assert signal["entry_price"] == 100.4
+    assert signal["status"] == "pending"
     assert store.pending_events(retry_after_seconds=0) == []
+    assert store.process_closed_candle(
+        signal["symbol"],
+        100.4,
+        now + timedelta(minutes=15),
+        high_price=101.0,
+        low_price=100.0,
+    ) == 1
+    active = store.active_signals()[0]
+    assert active["status"] == "entered"
+    assert active["entry_price"] == 100.4
+    assert [
+        event["event_type"]
+        for event in store.pending_events(retry_after_seconds=0)
+    ] == ["entered"]
+    store.close()
+
+
+def test_short_cmp_confirmation_then_tp1_counts_profit(tmp_path):
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+    store = _store(tmp_path)
+    signal, created = store.register_signal(
+        _row(
+            now,
+            direction="short",
+            entry_status="confirmation_pending",
+            entry_low=100.0,
+            entry_high=101.0,
+            price=100.4,
+            stop_loss=103.0,
+            take_profits=[98.0, 96.0, 94.0, 92.0],
+        ),
+        ["123"],
+        source="test",
+        now=now,
+    )
+
+    assert created is True
+    assert signal["status"] == "pending"
+    assert store.process_closed_candle(
+        signal["symbol"],
+        100.4,
+        now + timedelta(minutes=15),
+        high_price=101.0,
+        low_price=100.0,
+    ) == 1
+    assert store.process_price(
+        signal["symbol"],
+        98.0,
+        now + timedelta(minutes=20),
+        source="websocket",
+    ) == 1
+    active = store.active_signals()[0]
+    assert active["status"] == "entered"
+    assert active["highest_tp"] == 1
+    assert active["realized_r"] > 0
+    events = store.pending_events(retry_after_seconds=0)
+    assert [event["event_type"] for event in events] == ["entered", "target_hit"]
     store.close()
 
 
@@ -130,7 +208,7 @@ def test_closed_candle_invalidates_pending_but_wick_price_does_not(tmp_path):
     now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
     store = _store(tmp_path)
     signal, _ = store.register_signal(
-        _row(now),
+        _row(now, entry_status="confirmation_pending", price=100.4),
         ["123"],
         source="test",
         now=now,

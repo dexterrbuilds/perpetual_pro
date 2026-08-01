@@ -58,6 +58,10 @@ from src.scheduler.scan_job import (
     start_scheduler_background,
     stop_scheduler_background,
 )
+from src.scoring.runtime import (
+    get_outcome_scoring_runtime,
+    get_outcome_scoring_status,
+)
 from src.tracking.signal_tracker import (
     get_signal_reliability_summary,
     get_signal_tracker_status,
@@ -85,15 +89,20 @@ def get_config():
 async def lifespan(app: FastAPI):
     cfg = get_config()
     logger.info("perpetual_pro API v{} starting (exchange={})", __version__, cfg.exchange.default)
+    scoring_runtime = get_outcome_scoring_runtime(cfg)
+    scoring_database_ready = scoring_runtime.repository.check_ready()
     tracker_started = start_signal_tracker_background(cfg)
     scheduler_started = start_scheduler_background(cfg)
     webhook_started = configure_telegram_webhook(cfg)
     logger.info(
         "Background services: tracker_started={} scheduler_started={} webhook_started={} "
+        "outcome_database_ready={} scoring_mode={} "
         "scheduler_enabled={} times={} timezone={}",
         tracker_started,
         scheduler_started,
         webhook_started,
+        scoring_database_ready,
+        cfg.outcome_scoring.mode,
         cfg.scheduler.enabled,
         cfg.scheduler.times,
         cfg.scheduler.timezone,
@@ -145,6 +154,7 @@ def root() -> Dict[str, Any]:
             ),
             "telegram_commands": "/scan · /status · /help",
             "signal_reliability": "GET /signal-tracker/reliability",
+            "outcome_scoring": "GET /outcome-scoring/status",
         },
         "disclaimer": "Not financial advice. High leverage perps can liquidate quickly.",
     }
@@ -161,6 +171,7 @@ def health() -> Dict[str, Any]:
         "telegram_ready": is_telegram_ready(cfg),
         "scheduler": get_scheduler_status(),
         "signal_tracker": get_signal_tracker_status(),
+        "outcome_scoring": get_outcome_scoring_status(cfg),
     }
 
 
@@ -168,6 +179,12 @@ def health() -> Dict[str, Any]:
 def signal_tracker_reliability() -> Dict[str, Any]:
     """Forward outcome bands; scores are not probabilities until calibrated."""
     return get_signal_reliability_summary()
+
+
+@app.get("/outcome-scoring/status")
+def outcome_scoring_status() -> Dict[str, Any]:
+    """Redacted durable-journal and calibrated-model readiness."""
+    return get_outcome_scoring_status(get_config())
 
 
 @app.get("/telegram/status")

@@ -72,19 +72,21 @@ def test_execution_profile_waits_for_retest_and_uses_structure_targets():
         suite,
         _structure(),
         direction="long",
-        price=100.7,
+        price=100.6,
         atr=1.0,
     )
 
-    assert profile.status in ("ready", "wait_retest")
+    assert profile.status in ("confirmation_pending", "wait_retest")
     assert profile.score >= 65
-    assert profile.entry_high < 100.7
+    assert profile.entry_high < 100.6
     assert profile.stop_loss < profile.entry_low
-    assert len(profile.targets) == 4
+    assert 1 <= len(profile.targets) <= 4
     assert profile.targets == sorted(profile.targets)
     assert profile.targets[0] > profile.entry_high
     assert profile.immediate_sl_risk < 50
     assert profile.anchor_sources
+    assert profile.entry_zone_relation == "favorable_beyond"
+    assert profile.tp1_progress_pct < 70
 
     risk = RiskManager(
         risk_cfg=RiskConfig(prop_mode=True, max_leverage=5, leverage_ceiling=5),
@@ -93,7 +95,7 @@ def test_execution_profile_waits_for_retest_and_uses_structure_targets():
     )
     plan = risk.build_plan(
         "long",
-        price=100.7,
+        price=100.6,
         atr=1.0,
         confidence=75,
         execution=profile.to_dict(),
@@ -129,6 +131,62 @@ def test_execution_profile_waits_for_retest_and_uses_structure_targets():
     assert len(png) > 10_000
 
 
+def test_execution_profile_blocks_late_signal_near_tp1():
+    df = _execution_df()
+    suite = IndicatorSuite(
+        df=df,
+        summary={
+            "ema_fast": 100.15,
+            "ema_mid": 100.0,
+            "vwap": 99.95,
+            "atr": 1.0,
+        },
+    )
+    profile = build_execution_profile(
+        df,
+        suite,
+        _structure(),
+        direction="long",
+        price=101.55,
+        atr=1.0,
+    )
+
+    assert profile.status == "avoid_chase"
+    assert profile.entry_zone_relation == "favorable_beyond"
+    assert profile.tp1_progress_pct >= 70
+    assert any("already" in risk.lower() for risk in profile.risks)
+
+
+def test_stale_execution_sources_fail_market_quality_gate():
+    df = _execution_df()
+    suite = IndicatorSuite(
+        df=df,
+        summary={"ema_fast": 100.15, "ema_mid": 100.0, "vwap": 99.95, "atr": 1.0},
+    )
+    snapshot = MarketSnapshot(
+        symbol="BTC/USDT:USDT",
+        exchange_id="okx",
+        spread_bps=2.0,
+        execution_data_fresh=False,
+        ticker_age_seconds=90.0,
+        orderbook_age_seconds=60.0,
+    )
+    profile = build_execution_profile(
+        df,
+        suite,
+        _structure(),
+        direction="long",
+        price=100.0,
+        atr=1.0,
+        snapshot=snapshot,
+    )
+
+    assert profile.market_quality_ok is False
+    assert profile.status == "blocked"
+    assert profile.ticker_age_seconds == 90.0
+    assert profile.orderbook_age_seconds == 60.0
+
+
 def test_adverse_rejection_wick_is_detected():
     df = _execution_df()
     df.loc[df.index[-1], ["open", "high", "low", "close", "volume"]] = [
@@ -142,6 +200,27 @@ def test_adverse_rejection_wick_is_detected():
     assert context.adverse_rejection is True
     assert context.upper_wick_ratio > 0.45
     assert any("do not enter" in note.lower() for note in context.notes)
+
+    suite = IndicatorSuite(
+        df=df,
+        summary={
+            "ema_fast": 100.15,
+            "ema_mid": 100.0,
+            "vwap": 99.95,
+            "atr": 1.0,
+        },
+    )
+    profile = build_execution_profile(
+        df,
+        suite,
+        _structure(),
+        direction="long",
+        price=100.0,
+        atr=1.0,
+    )
+    assert profile.entry_zone_relation == "inside"
+    assert profile.status == "blocked"
+    assert "fresh scan" in profile.entry_reason.lower()
 
 
 def test_wide_spread_blocks_otherwise_valid_entry():
