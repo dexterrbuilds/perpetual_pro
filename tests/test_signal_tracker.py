@@ -336,6 +336,7 @@ def test_tracker_worker_starts_and_stops_without_market_subscriptions(tmp_path):
     cfg = load_config()
     cfg.signal_tracker.database_path = str(tmp_path / "worker.db")
     cfg.signal_tracker.websocket_enabled = False
+    cfg.signal_tracker.durable_lifecycle_required = False
     cfg.signal_tracker.reconcile_interval_seconds = 1800
     tracker = SignalTracker(cfg)
 

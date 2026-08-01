@@ -14,6 +14,7 @@ from __future__ import annotations
 import hmac
 import os
 import sys
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -39,6 +40,13 @@ from loguru import logger
 
 from src import __version__
 from src.api.service import AnalyzeRequest, analyze_from_image, scan_symbols
+from src.api.security import (
+    SCAN_ACCESS,
+    SCAN_TIMEOUT_SECONDS,
+    normalize_requested_symbols,
+    validate_exchange,
+    validate_timeframe,
+)
 from src.notify.telegram import (
     get_telegram_alert_chat_ids,
     get_telegram_credentials,
@@ -69,6 +77,7 @@ from src.tracking.signal_tracker import (
     stop_signal_tracker_background,
 )
 from src.utils.config import load_config, setup_logging
+from src.utils.build_info import get_build_identity
 
 # ---------------------------------------------------------------------------
 # App
@@ -88,7 +97,15 @@ def get_config():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = get_config()
-    logger.info("perpetual_pro API v{} starting (exchange={})", __version__, cfg.exchange.default)
+    identity = get_build_identity()
+    logger.info(
+        "perpetual_pro API v{} starting (exchange={} commit={} build={} "
+        "feature_schema={} execution_policy={} rank_policy={} environment={})",
+        __version__, cfg.exchange.default,
+        str(identity["git_commit_sha"])[:12], identity["build_timestamp"],
+        identity["feature_schema"], identity["execution_policy"],
+        identity["rank_policy"], identity["environment"],
+    )
     scoring_runtime = get_outcome_scoring_runtime(cfg)
     scoring_database_ready = scoring_runtime.repository.check_ready()
     tracker_started = start_signal_tracker_background(cfg)
@@ -97,14 +114,14 @@ async def lifespan(app: FastAPI):
     logger.info(
         "Background services: tracker_started={} scheduler_started={} webhook_started={} "
         "outcome_database_ready={} scoring_mode={} "
-        "scheduler_enabled={} times={} timezone={}",
+        "scheduler_enabled={} active_windows={} timezone={}",
         tracker_started,
         scheduler_started,
         webhook_started,
         scoring_database_ready,
         cfg.outcome_scoring.mode,
         cfg.scheduler.enabled,
-        cfg.scheduler.times,
+        (cfg.scheduler.sessions or cfg.scheduler.times),
         cfg.scheduler.timezone,
     )
     try:
@@ -145,6 +162,7 @@ def root() -> Dict[str, Any]:
         "docs": "/docs",
         "endpoints": {
             "health": "GET /health",
+            "readiness": "GET /ready",
             "analyze": "POST /analyze (multipart: image + optional symbol/timeframe)",
             "telegram_status": "GET /telegram/status",
             "telegram_test": "POST /telegram/test (X-Telegram-Test-Key required)",
@@ -175,6 +193,76 @@ def health() -> Dict[str, Any]:
     }
 
 
+@app.get("/ready")
+def readiness() -> JSONResponse:
+    """Dependency-aware readiness; never sends messages or places orders."""
+    cfg = get_config()
+    tracker = get_signal_tracker_status()
+    scoring_runtime = get_outcome_scoring_runtime(cfg)
+    supabase_ready = scoring_runtime.repository.check_ready()
+    scheduler = get_scheduler_status()
+    identity = get_build_identity()
+    production = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME"))
+    checks = {
+        "configuration_loaded": True,
+        "supabase_reachable": bool(supabase_ready),
+        "lifecycle_repository_available": bool(
+            tracker.get("durable_lifecycle_ready")
+        ),
+        "startup_recovery_completed": bool(tracker.get("recovery_completed")),
+        "tracker_running": bool(
+            tracker.get("running") and tracker.get("thread_alive")
+        ),
+        "scheduler_state_known": "enabled" in scheduler,
+        "telegram_configuration_valid": bool(
+            not cfg.telegram.enabled or is_telegram_ready(cfg)
+        ),
+        "exchange_market_data_capability": cfg.exchange.default
+        in {"okx", "bybit", "bitget", "binanceusdm"},
+        "policy_versions_compatible": bool(
+            identity["feature_schema"] == cfg.outcome_scoring.feature_schema_version
+            and identity["execution_policy"] == cfg.analysis.execution_policy_version
+        ),
+        "scan_auth_configured": bool(
+            SCAN_ACCESS.configured_key() or not production
+        ),
+        "deployment_identity_complete": bool(
+            identity["identity_complete"] or not production
+        ),
+        "background_workers_healthy": not bool(
+            tracker.get("recovery_failed")
+        ),
+    }
+    ready = all(checks.values())
+    payload = {
+        "status": "ready" if ready else "not_ready",
+        "guarded_mode": bool(not cfg.scheduler.enabled),
+        "scheduler": {
+            "enabled": bool(cfg.scheduler.enabled),
+            "state": "disabled_intentionally" if not cfg.scheduler.enabled else "enabled",
+            "active_windows": cfg.scheduler.sessions or cfg.scheduler.times,
+        },
+        "checks": checks,
+        "build": identity,
+    }
+    return JSONResponse(status_code=200 if ready else 503, content=payload)
+
+
+@app.get("/admin/status")
+def admin_status(
+    request: Request,
+    x_scan_api_key: Optional[str] = Header(None, alias="X-Scan-API-Key"),
+) -> Dict[str, Any]:
+    SCAN_ACCESS.authorize(request, x_scan_api_key)
+    return {
+        "ok": True,
+        "build": get_build_identity(),
+        "scheduler": get_scheduler_status(),
+        "signal_tracker": get_signal_tracker_status(),
+        "outcome_scoring": get_outcome_scoring_status(get_config()),
+    }
+
+
 @app.get("/signal-tracker/reliability")
 def signal_tracker_reliability() -> Dict[str, Any]:
     """Forward outcome bands; scores are not probabilities until calibrated."""
@@ -201,7 +289,6 @@ def telegram_status() -> Dict[str, Any]:
             "ready": is_telegram_ready(cfg),
             "token_configured": bool(token),
             "chat_id_configured": bool(chat),
-            "chat_id_suffix": chat[-4:] if chat else None,
             "alert_chat_count": len(alert_chats),
             "additional_alert_chats_configured": bool(
                 (os.getenv("TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS") or "").strip()
@@ -347,6 +434,7 @@ def telegram_test_scan(
 
 @app.post("/scan")
 async def scan(
+    request: Request,
     symbols: Optional[str] = Form(
         None,
         description="Comma-separated symbols to scan, e.g. BTC,ETH,SOL",
@@ -356,29 +444,48 @@ async def scan(
     no_news: bool = Form(False, description="Skip news fetch"),
     simulated_capital: Optional[float] = Form(None, description="Simulated capital"),
     risk: Optional[float] = Form(None, description="Risk percent"),
+    x_scan_api_key: Optional[str] = Header(None, alias="X-Scan-API-Key"),
 ) -> JSONResponse:
     cfg = get_config()
-    symbol_list = [x.strip() for x in (symbols or "").split(",") if x and x.strip()]
-    if not symbol_list:
-        return JSONResponse(status_code=422, content={"ok": False, "error": "no_symbols"})
+    SCAN_ACCESS.authorize(request, x_scan_api_key)
+    symbol_list = normalize_requested_symbols(
+        (symbols or "").split(","), approved_bases=cfg.scheduler.watchlist
+    )
+    validated_timeframe = validate_timeframe(timeframe, cfg.timeframes.primary)
+    validated_exchange = validate_exchange(exchange, cfg.exchange.default)
 
     req = AnalyzeRequest(
-        timeframe=timeframe.strip() if timeframe else None,
-        exchange=exchange.strip().lower() if exchange else None,
+        timeframe=validated_timeframe,
+        exchange=validated_exchange,
         simulated_capital=simulated_capital,
         risk_pct=risk,
         no_news=bool(no_news),
     )
     try:
-        result = scan_symbols(symbol_list, request=req, config=cfg)
+        with SCAN_ACCESS.slot():
+            result = await asyncio.wait_for(
+                asyncio.to_thread(scan_symbols, symbol_list, req, cfg),
+                timeout=SCAN_TIMEOUT_SECONDS,
+            )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail={"error": "scan_timeout", "budget_seconds": SCAN_TIMEOUT_SECONDS},
+        ) from exc
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.exception("Scan failed: {}", exc)
-        raise HTTPException(status_code=500, detail=f"Scan failed: {exc}") from exc
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "scan_failed", "error_type": type(exc).__name__},
+        ) from exc
     return JSONResponse(content=result)
 
 
 @app.post("/analyze")
 async def analyze(
+    request: Request,
     image: UploadFile = File(..., description="Chart screenshot (PNG/JPEG/WebP)"),
     symbol: Optional[str] = Form(
         None,
@@ -430,6 +537,7 @@ async def analyze(
         None,
         description="JSON string of fused client hints",
     ),
+    x_scan_api_key: Optional[str] = Header(None, alias="X-Scan-API-Key"),
 ) -> JSONResponse:
     """
     Maximum-signal chart analysis.
@@ -439,6 +547,11 @@ async def analyze(
     simulation → optional LLM narrative.
     """
     cfg = get_config()
+    SCAN_ACCESS.authorize(request, x_scan_api_key)
+    if timeframe:
+        timeframe = validate_timeframe(timeframe, cfg.timeframes.primary)
+    if exchange:
+        exchange = validate_exchange(exchange, cfg.exchange.default)
 
     # Validate content type lightly (some clients send octet-stream)
     content_type = (image.content_type or "").lower()
@@ -499,10 +612,24 @@ async def analyze(
     )
 
     try:
-        result = analyze_from_image(raw, request=req, config=cfg)
+        with SCAN_ACCESS.slot():
+            result = await asyncio.wait_for(
+                asyncio.to_thread(analyze_from_image, raw, req, cfg),
+                timeout=SCAN_TIMEOUT_SECONDS,
+            )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail={"error": "analysis_timeout", "budget_seconds": SCAN_TIMEOUT_SECONDS},
+        ) from exc
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.exception("Analyze failed: {}", exc)
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}") from exc
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "analysis_failed", "error_type": type(exc).__name__},
+        ) from exc
 
     if not result.get("ok", True) and result.get("error") in ("symbol_required", "invalid_symbol"):
         # Client fixable — return 422 with structured body

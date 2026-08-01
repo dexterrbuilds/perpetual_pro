@@ -7,6 +7,8 @@ news + confluence, returning a clean JSON-serializable dict.
 from __future__ import annotations
 
 import json
+import time
+import inspect
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Union
@@ -29,6 +31,7 @@ from src.scoring.runtime import (
 )
 from src.utils.config import AppConfig, load_config
 from src.utils.helpers import clamp, normalize_symbol
+from src.api.security import SCAN_BUDGET_SECONDS, SCAN_FALLBACK_EXCHANGES
 from src.vision.chart_detect import ChartVision
 from src.vision.ocr import OCREngine
 from src.vision.url_symbol import parse_chart_url
@@ -601,18 +604,37 @@ def scan_symbols(
     journal_records: List[Dict[str, Any]] = []
     analysis_failures: List[Dict[str, str]] = []
     analyzed_count = 0
+    scan_deadline = time.monotonic() + SCAN_BUDGET_SECONDS
     for symbol in symbol_list[:40]:
+        if time.monotonic() >= scan_deadline:
+            analysis_failures.append(
+                {"symbol": symbol, "reason": "scan_budget_exhausted"}
+            )
+            continue
         try:
             normalized_symbol = normalize_symbol(symbol)
-            fetch = fetch_multi_timeframe_with_fallback(
-                symbol=normalized_symbol,
-                primary_tf=primary_tf,
-                preferred_exchange=ex_id,
-                higher_tfs=["1h", "4h"],
-                limit=120,
-                include_snapshot=True,
-                config=cfg,
+            fetch_kwargs = {
+                "symbol": normalized_symbol,
+                "primary_tf": primary_tf,
+                "preferred_exchange": ex_id,
+                "higher_tfs": ["1h", "4h"],
+                "limit": 120,
+                "include_snapshot": True,
+                "config": cfg,
+            }
+            # Test adapters and third-party wrappers written before the bounded
+            # fallback parameters remain compatible without weakening the real
+            # production budget.
+            signature = inspect.signature(fetch_multi_timeframe_with_fallback)
+            accepts_kwargs = any(
+                item.kind == inspect.Parameter.VAR_KEYWORD
+                for item in signature.parameters.values()
             )
+            if accepts_kwargs or "max_exchanges" in signature.parameters:
+                fetch_kwargs["max_exchanges"] = SCAN_FALLBACK_EXCHANGES
+            if accepts_kwargs or "deadline_monotonic" in signature.parameters:
+                fetch_kwargs["deadline_monotonic"] = scan_deadline
+            fetch = fetch_multi_timeframe_with_fallback(**fetch_kwargs)
             client = fetch.client
             try:
                 mtf = fetch.mtf

@@ -81,9 +81,8 @@ def test_config_loads_prop_and_telegram():
     assert cfg.risk.max_leverage <= 5
     assert hasattr(cfg, "telegram")
     assert hasattr(cfg, "scheduler")
-    assert "09:00" in cfg.scheduler.times
-    assert "15:00" in cfg.scheduler.times
-    assert "20:00" in cfg.scheduler.times
+    assert cfg.scheduler.times == []
+    assert len(cfg.scheduler.sessions) == 4
     assert [session["name"] for session in cfg.scheduler.sessions] == [
         "London confirmation",
         "New York macro follow-through",

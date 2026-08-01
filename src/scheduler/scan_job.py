@@ -91,7 +91,7 @@ def next_slot_datetime(
     tz = ZoneInfo(timezone)
     now = now.astimezone(tz) if now else datetime.now(tz)
     candidates: List[datetime] = []
-    for t in times or ["09:00", "15:00", "20:00"]:
+    for t in times:
         try:
             h, m = _parse_hhmm(t)
         except (TypeError, ValueError):
@@ -101,7 +101,7 @@ def next_slot_datetime(
             candidate = candidate + timedelta(days=1)
         candidates.append(candidate)
     if not candidates:
-        return now + timedelta(hours=1)
+        raise ValueError("No valid scheduler times are configured")
     return min(candidates)
 
 
@@ -858,7 +858,7 @@ def run_scheduler_loop(
     """
     cfg = config or load_config()
     stop = stop_event or Event()
-    times = list(cfg.scheduler.times or ["09:00", "15:00", "20:00"])
+    times = list(cfg.scheduler.times or [])
     sessions = list(getattr(cfg.scheduler, "sessions", None) or [])
     tz_name = cfg.scheduler.timezone or "Africa/Lagos"
     _status_update(
@@ -867,6 +867,7 @@ def run_scheduler_loop(
         timezone=tz_name,
         times=times,
         sessions=sessions,
+        active_windows=(sessions if sessions else times),
         started_at=datetime.now(ZoneInfo("UTC")).isoformat(),
         last_error=None,
     )
@@ -968,6 +969,11 @@ def start_scheduler_background(config: Optional[AppConfig] = None) -> bool:
             timezone=cfg.scheduler.timezone,
             times=list(cfg.scheduler.times),
             sessions=list(getattr(cfg.scheduler, "sessions", None) or []),
+            active_windows=(
+                list(getattr(cfg.scheduler, "sessions", None) or [])
+                or list(cfg.scheduler.times)
+            ),
+            guarded_mode=True,
         )
         logger.warning("Scheduler disabled by configuration (scheduler.enabled=false)")
         return False
@@ -988,6 +994,11 @@ def start_scheduler_background(config: Optional[AppConfig] = None) -> bool:
         timezone=cfg.scheduler.timezone,
         times=list(cfg.scheduler.times),
         sessions=list(getattr(cfg.scheduler, "sessions", None) or []),
+        active_windows=(
+            list(getattr(cfg.scheduler, "sessions", None) or [])
+            or list(cfg.scheduler.times)
+        ),
+        guarded_mode=False,
     )
     logger.info("Scheduler background thread started")
     return True

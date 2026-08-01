@@ -200,11 +200,11 @@ def extract_candidate_features(
     direction = str(
         row.get("direction") or getattr(analysis, "direction", "") or ""
     ).lower()
+    # A flat analysis is research context, not a synthetic directional example.
+    # Never derive a training direction from bias for a row that did not qualify
+    # as an actual long/short candidate.
     if direction not in ("long", "short"):
-        bias = str(row.get("bias") or getattr(analysis, "bias", "") or "").lower()
-        direction = "long" if bias == "bullish" else (
-            "short" if bias == "bearish" else "flat"
-        )
+        direction = "flat"
     direction_sign = 1.0 if direction == "long" else -1.0
     status = str(
         row.get("entry_status") or execution.get("status") or "blocked"
@@ -356,10 +356,8 @@ def build_candidate_record(
         row.get("direction") or getattr(analysis, "direction", "flat") or "flat"
     ).lower()
     if direction not in ("long", "short"):
-        bias = str(row.get("bias") or getattr(analysis, "bias", "") or "").lower()
-        direction = "long" if bias == "bullish" else (
-            "short" if bias == "bearish" else "flat"
-        )
+        direction = "flat"
+    is_directional_candidate = direction in ("long", "short")
     identity = "|".join(
         [
             generated_at,
@@ -478,6 +476,7 @@ def build_candidate_record(
             row.get("primary_tf") or getattr(analysis, "primary_tf", "15m")
         ),
         "direction": direction,
+        "is_directional_candidate": is_directional_candidate,
         "setup_type": setup_type,
         "setup_name": str(
             row.get("setup_name") or getattr(analysis, "setup_name", "") or ""

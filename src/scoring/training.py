@@ -456,6 +456,12 @@ def _prepare_rows(
     for source in rows:
         if str(source.get("feature_schema_version") or "") != feature_schema_version:
             continue
+        if source.get("is_directional_candidate") is False:
+            continue
+        if source.get("direction") is not None and str(
+            source.get("direction") or ""
+        ).lower() not in ("long", "short"):
+            continue
         # Unknown event ordering is not a negative label and must not train the
         # execution or alert models in either direction.
         if str(source.get("terminal_status") or "") == "ambiguous_gap":

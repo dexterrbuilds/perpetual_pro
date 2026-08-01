@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from loguru import logger
 
@@ -25,6 +25,12 @@ from src.data.exchange import ExchangeClient, normalize_exchange_id
 from src.notify.telegram import send_telegram_message_detailed
 from src.scoring.labels import technical_success_from_range
 from src.scoring.repository import OutcomeRepository, TERMINAL_STATUSES as DURABLE_TERMINAL_STATUSES
+from src.analysis.execution_policy import RANK_POLICY_VERSION
+from src.tracking.durable_repository import (
+    LIFECYCLE_SCHEMA_VERSION,
+    LifecycleRepository,
+    destination_hash,
+)
 from src.utils.config import AppConfig, load_config
 from src.utils.helpers import safe_float
 
@@ -247,6 +253,11 @@ class SignalStore:
                     terminal_at TEXT,
                     terminal_reason TEXT,
                     technical_success INTEGER,
+                    previous_price REAL,
+                    previous_price_at TEXT,
+                    last_processed_candle_at TEXT,
+                    lifecycle_version INTEGER NOT NULL DEFAULT 0,
+                    ordering_policy TEXT NOT NULL DEFAULT 'observed_segment_v1',
                     row_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -269,6 +280,11 @@ class SignalStore:
                     attempts INTEGER NOT NULL DEFAULT 0,
                     last_attempt_at TEXT,
                     notified_at TEXT,
+                    event_uid TEXT,
+                    lifecycle_version INTEGER NOT NULL DEFAULT 0,
+                    from_status TEXT,
+                    to_status TEXT,
+                    notify INTEGER NOT NULL DEFAULT 1,
                     FOREIGN KEY(signal_id) REFERENCES signals(id)
                 );
 
@@ -284,6 +300,37 @@ class SignalStore:
                 self._connection.execute(
                     "ALTER TABLE signals ADD COLUMN technical_success INTEGER"
                 )
+            additive_signal_columns = {
+                "previous_price": "REAL",
+                "previous_price_at": "TEXT",
+                "last_processed_candle_at": "TEXT",
+                "lifecycle_version": "INTEGER NOT NULL DEFAULT 0",
+                "ordering_policy": "TEXT NOT NULL DEFAULT 'observed_segment_v1'",
+            }
+            for name, declaration in additive_signal_columns.items():
+                if name not in columns:
+                    self._connection.execute(
+                        f"ALTER TABLE signals ADD COLUMN {name} {declaration}"
+                    )
+            event_columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(signal_events)")
+            }
+            additive_event_columns = {
+                "event_uid": "TEXT",
+                "lifecycle_version": "INTEGER NOT NULL DEFAULT 0",
+                "from_status": "TEXT",
+                "to_status": "TEXT",
+                "notify": "INTEGER NOT NULL DEFAULT 1",
+            }
+            for name, declaration in additive_event_columns.items():
+                if name not in event_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE signal_events ADD COLUMN {name} {declaration}"
+                    )
+            self._connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_uid ON signal_events(event_uid)"
+            )
             self._connection.commit()
 
     def close(self) -> None:
@@ -349,6 +396,85 @@ class SignalStore:
         with self._lock:
             rows = self._connection.execute(sql, params).fetchall()
         return [self._decode_signal(row) for row in rows]
+
+    def events_for_sync(self, signal_id: str) -> List[Dict[str, Any]]:
+        """Return immutable local events for atomic durable journaling."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM signal_events WHERE signal_id=? ORDER BY lifecycle_version",
+                (signal_id,),
+            ).fetchall()
+        return [self._decode_event(row) for row in rows]
+
+    def restore_signal(self, signal: Mapping[str, Any]) -> bool:
+        """Restore a durable active record into the SQLite working cache."""
+        signal_id = str(signal.get("id") or "").strip()
+        if not signal_id or str(signal.get("status")) not in ACTIVE_STATUSES:
+            return False
+        targets = list(signal.get("take_profits") or [])
+        destinations = list(signal.get("destinations") or [])
+        row = dict(signal.get("row") or {})
+        with self._lock:
+            existing = self._connection.execute(
+                "SELECT lifecycle_version FROM signals WHERE id=?", (signal_id,)
+            ).fetchone()
+            if existing and int(existing["lifecycle_version"] or 0) > int(
+                signal.get("lifecycle_version") or 0
+            ):
+                return False
+            self._connection.execute(
+                """
+                INSERT INTO signals (
+                  id,fingerprint,symbol,exchange_id,direction,timeframe,source,status,
+                  confidence,entry_low,entry_high,entry_mid,stop_loss,
+                  take_profits_json,destinations_json,generated_at,valid_until,
+                  entered_at,entry_price,hold_until,highest_tp,realized_r,mfe_r,
+                  mae_r,slippage_bps,last_price,last_price_at,terminal_at,
+                  terminal_reason,technical_success,previous_price,previous_price_at,
+                  last_processed_candle_at,lifecycle_version,ordering_policy,row_json,
+                  created_at,updated_at
+                ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                  status=excluded.status, entered_at=excluded.entered_at,
+                  entry_price=excluded.entry_price, hold_until=excluded.hold_until,
+                  highest_tp=excluded.highest_tp, realized_r=excluded.realized_r,
+                  mfe_r=excluded.mfe_r, mae_r=excluded.mae_r,
+                  last_price=excluded.last_price, last_price_at=excluded.last_price_at,
+                  previous_price=excluded.previous_price,
+                  previous_price_at=excluded.previous_price_at,
+                  last_processed_candle_at=excluded.last_processed_candle_at,
+                  lifecycle_version=excluded.lifecycle_version,
+                  ordering_policy=excluded.ordering_policy,
+                  destinations_json=excluded.destinations_json,
+                  row_json=excluded.row_json, updated_at=excluded.updated_at
+                """,
+                (
+                    signal_id, signal.get("fingerprint") or signal_id,
+                    signal.get("symbol"), signal.get("exchange_id"),
+                    signal.get("direction"), signal.get("timeframe") or "15m",
+                    signal.get("source") or "telegram", signal.get("status"),
+                    safe_float(signal.get("confidence")), signal.get("entry_low"),
+                    signal.get("entry_high"), signal.get("entry_mid"),
+                    signal.get("stop_loss"), json.dumps(targets, separators=(",", ":")),
+                    json.dumps(destinations, separators=(",", ":")),
+                    signal.get("generated_at"), signal.get("valid_until"),
+                    signal.get("entered_at"), signal.get("entry_price"),
+                    signal.get("hold_until"), int(signal.get("highest_tp") or 0),
+                    safe_float(signal.get("realized_r")), safe_float(signal.get("mfe_r")),
+                    safe_float(signal.get("mae_r")), signal.get("slippage_bps"),
+                    signal.get("last_price"), signal.get("last_price_at"),
+                    signal.get("terminal_at"), signal.get("terminal_reason"),
+                    signal.get("technical_success"), signal.get("previous_price"),
+                    signal.get("previous_price_at"), signal.get("last_processed_candle_at"),
+                    int(signal.get("lifecycle_version") or 0),
+                    signal.get("ordering_policy") or "observed_segment_v1",
+                    json.dumps(row, separators=(",", ":"), default=str),
+                    signal.get("created_at") or signal.get("generated_at"),
+                    signal.get("updated_at") or _iso(_utc_now()),
+                ),
+            )
+            self._connection.commit()
+        return True
 
     def counts(self) -> Dict[str, int]:
         with self._lock:
@@ -544,6 +670,7 @@ class SignalStore:
     ) -> Tuple[Dict[str, Any], bool]:
         """Insert a delivered signal or merge destinations into an active match."""
         timestamp = now or _utc_now()
+        row = dict(row)
         symbol = str(row.get("symbol") or "").upper().strip()
         direction = str(row.get("direction") or "").lower().strip()
         entry_low = safe_float(row.get("entry_low"))
@@ -554,6 +681,10 @@ class SignalStore:
             for value in list(row.get("take_profits") or [])[:4]
             if safe_float(value) > 0
         ]
+        row.setdefault(
+            "target_allocations",
+            _normalize_allocations(self._allocations_config, len(targets)),
+        )
         chats = _unique_strings(destinations)
         if (
             not symbol
@@ -616,6 +747,7 @@ class SignalStore:
             )
             if existing is not None:
                 existing_signal = self._decode_signal(existing)
+                previous_destinations = list(existing_signal["destinations"])
                 merged = _unique_strings(
                     [*existing_signal["destinations"], *chats]
                 )
@@ -634,7 +766,18 @@ class SignalStore:
                 self._connection.commit()
                 existing_signal["destinations"] = merged
                 existing_signal["updated_at"] = now_iso
-                return existing_signal, False
+                newly_delivered = [chat for chat in chats if chat not in previous_destinations]
+                if newly_delivered:
+                    self._create_event_locked(
+                        existing_signal["id"], "published", timestamp,
+                        initial_price if initial_price > 0 else None,
+                        {"source": source}, newly_delivered, notify=False,
+                    )
+                    self._connection.commit()
+                refreshed = self._connection.execute(
+                    "SELECT * FROM signals WHERE id=?", (existing_signal["id"],)
+                ).fetchone()
+                return self._decode_signal(refreshed), False
 
             self._connection.execute(
                 """
@@ -684,6 +827,20 @@ class SignalStore:
                 "SELECT * FROM signals WHERE id = ?",
                 (signal_id,),
             ).fetchone()
+            self._create_event_locked(
+                signal_id,
+                "published",
+                timestamp,
+                initial_price if initial_price > 0 else None,
+                {"source": source},
+                chats,
+                notify=False,
+            )
+            self._connection.commit()
+            inserted = self._connection.execute(
+                "SELECT * FROM signals WHERE id = ?",
+                (signal_id,),
+            ).fetchone()
         assert inserted is not None
         return self._decode_signal(inserted), True
 
@@ -701,12 +858,35 @@ class SignalStore:
         chats = _unique_strings(destinations)
         delivered = [] if notify else chats
         notified_at = None if notify else _iso(occurred_at)
+        state_row = self._connection.execute(
+            "SELECT status, lifecycle_version, entered_at FROM signals WHERE id=?",
+            (signal_id,),
+        ).fetchone()
+        previous_version = int(state_row["lifecycle_version"] or 0) if state_row else 0
+        lifecycle_version = previous_version + 1
+        to_status = str(state_row["status"] or "") if state_row else None
+        if event_type in {"entered"}:
+            from_status = "pending"
+        elif event_type in {"target_hit", "completed", "protected_exit", "stopped", "time_exit"}:
+            from_status = "entered"
+        elif event_type in {"missed", "expired", "invalidated"}:
+            from_status = "pending"
+        elif event_type == "ambiguous_gap":
+            from_status = "entered" if state_row and state_row["entered_at"] else "pending"
+        else:
+            from_status = to_status
+        self._connection.execute(
+            "UPDATE signals SET lifecycle_version=? WHERE id=?",
+            (lifecycle_version, signal_id),
+        )
+        event_uid = f"{signal_id}:{lifecycle_version}:{event_type}"
         cursor = self._connection.execute(
             """
             INSERT INTO signal_events (
                 signal_id, event_type, occurred_at, price, payload_json,
-                destinations_json, delivered_to_json, notified_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                destinations_json, delivered_to_json, notified_at, event_uid,
+                lifecycle_version, from_status, to_status, notify
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 signal_id,
@@ -717,6 +897,11 @@ class SignalStore:
                 json.dumps(chats, separators=(",", ":")),
                 json.dumps(delivered, separators=(",", ":")),
                 notified_at,
+                event_uid,
+                lifecycle_version,
+                from_status,
+                to_status,
+                1 if notify else 0,
             ),
         )
         return int(cursor.lastrowid)
@@ -903,6 +1088,7 @@ class SignalStore:
                     if signal.get("last_price") is not None
                     else None
                 )
+                previous_at = signal.get("last_price_at")
                 self._update_technical_success_locked(
                     signal,
                     high=price,
@@ -924,10 +1110,14 @@ class SignalStore:
                 self._connection.execute(
                     """
                     UPDATE signals
-                    SET last_price = ?, last_price_at = ?, updated_at = ?
+                    SET previous_price = ?, previous_price_at = ?,
+                        last_price = ?, last_price_at = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (price, _iso(timestamp), _iso(timestamp), signal["id"]),
+                    (
+                        previous_price, previous_at, price, _iso(timestamp),
+                        _iso(timestamp), signal["id"],
+                    ),
                 )
 
                 if signal["status"] == "pending":
@@ -1165,8 +1355,19 @@ class SignalStore:
             rows = self._connection.execute(sql, params).fetchall()
             for db_row in rows:
                 signal = self._decode_signal(db_row)
+                last_candle = (
+                    _parse_datetime(signal.get("last_processed_candle_at"))
+                    if signal.get("last_processed_candle_at")
+                    else None
+                )
+                if last_candle and timestamp <= last_candle:
+                    continue
                 if timestamp <= _parse_datetime(signal["generated_at"]):
                     continue
+                self._connection.execute(
+                    "UPDATE signals SET last_processed_candle_at=?, updated_at=? WHERE id=?",
+                    (_iso(timestamp), _iso(timestamp), signal["id"]),
+                )
                 self._update_technical_success_locked(
                     signal,
                     high=safe_float(high_price, close_price),
@@ -1695,7 +1896,7 @@ def format_tracker_event(event: Dict[str, Any]) -> str:
             "The old levels are cancelled. Run a new scan before considering the market.",
         ]
 
-    return "\n".join(
+    message = "\n".join(
         [
             title,
             "",
@@ -1704,6 +1905,9 @@ def format_tracker_event(event: Dict[str, Any]) -> str:
             "NFA · DYOR · Trade at your own risk",
         ]
     )
+    if str(signal.get("source") or "").startswith("production_verification"):
+        return "🧪 <b>CONTROLLED LIFECYCLE TEST — NOT A TRADE</b>\n\n" + message
+    return message
 
 
 class SignalTracker:
@@ -1718,6 +1922,9 @@ class SignalTracker:
         self.outcome_repository = OutcomeRepository(
             config.outcome_scoring.database_url
         )
+        self.lifecycle_repository = LifecycleRepository(
+            config.outcome_scoring.database_url
+        )
         self._stop = Event()
         self._queue: queue.Queue[
             Tuple[str, str, float, datetime, str]
@@ -1726,6 +1933,7 @@ class SignalTracker:
         self._exchange_clients: Dict[str, ExchangeClient] = {}
         self._closed = False
         self._instrument_symbols: Dict[str, List[str]] = {}
+        self._last_observation_sync: Dict[str, float] = {}
         self._status_lock = Lock()
         self._status: Dict[str, Any] = {
             "enabled": bool(config.signal_tracker.enabled),
@@ -1744,6 +1952,21 @@ class SignalTracker:
                 config.outcome_scoring.database_url
             ),
             "durable_outcome_database_ready": False,
+            "durable_lifecycle_required": bool(
+                config.signal_tracker.durable_lifecycle_required
+            ),
+            "durable_lifecycle_ready": False,
+            "recovery_completed": False,
+            "recovery_failed": False,
+            "recovery": {
+                "active_found": 0,
+                "restored": 0,
+                "expired": 0,
+                "reconciled": 0,
+                "ambiguous": 0,
+                "invalid": 0,
+                "duplicates_skipped": 0,
+            },
             "websocket_enabled": bool(
                 config.signal_tracker.websocket_enabled
             ),
@@ -1782,7 +2005,109 @@ class SignalTracker:
         durable = self.outcome_repository.status()
         status["durable_outcome_database"] = durable
         status["durable_outcome_database_ready"] = bool(durable.get("ready"))
+        lifecycle = self.lifecycle_repository.status()
+        status["durable_lifecycle_database"] = lifecycle
+        status["durable_lifecycle_ready"] = bool(lifecycle.get("ready"))
         return status
+
+    def _recover(self) -> bool:
+        """Restore active Supabase state before any tracker worker can run."""
+        required = bool(self.config.signal_tracker.durable_lifecycle_required)
+        if not self.lifecycle_repository.check_ready():
+            self._update_status(
+                durable_lifecycle_ready=False,
+                recovery_completed=False,
+                recovery_failed=required,
+                last_error="Durable lifecycle repository unavailable",
+            )
+            return not required
+        stats = {
+            "active_found": 0,
+            "restored": 0,
+            "expired": 0,
+            "reconciled": 0,
+            "ambiguous": 0,
+            "invalid": 0,
+            "duplicates_skipped": 0,
+        }
+        try:
+            records = self.lifecycle_repository.load_active()
+            stats["active_found"] = len(records)
+            seen: Set[str] = set()
+            for signal in records:
+                signal_id = str(signal.get("id") or "")
+                if not signal_id:
+                    stats["invalid"] += 1
+                    continue
+                if signal_id in seen:
+                    stats["duplicates_skipped"] += 1
+                    continue
+                seen.add(signal_id)
+                if (
+                    str(signal.get("_lifecycle_schema_version") or "")
+                    not in ("", LIFECYCLE_SCHEMA_VERSION)
+                    or str(
+                        signal.get("_feature_schema_version")
+                        or self.config.outcome_scoring.feature_schema_version
+                    ) != self.config.outcome_scoring.feature_schema_version
+                    or str(
+                        signal.get("_execution_policy_version")
+                        or self.config.analysis.execution_policy_version
+                    ) != self.config.analysis.execution_policy_version
+                    or str(
+                        signal.get("_rank_policy_version") or RANK_POLICY_VERSION
+                    ) != RANK_POLICY_VERSION
+                    or
+                    str(signal.get("status")) not in ACTIVE_STATUSES
+                    or str(signal.get("direction")) not in ("long", "short")
+                    or not list(signal.get("take_profits") or [])
+                ):
+                    stats["invalid"] += 1
+                    continue
+                if self.store.restore_signal(signal):
+                    stats["restored"] += 1
+            expired = self.store.apply_time_rules(_utc_now())
+            stats["expired"] = int(expired)
+            if expired:
+                self._sync_all_signals()
+            self._refresh_counts_and_subscriptions()
+            if stats["invalid"] and required:
+                self._update_status(
+                    durable_lifecycle_ready=True,
+                    recovery_completed=False,
+                    recovery_failed=True,
+                    recovery=stats,
+                    last_error="Incompatible active durable lifecycle records",
+                )
+                logger.error(
+                    "Lifecycle recovery blocked by incompatible active records: count={}",
+                    stats["invalid"],
+                )
+                return False
+            self._update_status(
+                durable_lifecycle_ready=True,
+                recovery_completed=not bool(self.store.active_signals()),
+                recovery_failed=False,
+                recovery=stats,
+                last_error=None,
+            )
+            logger.info(
+                "Lifecycle recovery complete: found={} restored={} expired={} "
+                "invalid={} duplicates_skipped={}",
+                stats["active_found"], stats["restored"], stats["expired"],
+                stats["invalid"], stats["duplicates_skipped"],
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._update_status(
+                durable_lifecycle_ready=False,
+                recovery_completed=False,
+                recovery_failed=True,
+                recovery=stats,
+                last_error=f"Lifecycle recovery {type(exc).__name__}",
+            )
+            logger.error("Lifecycle recovery failed: error_type={}", type(exc).__name__)
+            return False
 
     def _refresh_counts_only(self) -> None:
         counts = self.store.counts()
@@ -1819,6 +2144,35 @@ class SignalTracker:
             return False
         if self._thread and self._thread.is_alive():
             return True
+        if not self._recover():
+            return False
+        active_before_reconcile = len(self.store.active_signals())
+        if active_before_reconcile:
+            reconciliation = self._reconcile()
+            recovery = dict(self.status().get("recovery") or {})
+            recovery["reconciled"] = max(
+                0,
+                int(reconciliation.get("attempted") or 0)
+                - len(reconciliation.get("errors") or []),
+            )
+            recovery["ambiguous"] = sum(
+                1
+                for item in self.store.signals_for_sync()
+                if str(item.get("status")) == "ambiguous_gap"
+            )
+            all_failed = bool(
+                reconciliation.get("attempted")
+                and len(reconciliation.get("errors") or [])
+                >= int(reconciliation.get("attempted") or 0)
+            )
+            self._update_status(
+                recovery=recovery,
+                recovery_completed=not all_failed,
+                recovery_failed=all_failed,
+            )
+            if all_failed and self.config.signal_tracker.durable_lifecycle_required:
+                logger.error("Lifecycle startup reconciliation failed for every active market")
+                return False
         self._stop.clear()
         self._thread = Thread(
             target=self._run,
@@ -1851,7 +2205,7 @@ class SignalTracker:
             destinations,
             source=source,
         )
-        self._sync_signals([signal])
+        durable = self._sync_signals([signal])
         self._refresh_counts_and_subscriptions()
         logger.info(
             "Signal tracker {}: symbol={} direction={} status={} destinations={}",
@@ -1862,7 +2216,7 @@ class SignalTracker:
             len(signal["destinations"]),
         )
         return {
-            "ok": True,
+            "ok": bool(durable or not self.config.signal_tracker.durable_lifecycle_required),
             "created": created,
             "signal_id": signal["id"],
             "status": signal["status"],
@@ -1905,8 +2259,15 @@ class SignalTracker:
                         exchange_id=exchange_id,
                     )
                     self._update_status(last_price_at=_iso(observed))
-                    if transitions:
+                    checkpoint_due = (
+                        time.monotonic()
+                        - self._last_observation_sync.get(symbol, 0.0)
+                        >= 30.0
+                    )
+                    if transitions or checkpoint_due:
                         self._sync_symbol(symbol)
+                        self._last_observation_sync[symbol] = time.monotonic()
+                    if transitions:
                         self._refresh_counts_and_subscriptions()
                     self._queue.task_done()
                 except queue.Empty:
@@ -1950,11 +2311,11 @@ class SignalTracker:
             )
         return self._exchange_clients[normalized]
 
-    def _reconcile(self) -> None:
+    def _reconcile(self) -> Dict[str, Any]:
         active = self.store.active_signals()
         if not active:
             self._update_status(last_reconcile_at=_iso(_utc_now()))
-            return
+            return {"attempted": 0, "errors": []}
         markets = sorted(
             {
                 (normalize_exchange_id(signal["exchange_id"]), signal["symbol"])
@@ -2036,6 +2397,7 @@ class SignalTracker:
                 else None
             ),
         )
+        return {"attempted": len(markets), "errors": errors}
 
     def _sync_symbol(self, symbol: str) -> None:
         self._sync_signals(self.store.signals_for_sync(symbol))
@@ -2043,47 +2405,78 @@ class SignalTracker:
     def _sync_all_signals(self) -> None:
         self._sync_signals(self.store.signals_for_sync())
 
-    def _sync_signals(self, signals: Sequence[Dict[str, Any]]) -> None:
-        if not self.outcome_repository.enabled:
-            return
+    def _sync_signals(self, signals: Sequence[Dict[str, Any]]) -> bool:
+        all_durable = True
         for signal in signals:
+            events = self.store.events_for_sync(str(signal.get("id") or ""))
+            durable = self.lifecycle_repository.persist_state_and_events(
+                signal,
+                events,
+            )
+            # Preserve the original Phase 1/2A mirror/outcome path for backward
+            # compatibility. It is no longer the lifecycle source of truth.
             mirrored = self.outcome_repository.upsert_tracked_signal(signal)
             if (
                 mirrored
                 and str(signal.get("status") or "") in DURABLE_TERMINAL_STATUSES
             ):
                 self.outcome_repository.upsert_outcome_from_signal(signal)
+            if not durable and self.config.signal_tracker.durable_lifecycle_required:
+                all_durable = False
+                self._update_status(
+                    durable_lifecycle_ready=False,
+                    last_error="Durable lifecycle commit failed",
+                )
+        return all_durable
 
     def _flush_notifications(self) -> None:
-        events = self.store.pending_events(
-            retry_after_seconds=self.config.signal_tracker.notification_retry_seconds
-        )
-        for event in events:
-            destinations = _unique_strings(event.get("destinations") or [])
-            delivered = _unique_strings(event.get("delivered_to") or [])
-            missing = [chat for chat in destinations if chat not in delivered]
-            message = format_tracker_event(event)
-            for destination in missing:
-                result = send_telegram_message_detailed(
-                    message,
-                    chat_id=destination,
-                    parse_mode=self.config.telegram.parse_mode or "HTML",
-                )
-                if result.get("ok"):
-                    delivered.append(destination)
-                    self._update_status(last_notification_at=_iso(_utc_now()))
-                else:
-                    logger.error(
-                        "Signal tracker Telegram update failed: event={} error={}",
-                        event["event_type"],
-                        result.get("error"),
-                    )
-            all_delivered = all(chat in delivered for chat in destinations)
-            self.store.record_delivery_attempt(
-                int(event["id"]),
-                delivered,
-                all_delivered=all_delivered,
+        jobs = self.lifecycle_repository.claim_notifications(limit=25)
+        for job in jobs:
+            payload = dict(job.get("payload") or {})
+            destinations = _unique_strings(payload.pop("destinations", []))
+            destination = next(
+                (
+                    item for item in destinations
+                    if destination_hash(item) == str(job.get("destination_hash") or "")
+                ),
+                None,
             )
+            if destination is None:
+                self.lifecycle_repository.finish_notification(
+                    int(job["id"]),
+                    delivered=False,
+                    error_category="destination_unavailable",
+                )
+                continue
+            event = {
+                "event_type": job.get("event_type"),
+                "occurred_at": job.get("occurred_at"),
+                "price": job.get("price"),
+                "payload": payload,
+                "signal": dict(job.get("lifecycle_state") or {}),
+            }
+            result = send_telegram_message_detailed(
+                format_tracker_event(event),
+                chat_id=destination,
+                parse_mode=self.config.telegram.parse_mode or "HTML",
+            )
+            success = bool(result.get("ok"))
+            self.lifecycle_repository.finish_notification(
+                int(job["id"]),
+                delivered=success,
+                message_id=result.get("message_id"),
+                error_category=result.get("error"),
+                retry_after_seconds=result.get("retry_after"),
+            )
+            if success:
+                self._update_status(last_notification_at=_iso(_utc_now()))
+            else:
+                logger.error(
+                    "Signal tracker Telegram update failed: event={} destination={} error={}",
+                    job.get("event_type"),
+                    str(job.get("destination_hash") or "")[:10],
+                    result.get("error"),
+                )
 
     def stop(self, timeout: float = 8.0) -> None:
         self._stop.set()
@@ -2144,7 +2537,11 @@ def start_signal_tracker_background(
             return _TRACKER.start()
         try:
             tracker = SignalTracker(cfg)
-            tracker.start()
+            started = tracker.start()
+            if not started:
+                _LAST_STATUS = tracker.status()
+                tracker.stop()
+                return False
             _TRACKER = tracker
             _LAST_STATUS = tracker.status()
             return True
@@ -2254,6 +2651,9 @@ def register_delivered_signals(
     for index, row, destinations in candidates:
         try:
             result = tracker.register(row, destinations, source=source)
+            if not result.get("ok"):
+                errors.append(f"{str(row.get('symbol') or f'row-{index}')}:durable_commit_failed")
+                continue
             if result.get("created"):
                 registered += 1
             else:

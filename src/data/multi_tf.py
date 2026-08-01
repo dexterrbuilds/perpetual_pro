@@ -294,6 +294,8 @@ def fetch_multi_timeframe_with_fallback(
     include_snapshot: bool = True,
     config: Optional[AppConfig] = None,
     auto_fallback: Optional[bool] = None,
+    max_exchanges: Optional[int] = None,
+    deadline_monotonic: Optional[float] = None,
 ) -> FallbackFetchResult:
     """
     Try preferred exchange first; on missing symbol/OHLCV, iterate fallbacks.
@@ -308,6 +310,8 @@ def fetch_multi_timeframe_with_fallback(
     exchanges = build_exchange_attempt_order(
         requested, config, auto_fallback=auto_fallback
     )
+    if max_exchanges is not None:
+        exchanges = exchanges[: max(1, int(max_exchanges))]
     healthy = [ex for ex in exchanges if not _venue_is_blocked(ex)]
     cooled_down = [ex for ex in exchanges if ex not in healthy]
     if healthy and cooled_down:
@@ -321,6 +325,9 @@ def fetch_multi_timeframe_with_fallback(
     last_mtf: Optional[MultiTimeframeData] = None
 
     for ex_id in exchanges:
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            logger.warning("Exchange fallback budget exhausted before venue={}", ex_id)
+            break
         attempted.append(ex_id)
         client: Optional[ExchangeClient] = None
         try:
@@ -400,31 +407,15 @@ def fetch_multi_timeframe_with_fallback(
             attempted_exchanges=list(attempted),
         )
 
-    # Every attempt raised — open preferred so caller still has a client to close
+    # Every bounded attempt raised. Do not silently repeat the preferred venue;
+    # that used to double timeout cost for unsupported symbols.
     client = ExchangeClient(exchange_id=requested, config=config)
-    try:
-        mtf = fetch_multi_timeframe(
-            client,
-            symbol=symbol,
-            primary_tf=primary_tf,
-            higher_tfs=higher_tfs,
-            limit=limit,
-            include_snapshot=include_snapshot,
-            config=config,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Final preferred-exchange fetch failed for {} on {}: {}",
-            symbol,
-            requested,
-            exc,
-        )
-        mtf = MultiTimeframeData(
-            symbol=symbol,
-            exchange_id=requested,
-            primary_tf=primary_tf,
-            errors=[str(exc)],
-        )
+    mtf = MultiTimeframeData(
+        symbol=symbol,
+        exchange_id=requested,
+        primary_tf=primary_tf,
+        errors=["bounded_exchange_fallback_exhausted"],
+    )
     return FallbackFetchResult(
         mtf=mtf,
         client=client,

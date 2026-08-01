@@ -68,13 +68,15 @@ Built to feel like a senior prop trader sitting next to you.
   Text delivery remains as an automatic fallback if media rendering/upload fails.
   When no setup passes the quality gates, Telegram sends an explicit
   **NO QUALITY SETUP — STAND ASIDE** confirmation.
-- **Active signal tracker**: only delivered ≥80% setups are persisted and
-  subscribed on one public OKX WebSocket. RETEST signals progress through
-  pending → entered → TP/SL/expired; CMP-ready alerts begin entered. TP1 before
-  entry is recorded as missed, while TP1 after entry keeps the remaining targets
-  active. Telegram follow-ups are sent only on state changes. A 30-minute REST
-  reconciliation recovers disconnects and checks confirmed-candle invalidation.
-  Forward outcomes retain entry delay, fill-proxy slippage, MFE, MAE and R.
+- **Restart-safe active signal tracker**: Supabase is authoritative for active
+  lifecycle state, transition versions, and a per-destination Telegram delivery
+  ledger. SQLite is only a local working cache. RETEST signals progress through
+  pending → entered → TP/SL/expired; CMP alerts remain confirmation-pending until
+  a later qualifying closed candle. TP1 before entry is missed, while TP1 after
+  entry protects the remainder. Events are idempotent across repeated ticks,
+  retries, and restarts; uncertain restart gaps become `ambiguous_gap` instead
+  of being guessed. A 30-minute REST reconciliation backs up the active-symbol
+  WebSocket feed.
 
 **Telegram secrets are env-only** (never put tokens in `config.yaml` or commit them):
 
@@ -85,8 +87,12 @@ export TELEGRAM_CHAT_ID="your-alert-group-id"
 export TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS="your-private-channel-id"
 export TELEGRAM_COMMAND_CHAT_IDS="your-private-chat-id"
 export TELEGRAM_TEST_KEY="a-long-random-admin-key"
-# Optional tracker overrides. Attach a Railway volume for deploy-safe history:
-export SIGNAL_TRACKER_DB_PATH="/data/perpetual_pro_signals.db"
+# Required for private/admin access to POST /scan and POST /analyze:
+export SCAN_API_KEY="a-separate-long-random-scan-key"
+# Required durable lifecycle database; apply migrations 001 then 002 first:
+export DATABASE_URL="your-supabase-session-pooler-url"
+# Optional local cache location. Production correctness does not depend on it:
+export SIGNAL_TRACKER_DB_PATH="./data/perpetual_pro_signals.db"
 export SIGNAL_TRACKER_RECONCILE_SECONDS="1800"
 # Optional outside Render; may be a base URL or the full webhook endpoint:
 export TELEGRAM_WEBHOOK_URL="https://your-api.example.com"
@@ -98,9 +104,9 @@ python scripts/run_scheduled_scans.py          # DST-aware market-session loop
 
 Streamlit: **Scan & analyze** with interactive closed-candle/volume/entry charts + **Backtest** tabs.
 
-The FastAPI deployment starts the scheduler in-process when
-`SCHEDULER_ENABLED=1` (the default in `render.yaml`). Check `GET /telegram/status`,
-`GET /health`, and `GET /signal-tracker/reliability`, or send a live
+The FastAPI deployment starts the scheduler in-process only when
+`SCHEDULER_ENABLED=1`. Keep it disabled during private verification. Check
+`GET /health` for liveness and `GET /ready` for dependency readiness, or send a live
 permission/delivery test with:
 
 ```bash
@@ -141,10 +147,9 @@ group/channel IDs commonly begin with `-100`.
 > On hosts that suspend free services, use an always-on instance or run
 > `scripts/run_scheduled_scans.py` in a dedicated worker/cron process.
 >
-> SQLite works without a volume, but Railway's container filesystem is
-> deployment-ephemeral. Mount a persistent volume (for example at `/data`) and
-> set `SIGNAL_TRACKER_DB_PATH=/data/perpetual_pro_signals.db` to preserve
-> lifecycle history across deployments.
+> Railway's filesystem is deployment-ephemeral. Supabase lifecycle migration
+> `migrations/002_durable_lifecycle.sql` is therefore required in production.
+> A Railway volume is optional because SQLite is no longer authoritative.
 
 ---
 
@@ -267,7 +272,14 @@ curl -s -X POST "http://127.0.0.1:8000/analyze" \
 Response JSON includes `ok`, `bias`, `confidence`, `execution`, `chart`, `trade_plan`,
 `factors`, `patterns`, `structure`, `news`, `scenarios`, `vision` (OCR/CV), and a disclaimer.
 
-Health: `GET /health`
+Liveness: `GET /health` · readiness: `GET /ready`
+
+`POST /scan`, `POST /analyze`, and `GET /admin/status` require either
+`X-Scan-API-Key: ...` or `Authorization: Bearer ...` in production. Keys are
+never accepted in query parameters. The endpoints enforce approved symbols,
+15m/1h/4h timeframes, bounded concurrency, rate limits, request timeouts, and a
+two-venue fallback budget. Authorized Telegram `/scan` commands use the private
+webhook command path and remain available independently.
 
 ### Streamlit web app
 

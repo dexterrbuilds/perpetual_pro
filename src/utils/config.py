@@ -243,8 +243,8 @@ class TelegramConfig:
 class SchedulerConfig:
     enabled: bool = False
     timezone: str = "Africa/Lagos"  # WAT
-    # Legacy/fallback WAT slots. Session-aware slots below take priority.
-    times: List[str] = field(default_factory=lambda: ["09:00", "15:00", "20:00"])
+    # Empty when DST-aware sessions are configured; no hidden legacy fallback.
+    times: List[str] = field(default_factory=list)
     sessions: List[Dict[str, str]] = field(
         default_factory=lambda: [
             {
@@ -289,6 +289,7 @@ class SignalTrackerConfig:
     reconcile_interval_seconds: int = 1800
     lifecycle_check_seconds: int = 15
     notification_retry_seconds: int = 60
+    durable_lifecycle_required: bool = False
     target_allocations: List[float] = field(
         default_factory=lambda: [0.25, 0.25, 0.25, 0.25]
     )
@@ -564,7 +565,7 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
         scheduler=SchedulerConfig(
             enabled=bool(sched.get("enabled", True)),
             timezone=str(sched.get("timezone", "Africa/Lagos") or "Africa/Lagos"),
-            times=list(sched.get("times", ["09:00", "15:00", "20:00"])),
+            times=list(sched.get("times") or []),
             sessions=[
                 {
                     "name": str(item.get("name") or "Trading session"),
@@ -635,6 +636,9 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
             notification_retry_seconds=max(
                 15,
                 int(tracker.get("notification_retry_seconds", 60)),
+            ),
+            durable_lifecycle_required=bool(
+                tracker.get("durable_lifecycle_required", False)
             ),
             target_allocations=[
                 max(0.0, float(value))

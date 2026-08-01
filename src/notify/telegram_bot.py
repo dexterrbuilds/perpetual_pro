@@ -346,6 +346,14 @@ def process_telegram_update(update: Dict[str, Any], config: AppConfig) -> Dict[s
         return {"ok": bool(delivery.get("ok")), "handled": True, "command": command}
 
     timeframe, symbols, error = parse_scan_command(text)
+    if not error and symbols:
+        approved = {
+            str(item or "").upper().strip()
+            for item in (config.scheduler.watchlist or [])
+        }
+        unsupported = sorted(set(symbols) - approved)
+        if unsupported:
+            error = "Unsupported symbol(s): " + ", ".join(unsupported)
     if error:
         delivery = send_telegram_message_detailed(
             f"⚠️ {html.escape(error)}\n\n{_command_help()}",

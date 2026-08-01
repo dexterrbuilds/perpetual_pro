@@ -79,14 +79,15 @@ class OutcomeRepository:
                 id, generated_at, symbol, exchange_id, timeframe, direction,
                 setup_type, setup_name, feature_schema_version, features,
                 decision, production_scores, production_eligible,
-                production_rank, shadow_model_version, shadow_scores, source
+                production_rank, shadow_model_version, shadow_scores, source,
+                is_directional_candidate
             ) values (
                 %(id)s, %(generated_at)s, %(symbol)s, %(exchange_id)s,
                 %(timeframe)s, %(direction)s, %(setup_type)s, %(setup_name)s,
                 %(feature_schema_version)s, %(features)s, %(decision)s,
                 %(production_scores)s, %(production_eligible)s,
                 %(production_rank)s, %(shadow_model_version)s,
-                %(shadow_scores)s, %(source)s
+                %(shadow_scores)s, %(source)s, %(is_directional_candidate)s
             )
             on conflict (id) do update set
                 features = excluded.features,
@@ -95,7 +96,8 @@ class OutcomeRepository:
                 production_eligible = excluded.production_eligible,
                 production_rank = excluded.production_rank,
                 shadow_model_version = excluded.shadow_model_version,
-                shadow_scores = excluded.shadow_scores
+                shadow_scores = excluded.shadow_scores,
+                is_directional_candidate = excluded.is_directional_candidate
         """
         payloads: List[Dict[str, Any]] = []
         for row in rows:
@@ -113,6 +115,9 @@ class OutcomeRepository:
                         else None
                     ),
                     "shadow_model_version": row.get("shadow_model_version"),
+                    "is_directional_candidate": bool(
+                        row.get("is_directional_candidate")
+                    ),
                 }
             )
         try:
@@ -458,6 +463,7 @@ class OutcomeRepository:
                         """
                         select c.id, c.generated_at, c.symbol, c.exchange_id,
                                c.timeframe, c.setup_type,
+                               c.direction, c.is_directional_candidate,
                                c.feature_schema_version, c.features,
                                c.production_scores, c.production_eligible,
                                o.valid_fill, o.technical_success,
@@ -472,6 +478,10 @@ class OutcomeRepository:
                         from public.signal_candidates c
                         join public.signal_outcomes o
                           on o.candidate_id = c.id
+                        where c.is_directional_candidate = true
+                          and c.direction in ('long', 'short')
+                          and o.terminal_status <> 'ambiguous_gap'
+                          and coalesce(o.ambiguity_policy, '') <> 'sparse_gap_unknown'
                         order by c.generated_at
                         """
                     )

@@ -74,10 +74,7 @@ scheduler:
       time: "15:20"          # Confirmation inside the high-volume 15:00–16:00 ET window
       timezone: "America/New_York"
   # WAT fallback used only if sessions is empty.
-  times:
-    - "09:00"
-    - "15:00"
-    - "20:00"
+  times: []
   # Deep-liquidity crypto-perpetual universe shared with Telegram scans.
   watchlist:
     - BTC
@@ -117,6 +114,8 @@ signal_tracker:
   reconcile_interval_seconds: 1800
   lifecycle_check_seconds: 15
   notification_retry_seconds: 60
+  # Production readiness depends on Supabase recovery, never Railway-local SQLite.
+  durable_lifecycle_required: true
   target_allocations: [0.25, 0.25, 0.25, 0.25]
 
 # Outcome-calibrated scoring. DATABASE_URL is read from the backend environment
