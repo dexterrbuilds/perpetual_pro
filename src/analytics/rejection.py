@@ -175,6 +175,20 @@ def _number(value: Any) -> Optional[float]:
     return number if isfinite(number) else None
 
 
+def _canonical_candidate_direction(row: Mapping[str, Any]) -> str:
+    """Return the publishable direction without promoting a shadow bias.
+
+    Flat rows may carry ``evaluated_direction`` so their shadow features remain
+    direction-aligned.  That field is diagnostic only and must not turn a
+    non-signal into a directional rejection candidate.
+    """
+    published = str(row.get("direction") or "").strip().lower()
+    if published:
+        return published if published in {"long", "short"} else "flat"
+    evaluated = str(row.get("evaluated_direction") or "").strip().lower()
+    return evaluated if evaluated in {"long", "short"} else "flat"
+
+
 def _minimum_gate(
     code: str,
     name: str,
@@ -449,9 +463,7 @@ def evaluate_alert_gates(
 ) -> GateEvaluation:
     """Mirror the scheduled/manual alert filter without new authority."""
     stage = "alert_filter"
-    direction = str(
-        row.get("evaluated_direction") or row.get("direction") or ""
-    ).lower()
+    direction = _canonical_candidate_direction(row)
     directional = direction in {"long", "short"}
     market_ok = row.get("market_quality_ok") is not False
     data_ok = row.get("data_quality_ok") is not False
@@ -634,11 +646,7 @@ def candidate_analytics_snapshot(
     execution_components = dict(row.get("execution_components") or {})
     targets = list(row.get("take_profits") or [])
     target_feasibility = list(row.get("target_feasibility") or [])
-    direction = str(
-        row.get("evaluated_direction") or row.get("direction") or "flat"
-    ).lower()
-    if direction not in {"long", "short"}:
-        direction = "flat"
+    direction = _canonical_candidate_direction(row)
     return {
         "scan_id": scan_id,
         "candidate_id": candidate_id,
@@ -792,7 +800,15 @@ def aggregate_rejection_rows(
         for gate in (row.get("gate_evaluation") or {}).get("gates") or []:
             if not gate.get("passed"):
                 failures_by_stage[str(gate.get("stage") or "unknown")] += 1
-    rejected = [row for row in candidates if not row.get("eligible")]
+    # A flat row is useful in distributions but is never a near-trade.  Keep it
+    # out of the closest-candidate list so operators cannot mistake shadow bias
+    # for an actionable direction.
+    rejected = [
+        row
+        for row in candidates
+        if not row.get("eligible")
+        and str(row.get("direction") or "").lower() in {"long", "short"}
+    ]
     nearest = sorted(
         rejected,
         key=lambda row: (

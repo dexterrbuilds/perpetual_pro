@@ -118,6 +118,51 @@ def test_flat_candidate_is_non_directional_and_not_a_near_trade():
     assert decision.proximity_label == "NON_DIRECTIONAL"
 
 
+def test_flat_publish_direction_is_not_promoted_by_shadow_evaluated_direction():
+    row = _alert_row(direction="flat", evaluated_direction="long")
+    decision = _alert(row)
+    snapshot = candidate_analytics_snapshot(
+        row,
+        decision.to_dict(),
+        scan_id="scan-flat",
+        candidate_id="candidate-flat",
+        analyzed_at="2026-08-02T00:00:00Z",
+    )
+    assert decision.primary_rejection_reason == "FLAT_DIRECTION"
+    assert decision.proximity_label == "NON_DIRECTIONAL"
+    assert snapshot["direction"] == "flat"
+
+
+def test_flat_rows_are_counted_but_excluded_from_nearest_candidates():
+    directional = {
+        "candidate_id": "directional",
+        "symbol": "BTC",
+        "direction": "long",
+        "eligible": False,
+        "distance_to_eligibility": 0.1,
+        "proximity_label": "NEAR_PASS",
+        "primary_rejection_reason": "OVERALL_QUALITY_BELOW_MINIMUM",
+        "all_rejection_reasons": ["OVERALL_QUALITY_BELOW_MINIMUM"],
+        "gate_evaluation": {"failed_hard_gates": 1, "gates": []},
+    }
+    flat = {
+        **directional,
+        "candidate_id": "flat",
+        "symbol": "ETH",
+        "direction": "flat",
+        "distance_to_eligibility": 0.0,
+        "proximity_label": "NON_DIRECTIONAL",
+        "primary_rejection_reason": "FLAT_DIRECTION",
+        "all_rejection_reasons": ["FLAT_DIRECTION"],
+    }
+    summary = aggregate_rejection_rows([], [flat, directional])
+    assert summary["directional_candidates"] == 1
+    assert summary["direction_distribution"]["flat"] == 1
+    assert [row["candidate_id"] for row in summary["closest_rejected_candidates"]] == [
+        "directional"
+    ]
+
+
 @pytest.mark.parametrize("direction", ["long", "short"])
 def test_gate_evaluation_is_long_short_symmetric(direction):
     decision = _analysis(direction=direction)
