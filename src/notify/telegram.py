@@ -77,6 +77,25 @@ def get_telegram_alert_chat_ids(
     return destinations
 
 
+def get_telegram_private_operator_chat_ids() -> List[str]:
+    """Return explicit private operator destinations, never public fallbacks.
+
+    Scheduled empty and operational reports must not fall back to
+    ``TELEGRAM_CHAT_ID`` because that variable is the public signal channel in
+    production. Private operator routing is intentionally opt-in through
+    ``TELEGRAM_COMMAND_CHAT_IDS``.
+    """
+    sources = [os.getenv("TELEGRAM_COMMAND_CHAT_IDS") or ""]
+    destinations: List[str] = []
+    for source in sources:
+        for candidate in str(source or "").replace(";", ",").split(","):
+            for value in candidate.split():
+                chat_id = value.strip()
+                if chat_id and chat_id not in destinations:
+                    destinations.append(chat_id)
+    return destinations
+
+
 def _response_detail(response: requests.Response) -> Dict[str, Any]:
     """Extract Telegram's safe error fields without logging request URLs/tokens."""
     try:

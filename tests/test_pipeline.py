@@ -13,6 +13,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.analysis.confluence import ConfluenceEngine
+from src.analysis import confluence as confluence_module
+from src.analysis.llm import NarrativeLLM
 from src.analysis.indicators import compute_indicators
 from src.data.exchange import MarketSnapshot
 from src.data.multi_tf import MultiTimeframeData
@@ -165,7 +167,7 @@ def test_full_confluence_pipeline(tmp_path):
     assert "position_simulation" in payload
 
 
-def test_stale_confirmation_timeframe_blocks_live_signal():
+def test_stale_confirmation_timeframe_blocks_live_signal(monkeypatch):
     cfg = load_config(ROOT / "config.yaml")
     primary = _ohlcv(320, drift=0.12)
     h1 = primary.resample("1h").agg(
@@ -191,8 +193,63 @@ def test_stale_confirmation_timeframe_blocks_live_signal():
         },
     )
 
-    result = ConfluenceEngine(cfg).analyze(mtf, use_llm=False)
+    monkeypatch.setattr(
+        NarrativeLLM,
+        "generate",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("deterministic reject must not call the LLM")
+        ),
+    )
+    result = ConfluenceEngine(cfg).analyze(mtf, use_llm=True)
 
     assert result.meta["primary_data_quality_ok"] is False
     assert result.confidence <= 45.0
     assert result.meta["signal_eligible"] is False
+    assert result.meta["llm_invocation_status"] == "skipped_deterministic_reject"
+
+
+def test_llm_rate_limit_cannot_change_deterministic_result(monkeypatch):
+    cfg = load_config(ROOT / "config.yaml")
+    primary = _ohlcv(320, drift=0.12)
+    h1 = primary.resample("1h").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    ).dropna()
+    h4 = primary.resample("4h").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    ).dropna()
+    mtf = MultiTimeframeData(
+        symbol="BTC/USDT:USDT",
+        exchange_id="okx",
+        primary_tf="15m",
+        frames={"15m": primary, "1h": h1, "4h": h4},
+        snapshot=MarketSnapshot(
+            symbol="BTC/USDT:USDT",
+            exchange_id="okx",
+            last=float(primary["close"].iloc[-1]),
+        ),
+    )
+    baseline = ConfluenceEngine(cfg).analyze(mtf, use_llm=False)
+    calls = []
+    monkeypatch.setattr(
+        confluence_module,
+        "deterministic_narrative_eligible",
+        lambda **kwargs: True,
+    )
+
+    def rate_limited(*args, **kwargs):
+        calls.append(True)
+        raise RuntimeError("Groq 429")
+
+    monkeypatch.setattr(NarrativeLLM, "generate", rate_limited)
+    limited = ConfluenceEngine(cfg).analyze(mtf, use_llm=True)
+
+    assert calls == [True]
+    assert limited.meta["llm_invocation_status"] == "fallback:RuntimeError"
+    assert limited.confidence == baseline.confidence
+    assert limited.rank_score == baseline.rank_score
+    assert limited.direction == baseline.direction
+    assert limited.meta["signal_eligible"] == baseline.meta["signal_eligible"]
+    assert limited.trade_plan.entry_low == baseline.trade_plan.entry_low
+    assert limited.trade_plan.entry_high == baseline.trade_plan.entry_high
+    assert limited.trade_plan.stop_loss == baseline.trade_plan.stop_loss
+    assert limited.trade_plan.take_profits == baseline.trade_plan.take_profits

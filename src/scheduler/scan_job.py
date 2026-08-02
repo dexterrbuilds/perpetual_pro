@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 from threading import Event, Lock, Thread
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -17,11 +19,14 @@ from src.notify.telegram import (
     format_signal_photo_caption,
     format_prop_scan_report,
     get_telegram_alert_chat_ids,
+    get_telegram_private_operator_chat_ids,
     is_telegram_ready,
     send_telegram_message_detailed,
     send_telegram_photo_detailed,
 )
 from src.report.charts import render_signal_chart_png
+from src.scheduler.run_repository import SchedulerRunRepository
+from src.tracking.durable_repository import destination_hash
 from src.tracking.signal_tracker import register_delivered_signals
 from src.utils.config import (
     DEFAULT_CRYPTO_WATCHLIST,
@@ -49,6 +54,7 @@ _SCHEDULER_STATUS: Dict[str, Any] = {
     "last_error": None,
     "last_delivery_status": None,
     "last_alert_count": None,
+    "last_run": None,
 }
 _BACKGROUND_THREAD: Optional[Thread] = None
 _BACKGROUND_STOP: Optional[Event] = None
@@ -73,6 +79,43 @@ def get_scheduler_status() -> Dict[str, Any]:
         _BACKGROUND_THREAD and _BACKGROUND_THREAD.is_alive()
     )
     return status
+
+
+def _durable_run_id(slot_label: str, scheduled_for: Optional[str]) -> str:
+    if scheduled_for:
+        material = f"{slot_label}|{scheduled_for}"
+        return "sched_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+    return "run_" + uuid4().hex
+
+
+def _scheduler_run_source(
+    slot_label: str,
+    telegram_chat_ids: Optional[List[str]],
+    scheduled_for: Optional[str],
+) -> str:
+    if scheduled_for:
+        return "scheduled"
+    if telegram_chat_ids is not None or "telegram" in str(slot_label or "").lower():
+        return "telegram"
+    return "manual"
+
+
+def _compact_run_summary(outcome: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "symbols_analyzed": int(outcome.get("analyzed_count") or 0),
+        "symbol_failures": int(outcome.get("analysis_failure_count") or 0),
+        "eligible_candidates": int(outcome.get("alert_count") or 0),
+        "revalidated_candidates": int(outcome.get("alert_count") or 0),
+        "rejected_candidates": int(outcome.get("rejected_count") or 0),
+        "scan_duration_seconds": outcome.get("scan_duration_seconds"),
+        "max_ticker_age_seconds": outcome.get("max_ticker_age_seconds"),
+        "max_orderbook_age_seconds": outcome.get("max_orderbook_age_seconds"),
+        "result_code": outcome.get("result_code"),
+        "telegram_delivery_status": outcome.get("telegram_delivery_status"),
+        "main_rejection_reasons": dict(outcome.get("main_rejection_reasons") or {}),
+        "llm_invocation_counts": dict(outcome.get("llm_invocation_counts") or {}),
+        "public_empty_suppressed": bool(outcome.get("public_empty_suppressed")),
+    }
 
 
 def _parse_hhmm(s: str) -> Tuple[int, int]:
@@ -388,9 +431,12 @@ def _run_scheduled_scan_once_unlocked(
     timeframe: Optional[str] = None,
     notify_on_empty: Optional[bool] = None,
     telegram_chat_ids: Optional[List[str]] = None,
+    run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one watchlist scan and optionally Telegram high-conf results."""
     cfg = config or load_config()
+    scan_started_monotonic = time.monotonic()
+    run_id = str(run_id or _durable_run_id(slot_label, None))
     started_at = datetime.now(ZoneInfo("UTC")).isoformat()
     watchlist = list(symbols or cfg.scheduler.watchlist or []) or list(DEFAULT_WATCHLIST)
     req = AnalyzeRequest(
@@ -402,7 +448,8 @@ def _run_scheduled_scan_once_unlocked(
         use_llm=True,
     )
     logger.info(
-        "Scheduled scan triggered: slot={} symbols={} timeframe={} exchange={} send={}",
+        "Scheduled scan triggered: run={} slot={} symbols={} timeframe={} exchange={} send={}",
+        run_id,
         slot_label or "manual",
         len(watchlist),
         req.timeframe,
@@ -526,11 +573,22 @@ def _run_scheduled_scan_once_unlocked(
         )
     sent = False
     delivery: Optional[Dict[str, Any]] = None
+    delivery_audit: List[Dict[str, Any]] = []
     tracking: Optional[Dict[str, Any]] = None
     delivery_status = "not_requested"
+    # Manual commands keep their exclusive per-request destination. Recurring
+    # scans send eligible signals to public alert channels, while no-setup and
+    # operational reports are restricted to explicit private operator chats.
     destinations = get_telegram_alert_chat_ids(telegram_chat_ids)
+    report_destinations = (
+        destinations
+        if manual_delivery
+        else get_telegram_private_operator_chat_ids()
+    )
     # Credentials from env only (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — never YAML
-    tg_ready = is_telegram_ready(cfg) and bool(destinations)
+    tg_ready = is_telegram_ready(cfg) and bool(
+        destinations or report_destinations
+    )
     if send and tg_ready:
         if filtered:
             rendered: List[Dict[str, Any]] = []
@@ -592,6 +650,17 @@ def _run_scheduled_scan_once_unlocked(
                         )
                         item["symbol"] = symbol
                         item["mode"] = "photo"
+                        digest = destination_hash(destination)
+                        delivery_audit.append(
+                            {
+                                "idempotency_key": f"{run_id}:{digest}:signal_photo:{symbol}",
+                                "destination_hash": digest,
+                                "delivery_type": f"signal_photo:{symbol}",
+                                "ok": bool(item.get("ok")),
+                                "message_id": item.get("message_id"),
+                                "error": item.get("error"),
+                            }
+                        )
                     destination_items.append(item)
                     chart_items.append(item)
                     if item.get("ok"):
@@ -608,6 +677,17 @@ def _run_scheduled_scan_once_unlocked(
                         parse_mode=cfg.telegram.parse_mode or "HTML",
                     )
                     fallback_items.append(fallback)
+                    digest = destination_hash(destination)
+                    delivery_audit.append(
+                        {
+                            "idempotency_key": f"{run_id}:{digest}:signal_text_fallback",
+                            "destination_hash": digest,
+                            "delivery_type": "signal_text_fallback",
+                            "ok": bool(fallback.get("ok")),
+                            "message_id": fallback.get("message_id"),
+                            "error": fallback.get("error"),
+                        }
+                    )
                     if fallback.get("ok"):
                         for signal_destinations in tracking_destinations:
                             if destination not in signal_destinations:
@@ -707,14 +787,26 @@ def _run_scheduled_scan_once_unlocked(
             if notify_on_empty is not None
             else cfg.telegram.notify_on_empty
         ):
-            destination_results = [
-                send_telegram_message_detailed(
+            destination_results = []
+            report_type = "scan_failure" if scan_failed else "no_quality_report"
+            for destination in report_destinations:
+                item = send_telegram_message_detailed(
                     report,
                     chat_id=destination,
                     parse_mode=cfg.telegram.parse_mode or "HTML",
                 )
-                for destination in destinations
-            ]
+                destination_results.append(item)
+                digest = destination_hash(destination)
+                delivery_audit.append(
+                    {
+                        "idempotency_key": f"{run_id}:{digest}:{report_type}",
+                        "destination_hash": digest,
+                        "delivery_type": report_type,
+                        "ok": bool(item.get("ok")),
+                        "message_id": item.get("message_id"),
+                        "error": item.get("error"),
+                    }
+                )
             sent_count = sum(1 for item in destination_results if item.get("ok"))
             sent = sent_count > 0
             delivery = (
@@ -740,13 +832,26 @@ def _run_scheduled_scan_once_unlocked(
                     sent_count,
                     len(destination_results),
                 )
-            else:
+            elif report_destinations:
                 delivery_status = "failed"
                 logger.error(
                     "Scheduled empty Telegram report failed: slot={} error={} description={}",
                     slot_label or "scan",
                     delivery.get("error"),
                     delivery.get("description"),
+                )
+            else:
+                delivery_status = (
+                    "skipped_private_scan_failure_no_operator"
+                    if scan_failed
+                    else "skipped_public_empty_report"
+                )
+                logger.info(
+                    "Scheduled report persisted without Telegram delivery: "
+                    "slot={} result={} public_empty_suppressed=true "
+                    "private_operator_configured=false",
+                    slot_label or "scan",
+                    "scan_unavailable" if scan_failed else "no_quality_setup",
                 )
         else:
             delivery_status = "skipped_no_actionable_signals"
@@ -764,26 +869,64 @@ def _run_scheduled_scan_once_unlocked(
     elif not send:
         delivery_status = "disabled_for_run"
     completed_at = datetime.now(ZoneInfo("UTC")).isoformat()
+    scan_duration_seconds = round(time.monotonic() - scan_started_monotonic, 3)
+    ticker_ages = [
+        value
+        for value in (_safe_float_or_none(row.get("ticker_age_seconds")) for row in ranked)
+        if value is not None
+    ]
+    orderbook_ages = [
+        value
+        for value in (_safe_float_or_none(row.get("orderbook_age_seconds")) for row in ranked)
+        if value is not None
+    ]
+    rejection_counts: Dict[str, int] = {}
+    llm_counts: Dict[str, int] = {}
+    for row in ranked:
+        status = str(row.get("llm_invocation_status") or "unknown")
+        llm_counts[status] = llm_counts.get(status, 0) + 1
+        reasons = list(row.get("rejection_reasons") or []) + list(
+            row.get("delivery_rejection_reasons") or []
+        )
+        for reason in reasons:
+            code = str(reason.get("code") if isinstance(reason, dict) else reason)
+            if code:
+                rejection_counts[code] = rejection_counts.get(code, 0) + 1
+    result_code = (
+        "scan_unavailable"
+        if scan_failed
+        else ("eligible_signals" if filtered else "no_quality_setup")
+    )
+    public_empty_suppressed = bool(
+        not manual_delivery and not filtered and not scan_failed
+    )
     logger.info(
-        "Scheduled scan completed: slot={} scanned={} ranked={} actionable={} "
-        "delivery_status={}",
+        "Scheduled scan completed: run={} slot={} scanned={} ranked={} actionable={} "
+        "delivery_status={} duration_seconds={:.3f}",
+        run_id,
         slot_label or "scan",
         len(watchlist),
         len(ranked),
         len(filtered),
         delivery_status,
+        scan_duration_seconds,
     )
     return {
         "ok": bool(result.get("ok")),
+        "run_id": run_id,
         "started_at": started_at,
         "completed_at": completed_at,
         "scanned": len(watchlist),
+        "symbols_requested": list(watchlist),
+        "analyzed_count": int(result.get("analyzed_count") or len(ranked)),
+        "analysis_failure_count": len(result.get("analysis_failures") or []),
         "ranked_count": len(ranked),
         "alert_count": len(filtered),
         "duplicate_signal_count": len(suppressed_duplicates),
         "portfolio_risk_excluded_count": len(portfolio_risk_excluded),
         "pre_delivery_rejected_count": len(pre_delivery_rejected),
         "pre_delivery_rejected": pre_delivery_rejected,
+        "rejected_count": max(0, len(ranked) - len(filtered)),
         "filtered": filtered,
         "report": report,
         "telegram_sent": sent,
@@ -791,6 +934,14 @@ def _run_scheduled_scan_once_unlocked(
         "telegram_delivery_status": delivery_status,
         "telegram_delivery": delivery,
         "signal_tracking": tracking,
+        "delivery_audit": delivery_audit,
+        "result_code": result_code,
+        "scan_duration_seconds": scan_duration_seconds,
+        "max_ticker_age_seconds": max(ticker_ages) if ticker_ages else None,
+        "max_orderbook_age_seconds": max(orderbook_ages) if orderbook_ages else None,
+        "main_rejection_reasons": rejection_counts,
+        "llm_invocation_counts": llm_counts,
+        "public_empty_suppressed": public_empty_suppressed,
         "slot_label": slot_label,
     }
 
@@ -809,8 +960,11 @@ def run_scheduled_scan_once(
     timeframe: Optional[str] = None,
     notify_on_empty: Optional[bool] = None,
     telegram_chat_ids: Optional[List[str]] = None,
+    scheduled_for: Optional[str] = None,
+    run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one scan without overlapping another scheduler, API, or bot request."""
+    cfg = config or load_config()
     started_at = datetime.now(ZoneInfo("UTC")).isoformat()
     if not _SCAN_RUN_LOCK.acquire(blocking=False):
         logger.warning("Scan request skipped because another scan is already running")
@@ -831,15 +985,109 @@ def run_scheduled_scan_once(
             "slot_label": slot_label,
         }
     try:
-        return _run_scheduled_scan_once_unlocked(
-            config,
-            slot_label=slot_label,
-            send=send,
-            symbols=symbols,
-            timeframe=timeframe,
-            notify_on_empty=notify_on_empty,
-            telegram_chat_ids=telegram_chat_ids,
+        resolved_run_id = str(
+            run_id or _durable_run_id(slot_label, scheduled_for)
         )
+        source = _scheduler_run_source(
+            slot_label,
+            telegram_chat_ids,
+            scheduled_for,
+        )
+        watchlist = list(symbols or cfg.scheduler.watchlist or []) or list(
+            DEFAULT_WATCHLIST
+        )
+        repository = SchedulerRunRepository(cfg.outcome_scoring.database_url)
+        claimed = repository.claim(
+            run_id=resolved_run_id,
+            source=source,
+            slot_label=slot_label or "scan",
+            scheduled_for=scheduled_for,
+            symbols_requested=len(watchlist),
+        )
+        if claimed is False:
+            logger.warning(
+                "Duplicate durable scheduler run suppressed: run={} slot={}",
+                resolved_run_id,
+                slot_label or "scan",
+            )
+            return {
+                "ok": False,
+                "error": "duplicate_scheduler_run",
+                "run_id": resolved_run_id,
+                "started_at": started_at,
+                "completed_at": started_at,
+                "scanned": 0,
+                "ranked_count": 0,
+                "alert_count": 0,
+                "filtered": [],
+                "report": "",
+                "telegram_sent": False,
+                "telegram_ready": is_telegram_ready(cfg),
+                "telegram_delivery_status": "duplicate_run_suppressed",
+                "telegram_delivery": None,
+                "slot_label": slot_label,
+            }
+        if source == "scheduled" and repository.enabled and claimed is None:
+            logger.error(
+                "Scheduled run aborted because durable run claim is unavailable: run={}",
+                resolved_run_id,
+            )
+            return {
+                "ok": False,
+                "error": "scheduler_run_persistence_unavailable",
+                "run_id": resolved_run_id,
+                "started_at": started_at,
+                "completed_at": started_at,
+                "scanned": 0,
+                "ranked_count": 0,
+                "alert_count": 0,
+                "filtered": [],
+                "report": "",
+                "telegram_sent": False,
+                "telegram_ready": is_telegram_ready(cfg),
+                "telegram_delivery_status": "persistence_unavailable",
+                "telegram_delivery": None,
+                "slot_label": slot_label,
+            }
+        try:
+            outcome = _run_scheduled_scan_once_unlocked(
+                cfg,
+                slot_label=slot_label,
+                send=send,
+                symbols=symbols,
+                timeframe=timeframe,
+                notify_on_empty=notify_on_empty,
+                telegram_chat_ids=telegram_chat_ids,
+                run_id=resolved_run_id,
+            )
+        except Exception:
+            repository.finish(
+                run_id=resolved_run_id,
+                status="failed",
+                summary={"result_code": "unhandled_exception"},
+            )
+            raise
+        persisted = repository.finish(
+            run_id=resolved_run_id,
+            status="completed" if outcome.get("ok") else "failed",
+            summary=_compact_run_summary(outcome),
+            deliveries=list(outcome.get("delivery_audit") or []),
+        )
+        outcome["run_persisted"] = bool(persisted) if repository.enabled else None
+        last_run = {
+            "run_id": resolved_run_id,
+            "status": "completed" if outcome.get("ok") else "failed",
+            "result_code": outcome.get("result_code"),
+            "started_at": outcome.get("started_at"),
+            "completed_at": outcome.get("completed_at"),
+            "symbols_requested": outcome.get("scanned"),
+            "symbols_analyzed": outcome.get("analyzed_count"),
+            "alert_count": outcome.get("alert_count"),
+            "delivery_status": outcome.get("telegram_delivery_status"),
+            "persisted": outcome.get("run_persisted"),
+        }
+        _status_update(last_run=last_run)
+        return outcome
     finally:
         _SCAN_RUN_LOCK.release()
 
@@ -937,7 +1185,12 @@ def run_scheduler_loop(
             triggered_at = datetime.now(ZoneInfo("UTC")).isoformat()
             _status_update(last_triggered_at=triggered_at, last_error=None)
             try:
-                outcome = run_scheduled_scan_once(cfg, slot_label=label, send=True)
+                outcome = run_scheduled_scan_once(
+                    cfg,
+                    slot_label=label,
+                    send=True,
+                    scheduled_for=nxt.astimezone(ZoneInfo("UTC")).isoformat(),
+                )
                 _status_update(
                     last_completed_at=outcome.get("completed_at"),
                     last_delivery_status=outcome.get("telegram_delivery_status"),
@@ -962,6 +1215,11 @@ def start_scheduler_background(config: Optional[AppConfig] = None) -> bool:
     """Start one daemon scheduler thread for the API process."""
     global _BACKGROUND_THREAD, _BACKGROUND_STOP
     cfg = config or load_config()
+    latest_run = SchedulerRunRepository(
+        cfg.outcome_scoring.database_url
+    ).latest()
+    if latest_run:
+        _status_update(last_run=latest_run)
     if not cfg.scheduler.enabled:
         _status_update(
             enabled=False,

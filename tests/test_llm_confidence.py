@@ -14,6 +14,8 @@ from src.analysis.llm import (
     combined_rank_score,
     heuristic_llm_confidence,
 )
+from src.analysis.confluence import deterministic_narrative_eligible
+from src.analysis.execution import ExecutionProfile
 
 
 def test_heuristic_flat_is_low_priority():
@@ -120,3 +122,54 @@ def test_from_parsed_caps_flat_confidence():
         model="unit",
     )
     assert narrative.llm_confidence <= 25
+
+
+def _execution(**overrides):
+    values = {
+        "direction": "long",
+        "status": "wait_retest",
+        "score": 80.0,
+        "execution_quality": 80.0,
+        "immediate_sl_risk": 20.0,
+        "market_quality_ok": True,
+    }
+    values.update(overrides)
+    return ExecutionProfile(**values)
+
+
+def test_llm_gate_requires_complete_deterministic_eligibility():
+    base = {
+        "use_llm": True,
+        "direction": "long",
+        "technical_quality": 84.0,
+        "overall_quality": 84.0,
+        "confluence_total": 0.4,
+        "execution": _execution(),
+        "data_quality_ok": True,
+        "prop_safe": True,
+        "has_feasible_target": True,
+        "confidence_floor": 80.0,
+        "score_floor": 0.2,
+        "execution_floor": 72.0,
+        "max_immediate_sl_risk": 32.0,
+    }
+    assert deterministic_narrative_eligible(**base) is True
+
+    rejected = [
+        {"direction": "flat"},
+        {"technical_quality": 79.9},
+        {"overall_quality": 79.9},
+        {"confluence_total": 0.19},
+        {"execution": _execution(score=71.9, execution_quality=71.9)},
+        {"execution": _execution(status="avoid_chase")},
+        {"execution": _execution(immediate_sl_risk=32.1)},
+        {"execution": _execution(market_quality_ok=False)},
+        {"execution": _execution(hard_failures=["TARGET_BLOCKED"])},
+        {"data_quality_ok": False},
+        {"prop_safe": False},
+        {"has_feasible_target": False},
+        {"use_llm": False},
+    ]
+    for change in rejected:
+        candidate = {**base, **change}
+        assert deterministic_narrative_eligible(**candidate) is False

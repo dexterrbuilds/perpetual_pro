@@ -801,6 +801,10 @@ def scan_symbols(
                     "llm_confidence": round(float(analysis.llm_confidence), 1),
                     "llm_confidence_reason": analysis.llm_confidence_reason,
                     "llm_confidence_detail": getattr(analysis, "llm_confidence_detail", {}) or {},
+                    "llm_invocation_status": analysis.meta.get(
+                        "llm_invocation_status", "unknown"
+                    ),
+                    "llm_provider": analysis.meta.get("llm_provider", "none"),
                     "rank_score": round(scan_rank_score, 2),
                     "live_rank_score": round(live_rank_score, 2),
                     "rank_policy_version": analysis.meta.get("rank_policy_version"),

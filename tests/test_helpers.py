@@ -279,4 +279,5 @@ def test_liquid_crypto_watchlist_is_consistent():
 
     assert DEFAULT_CRYPTO_WATCHLIST == expected
     assert SchedulerConfig().watchlist == expected
-    assert cfg.scheduler.watchlist == expected
+    assert cfg.scheduler.watchlist == [symbol for symbol in expected if symbol != "XMR"]
+    assert "XMR" in DEFAULT_CRYPTO_WATCHLIST  # generic venue support is preserved

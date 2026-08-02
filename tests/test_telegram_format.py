@@ -684,7 +684,8 @@ def test_scheduled_scan_sends_no_quality_setup_message(monkeypatch):
     from src.scheduler import scan_job
 
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "123456")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100-public")
+    monkeypatch.setenv("TELEGRAM_COMMAND_CHAT_IDS", "123456")
     cfg = load_config(ROOT / "config.yaml")
     assert cfg.telegram.notify_on_empty is True
     monkeypatch.setattr(
@@ -696,7 +697,7 @@ def test_scheduled_scan_sends_no_quality_setup_message(monkeypatch):
     monkeypatch.setattr(
         scan_job,
         "send_telegram_message_detailed",
-        lambda text, **kwargs: messages.append(text)
+        lambda text, **kwargs: messages.append((text, kwargs.get("chat_id")))
         or {"ok": True, "message_id": 55},
     )
 
@@ -706,9 +707,127 @@ def test_scheduled_scan_sends_no_quality_setup_message(monkeypatch):
         send=True,
     )
     assert messages
-    assert "NO QUALITY SETUP" in messages[0]
+    assert "NO QUALITY SETUP" in messages[0][0]
+    assert messages[0][1] == "123456"
+    assert messages[0][1] != "-100-public"
     assert result["telegram_sent"] is True
     assert result["telegram_delivery_status"] == "sent_empty_report"
+
+
+def test_scheduled_scan_suppresses_public_empty_without_private_operator(monkeypatch):
+    from src.scheduler import scan_job
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100-public")
+    monkeypatch.delenv("TELEGRAM_COMMAND_CHAT_IDS", raising=False)
+    cfg = load_config(ROOT / "config.yaml")
+    monkeypatch.setattr(
+        scan_job,
+        "scan_symbols",
+        lambda *a, **k: {"ok": True, "ranked_results": []},
+    )
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_message_detailed",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("public empty report must stay silent")
+        ),
+    )
+
+    result = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label="London confirmation",
+        send=True,
+    )
+
+    assert result["telegram_sent"] is False
+    assert result["telegram_delivery_status"] == "skipped_public_empty_report"
+
+
+def test_scheduled_scan_failure_is_private_operator_only(monkeypatch):
+    from src.scheduler import scan_job
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100-public")
+    monkeypatch.setenv("TELEGRAM_COMMAND_CHAT_IDS", "654321")
+    cfg = load_config(ROOT / "config.yaml")
+    monkeypatch.setattr(
+        scan_job,
+        "scan_symbols",
+        lambda *a, **k: {
+            "ok": False,
+            "error": "scan_analysis_unavailable",
+            "ranked_results": [],
+        },
+    )
+    destinations = []
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_message_detailed",
+        lambda text, **kwargs: destinations.append(kwargs.get("chat_id"))
+        or {"ok": True, "message_id": 56},
+    )
+
+    result = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label="New York confirmation",
+        send=True,
+    )
+
+    assert destinations == ["654321"]
+    assert "-100-public" not in destinations
+    assert result["telegram_delivery_status"] == "sent_scan_failure"
+
+
+def test_recurring_run_claim_is_durable_and_duplicate_is_suppressed(monkeypatch):
+    from src.scheduler import scan_job
+
+    cfg = load_config(ROOT / "config.yaml")
+    claims = []
+    finishes = []
+
+    class FakeRepository:
+        enabled = True
+
+        def __init__(self, database_url):
+            pass
+
+        def claim(self, **kwargs):
+            claims.append(kwargs)
+            return len(claims) == 1
+
+        def finish(self, **kwargs):
+            finishes.append(kwargs)
+            return True
+
+    monkeypatch.setattr(scan_job, "SchedulerRunRepository", FakeRepository)
+    monkeypatch.setattr(
+        scan_job,
+        "scan_symbols",
+        lambda *a, **k: {"ok": True, "ranked_results": [], "analyzed_count": 21},
+    )
+    monkeypatch.setattr(scan_job, "is_telegram_ready", lambda config: False)
+    scheduled_for = "2026-08-02T12:50:00+00:00"
+
+    first = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label="New York macro follow-through",
+        send=False,
+        scheduled_for=scheduled_for,
+    )
+    duplicate = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label="New York macro follow-through",
+        send=False,
+        scheduled_for=scheduled_for,
+    )
+
+    assert first["run_persisted"] is True
+    assert first["run_id"].startswith("sched_")
+    assert finishes[0]["run_id"] == first["run_id"]
+    assert duplicate["run_id"] == first["run_id"]
+    assert duplicate["error"] == "duplicate_scheduler_run"
+    assert duplicate["telegram_delivery_status"] == "duplicate_run_suppressed"
 
 
 def test_scheduled_scan_sends_chart_alert_without_text_fallback(monkeypatch):

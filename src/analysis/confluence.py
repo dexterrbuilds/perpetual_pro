@@ -98,6 +98,46 @@ class FullAnalysis:
         ]
 
 
+def deterministic_narrative_eligible(
+    *,
+    use_llm: bool,
+    direction: str,
+    technical_quality: float,
+    overall_quality: float,
+    confluence_total: float,
+    execution: ExecutionProfile,
+    data_quality_ok: bool,
+    prop_safe: bool,
+    has_feasible_target: bool,
+    confidence_floor: float,
+    score_floor: float,
+    execution_floor: float,
+    max_immediate_sl_risk: float,
+) -> bool:
+    """Whether a deterministic signal merits optional narrative enrichment.
+
+    This is deliberately the production signal gate plus explicit hard-failure
+    and target checks. It cannot alter any deterministic score or eligibility;
+    it only prevents external LLM work for candidates already rejected by the
+    trading engine.
+    """
+    return bool(
+        use_llm
+        and direction in ("long", "short")
+        and technical_quality >= confidence_floor
+        and overall_quality >= confidence_floor
+        and abs(confluence_total) >= score_floor
+        and execution.score >= execution_floor
+        and execution.status in ("confirmation_pending", "wait_retest")
+        and execution.immediate_sl_risk <= max_immediate_sl_risk
+        and execution.market_quality_ok
+        and data_quality_ok
+        and prop_safe
+        and has_feasible_target
+        and not execution.hard_failures
+    )
+
+
 class ConfluenceEngine:
     """
     Orchestrates indicator, structure, pattern, derivatives, MTF, and news
@@ -415,22 +455,51 @@ class ConfluenceEngine:
 
         funding_pct = (funding * 100.0) if funding is not None else None
 
-        # LLM narrative (Groq / Gemini / local fallback) — includes play-out confidence
-        llm_candidate = bool(
-            use_llm
-            and direction in ("long", "short")
-            and calibrated_conf
-            >= float(
-                getattr(
-                    self.config.analysis,
-                    "directional_confidence_threshold",
-                    68.0,
-                )
+        # Resolve deterministic production gates before optional narrative work.
+        confidence_floor = float(
+            getattr(self.config.analysis, "directional_confidence_threshold", 68.0)
+        )
+        score_floor = float(
+            getattr(self.config.analysis, "directional_score_threshold", 0.20)
+        )
+        execution_floor = float(
+            getattr(self.config.analysis, "execution_min_score", 72.0)
+        )
+        legacy_execution_floor = float(
+            getattr(self.config.analysis, "legacy_execution_min_score", 65.0)
+        )
+        max_immediate_sl_risk = float(
+            getattr(self.config.analysis, "max_immediate_sl_risk", 32.0)
+        )
+        plan_prop_safe_before_confidence_gate = bool(
+            getattr(plan, "prop_safe", True)
+        )
+
+        # LLM narrative is optional and narrative-only. External providers are
+        # contacted only after every deterministic eligibility and safety gate.
+        llm_candidate = deterministic_narrative_eligible(
+            use_llm=use_llm,
+            direction=direction,
+            technical_quality=result.technical_confidence,
+            overall_quality=calibrated_conf,
+            confluence_total=result.confluence_total,
+            execution=execution,
+            data_quality_ok=data_quality_ok,
+            prop_safe=plan_prop_safe_before_confidence_gate,
+            has_feasible_target=bool(plan.take_profits),
+            confidence_floor=confidence_floor,
+            score_floor=score_floor,
+            execution_floor=execution_floor,
+            max_immediate_sl_risk=max_immediate_sl_risk,
+        )
+        llm_invocation_status = (
+            "eligible_not_requested"
+            if not use_llm and llm_candidate
+            else (
+                "pending"
+                if llm_candidate
+                else "skipped_deterministic_reject"
             )
-            - 5.0
-            and execution.score
-            >= float(getattr(self.config.analysis, "execution_min_score", 65.0)) - 5.0
-            and data_quality_ok
         )
         if llm_candidate:
             try:
@@ -458,6 +527,9 @@ class ConfluenceEngine:
                     "execution": execution.to_dict(),
                 }
                 narrative = NarrativeLLM(self.config).generate(llm_ctx)
+                llm_invocation_status = (
+                    f"completed:{str(narrative.provider or 'unknown').lower()}"
+                )
                 result.llm = narrative
                 if narrative.signal_narrative:
                     result.trader_commentary = narrative.signal_narrative
@@ -491,6 +563,7 @@ class ConfluenceEngine:
                 result.llm_confidence_detail = dict(getattr(narrative, "confidence_detail", None) or {})
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LLM narrative layer failed: {}", exc)
+                llm_invocation_status = f"fallback:{type(exc).__name__}"
                 result.trader_commentary = self._commentary(result)
                 result.llm_confidence, result.llm_confidence_reason = heuristic_llm_confidence(
                     direction=direction,
@@ -510,6 +583,8 @@ class ConfluenceEngine:
                     technical_confidence=calibrated_conf,
                 )
         else:
+            if not use_llm:
+                llm_invocation_status = "disabled"
             result.trader_commentary = self._commentary(result)
             result.llm_confidence, result.llm_confidence_reason = heuristic_llm_confidence(
                 direction=direction,
@@ -543,24 +618,6 @@ class ConfluenceEngine:
 
         # Prop eligibility is based on deterministic confidence calibrated by
         # execution and data quality.
-        confidence_floor = float(
-            getattr(self.config.analysis, "directional_confidence_threshold", 68.0)
-        )
-        score_floor = float(
-            getattr(self.config.analysis, "directional_score_threshold", 0.20)
-        )
-        execution_floor = float(
-            getattr(self.config.analysis, "execution_min_score", 72.0)
-        )
-        legacy_execution_floor = float(
-            getattr(self.config.analysis, "legacy_execution_min_score", 65.0)
-        )
-        max_immediate_sl_risk = float(
-            getattr(self.config.analysis, "max_immediate_sl_risk", 32.0)
-        )
-        plan_prop_safe_before_confidence_gate = bool(
-            getattr(plan, "prop_safe", True)
-        )
         common_legacy_gate = bool(
             direction in ("long", "short")
             and abs(result.confluence_total) >= score_floor
@@ -779,6 +836,10 @@ class ConfluenceEngine:
             "llm_confidence": result.llm_confidence,
             "llm_confidence_reason": result.llm_confidence_reason,
             "llm_confidence_detail": result.llm_confidence_detail,
+            "llm_invocation_status": llm_invocation_status,
+            "llm_provider": (
+                str(result.llm.provider) if result.llm is not None else "none"
+            ),
             "rank_score": result.rank_score,
             "rank_policy_version": RANK_POLICY_VERSION,
             "rank_breakdown": rank_breakdown,

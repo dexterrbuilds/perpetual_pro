@@ -46,7 +46,8 @@ Built to feel like a senior prop trader sitting next to you.
 
 ### Prop account toolkit
 - **Prop risk** (default): **0.5–1% risk per trade**, **max 5x leverage**, flags for high drawdown / wide stop / low R:R
-- **LLM context/veto only** with supporting vs opposing factors; it cannot promote deterministic confidence
+- **LLM narrative only** with supporting vs opposing factors; it cannot change
+  deterministic eligibility, quality, rank, entry, stop, targets, or risk
 - **Immediate execution-aware Legacy V2 scoring**: technical calculations stay
   unchanged, while overall confidence is capped by Execution + 5 and the default
   execution gate is 72. Rejected candidates retain structured reasons for
@@ -67,7 +68,11 @@ Built to feel like a senior prop trader sitting next to you.
   confidence, execution status, reason, risk, funding/OI context, and hold window.
   Text delivery remains as an automatic fallback if media rendering/upload fails.
   When no setup passes the quality gates, Telegram sends an explicit
-  **NO QUALITY SETUP — STAND ASIDE** confirmation.
+  **NO QUALITY SETUP — STAND ASIDE** confirmation to the private operator only;
+  public scheduled channels remain silent when no trade qualifies.
+  XMR remains supported by the symbol layer but is temporarily excluded from
+  the production schedule because no approved configured venue currently
+  provides a usable perpetual market from the deployment region.
 - **Restart-safe active signal tracker**: Supabase is authoritative for active
   lifecycle state, transition versions, and a per-destination Telegram delivery
   ledger. SQLite is only a local working cache. RETEST signals progress through
