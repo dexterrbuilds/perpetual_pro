@@ -13,6 +13,12 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 
+from src.analytics.rejection import (
+    ALERT_MIN_OVERALL_QUALITY,
+    evaluate_alert_gates,
+    evaluate_revalidation_gates,
+)
+from src.analytics.runtime import get_rejection_repository
 from src.api.service import AnalyzeRequest, scan_symbols
 from src.analysis.revalidation import revalidate_candidate_for_delivery
 from src.notify.telegram import (
@@ -36,7 +42,7 @@ from src.utils.config import (
 
 # Fallback watchlist when scheduler.watchlist is empty
 DEFAULT_WATCHLIST = list(DEFAULT_CRYPTO_WATCHLIST)
-MIN_TELEGRAM_SIGNAL_CONFIDENCE = 80.0
+MIN_TELEGRAM_SIGNAL_CONFIDENCE = ALERT_MIN_OVERALL_QUALITY
 
 _STATUS_LOCK = Lock()
 _SCHEDULER_STATUS: Dict[str, Any] = {
@@ -200,6 +206,8 @@ def filter_high_confidence(
     max_pre_entry_tp1_progress_pct: float = 70.0,
     min_tp2_rr: float = 1.25,
     max_spread_bps: float = 12.0,
+    max_ticker_age_seconds: float = 45.0,
+    max_orderbook_age_seconds: float = 30.0,
 ) -> List[Dict[str, Any]]:
     """Apply deterministic delivery gates; ``min_llm`` is legacy API-only."""
     confidence_floor = max(
@@ -208,69 +216,56 @@ def filter_high_confidence(
     )
     out: List[Dict[str, Any]] = []
     for row in ranked or []:
-        rejection_codes: List[str] = []
-        direction = str(row.get("direction") or "").lower()
-        if direction not in ("long", "short"):
-            rejection_codes.append("NOT_DIRECTIONAL")
-        rank = float(row.get("rank_score") or 0)
-        overall_confidence = float(row.get("confidence") or 0)
-        if overall_confidence < confidence_floor:
-            rejection_codes.append("CONFIDENCE_BELOW_ALERT_MINIMUM")
-        if rank < min_rank:
-            rejection_codes.append("RANK_BELOW_MINIMUM")
-        if row.get("signal_eligible") is False:
-            rejection_codes.append("ANALYSIS_SIGNAL_GATE")
-        execution_score = row.get("execution_score")
-        if execution_score is not None and float(execution_score or 0) < min_execution_score:
-            rejection_codes.append("EXECUTION_BELOW_ALERT_MINIMUM")
-        immediate_sl_risk = row.get("immediate_sl_risk")
-        if (
-            immediate_sl_risk is not None
-            and float(immediate_sl_risk) > max_immediate_sl_risk
-        ):
-            rejection_codes.append("IMMEDIATE_SL_RISK_HIGH")
-        chase_distance = row.get("chase_distance_atr")
-        if chase_distance is not None and float(chase_distance) > max_chase_distance_atr:
-            rejection_codes.append("CHASE_DISTANCE_HIGH")
-        tp1_progress = row.get("tp1_progress_pct")
-        if (
-            str(row.get("entry_zone_relation") or "") == "favorable_beyond"
-            and tp1_progress is not None
-            and float(tp1_progress) >= max_pre_entry_tp1_progress_pct
-        ):
-            rejection_codes.append("ENTRY_MOVE_MOSTLY_MISSED")
-        spread_bps = row.get("spread_bps")
-        if spread_bps is not None and float(spread_bps) > max_spread_bps:
-            rejection_codes.append("SPREAD_TOO_WIDE")
-        if row.get("market_quality_ok") is False:
-            rejection_codes.append("MARKET_QUALITY_BLOCKED")
-        if row.get("data_quality_ok") is False:
-            rejection_codes.append("DATA_QUALITY_BLOCKED")
-        if row.get("historical_edge_ok") is False:
-            rejection_codes.append("HISTORICAL_EDGE_BLOCKED")
-        tp2_rr = _row_tp2_rr(row)
-        if tp2_rr is not None and tp2_rr < min_tp2_rr:
-            rejection_codes.append("TP2_RR_BELOW_MINIMUM")
-        entry_status = row.get("entry_status")
-        if entry_status is not None and entry_status not in (
-            "ready",  # backward-compatible alias for old persisted rows
-            "confirmation_pending",
-            "wait_retest",
-        ):
-            rejection_codes.append("ENTRY_STATUS_BLOCKED")
-        if only_prop_safe and row.get("prop_safe") is False:
-            rejection_codes.append("PROP_RISK_BLOCKED")
-        if rejection_codes:
+        decision = evaluate_alert_gates(
+            row,
+            min_rank=min_rank,
+            only_prop_safe=only_prop_safe,
+            min_confidence=confidence_floor,
+            min_execution_quality=min_execution_score,
+            max_immediate_sl_risk=max_immediate_sl_risk,
+            max_chase_distance_atr=max_chase_distance_atr,
+            max_pre_entry_tp1_progress_pct=max_pre_entry_tp1_progress_pct,
+            min_tp2_rr=min_tp2_rr,
+            max_spread_bps=max_spread_bps,
+            max_ticker_age_seconds=max_ticker_age_seconds,
+            max_orderbook_age_seconds=max_orderbook_age_seconds,
+            prior=row.get("gate_evaluation"),
+        )
+        row["gate_evaluation"] = decision.to_dict()
+        if not decision.eligible:
+            compatibility_codes = {
+                "FLAT_DIRECTION": "NOT_DIRECTIONAL",
+                "OVERALL_QUALITY_BELOW_MINIMUM": "CONFIDENCE_BELOW_ALERT_MINIMUM",
+                "RANK_BELOW_MINIMUM": "RANK_BELOW_MINIMUM",
+                "EXECUTION_QUALITY_BELOW_MINIMUM": "EXECUTION_BELOW_ALERT_MINIMUM",
+                "IMMEDIATE_SL_RISK_TOO_HIGH": "IMMEDIATE_SL_RISK_HIGH",
+                "PRICE_TOO_EXTENDED": "CHASE_DISTANCE_HIGH",
+                "TP1_ALREADY_PROGRESSING": "ENTRY_MOVE_MOSTLY_MISSED",
+                "SPREAD_TOO_WIDE": "SPREAD_TOO_WIDE",
+                "MARKET_QUALITY_FAILED": "MARKET_QUALITY_BLOCKED",
+                "DATA_QUALITY_FAILED": "DATA_QUALITY_BLOCKED",
+                "HISTORICAL_EDGE_FAILED": "HISTORICAL_EDGE_BLOCKED",
+                "GROSS_RR_BELOW_MINIMUM": "TP2_RR_BELOW_MINIMUM",
+                "ENTRY_BLOCKED": "ENTRY_STATUS_BLOCKED",
+                "AVOID_CHASE": "ENTRY_STATUS_BLOCKED",
+                "ENTRY_EXPIRED": "ENTRY_STATUS_BLOCKED",
+                "INVALIDATED_BEFORE_ENTRY": "ENTRY_STATUS_BLOCKED",
+                "PROP_COMPATIBILITY_FAILED": "PROP_RISK_BLOCKED",
+                "ANALYSIS_ERROR": "ANALYSIS_SIGNAL_GATE",
+            }
             row["delivery_rejection_reasons"] = list(
-                dict.fromkeys(rejection_codes)
+                dict.fromkeys(
+                    compatibility_codes.get(code, code)
+                    for code in decision.all_rejection_reasons
+                )
             )
             logger.info(
                 "Telegram candidate rejected: symbol={} direction={} "
                 "confidence={:.1f} execution={} reasons={}",
                 row.get("symbol"),
-                direction,
-                overall_confidence,
-                execution_score,
+                str(row.get("direction") or "").lower(),
+                float(row.get("confidence") or 0),
+                row.get("execution_score"),
                 "|".join(row["delivery_rejection_reasons"]),
             )
             continue
@@ -456,7 +451,24 @@ def _run_scheduled_scan_once_unlocked(
         req.exchange,
         send,
     )
-    result = scan_symbols(watchlist, request=req, config=cfg)
+    slot_lower = str(slot_label or "").lower()
+    manual_delivery = bool(
+        telegram_chat_ids is not None
+        or any(
+            marker in slot_lower
+            for marker in ("manual", "on-demand", "telegram")
+        )
+    )
+    trigger_type = "telegram" if telegram_chat_ids is not None else (
+        "manual" if manual_delivery else "scheduled"
+    )
+    result = scan_symbols(
+        watchlist,
+        request=req,
+        config=cfg,
+        scan_id=run_id,
+        trigger_type=trigger_type,
+    )
     ranked = result.get("ranked_results") or []
     filtered = filter_high_confidence(
         ranked,
@@ -485,16 +497,14 @@ def _run_scheduled_scan_once_unlocked(
         ),
         min_tp2_rr=float(getattr(cfg.analysis, "min_tp2_rr", 1.25)),
         max_spread_bps=float(getattr(cfg.analysis, "max_spread_bps", 12.0)),
+        max_ticker_age_seconds=float(
+            getattr(cfg.analysis, "max_ticker_age_seconds", 45.0)
+        ),
+        max_orderbook_age_seconds=float(
+            getattr(cfg.analysis, "max_orderbook_age_seconds", 30.0)
+        ),
     )
     suppressed_duplicates: List[Dict[str, Any]] = []
-    slot_lower = str(slot_label or "").lower()
-    manual_delivery = bool(
-        telegram_chat_ids is not None
-        or any(
-            marker in slot_lower
-            for marker in ("manual", "on-demand", "telegram")
-        )
-    )
     if send and not manual_delivery and filtered:
         filtered, suppressed_duplicates = suppress_recent_scheduled_signals(filtered)
         if suppressed_duplicates:
@@ -531,10 +541,15 @@ def _run_scheduled_scan_once_unlocked(
                 try:
                     validation = future.result()
                 except Exception as exc:  # noqa: BLE001
+                    decision = evaluate_revalidation_gates(
+                        [f"PRE_SEND_INTERNAL_FAILURE:{type(exc).__name__}"],
+                        prior=original.get("gate_evaluation"),
+                    )
                     validation = {
                         "ok": False,
                         "row": original,
                         "reasons": [f"PRE_SEND_INTERNAL_FAILURE:{type(exc).__name__}"],
+                        "gate_evaluation": decision.to_dict(),
                     }
                 if validation.get("ok"):
                     accepted[index] = dict(validation.get("row") or original)
@@ -544,6 +559,11 @@ def _run_scheduled_scan_once_unlocked(
                         validation.get("reasons") or ["PRE_SEND_REJECTED"]
                     )
                     pre_delivery_rejected.append(rejected)
+                    rejected["gate_evaluation"] = dict(
+                        validation.get("gate_evaluation")
+                        or rejected.get("gate_evaluation")
+                        or {}
+                    )
                     logger.warning(
                         "Telegram candidate failed final revalidation: symbol={} reasons={}",
                         original.get("symbol"),
@@ -570,6 +590,9 @@ def _run_scheduled_scan_once_unlocked(
             ),
             scanned_count=len(watchlist),
             ranked_count=len(ranked),
+            rejection_summary=(
+                result.get("rejection_analytics") if manual_delivery else None
+            ),
         )
     sent = False
     delivery: Optional[Dict[str, Any]] = None
@@ -900,6 +923,47 @@ def _run_scheduled_scan_once_unlocked(
     public_empty_suppressed = bool(
         not manual_delivery and not filtered and not scan_failed
     )
+    successful_delivery_events = sum(
+        1 for item in delivery_audit if item.get("ok")
+    )
+    public_messages = (
+        successful_delivery_events if not manual_delivery and filtered else 0
+    )
+    private_messages = successful_delivery_events - public_messages
+    candidate_updates: List[Dict[str, Any]] = []
+    latest_by_id: Dict[str, Dict[str, Any]] = {
+        str(row.get("candidate_id")): row
+        for row in [*ranked, *pre_delivery_rejected, *filtered]
+        if row.get("candidate_id")
+    }
+    for candidate_id, row in latest_by_id.items():
+        if row.get("gate_evaluation"):
+            candidate_updates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "gate_evaluation": row.get("gate_evaluation"),
+                }
+            )
+    analytics_finalized = get_rejection_repository(cfg).finalize_scan(
+        scan_id=run_id,
+        revalidated_candidates=len(filtered),
+        public_messages=public_messages,
+        private_messages=private_messages,
+        no_quality_result=not bool(filtered),
+        summary_patch={
+            "result_code": result_code,
+            "delivery_status": delivery_status,
+            "pre_delivery_rejected_count": len(pre_delivery_rejected),
+            "public_empty_suppressed": public_empty_suppressed,
+        },
+        candidate_updates=candidate_updates,
+    )
+    if not analytics_finalized and get_rejection_repository(cfg).enabled:
+        logger.error(
+            "Rejection analytics finalization failed for run={}; delivery and "
+            "eligibility remain unchanged",
+            run_id,
+        )
     logger.info(
         "Scheduled scan completed: run={} slot={} scanned={} ranked={} actionable={} "
         "delivery_status={} duration_seconds={:.3f}",
@@ -942,6 +1006,8 @@ def _run_scheduled_scan_once_unlocked(
         "main_rejection_reasons": rejection_counts,
         "llm_invocation_counts": llm_counts,
         "public_empty_suppressed": public_empty_suppressed,
+        "rejection_analytics": result.get("rejection_analytics") or {},
+        "rejection_analytics_finalized": analytics_finalized,
         "slot_label": slot_label,
     }
 

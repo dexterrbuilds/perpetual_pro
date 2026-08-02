@@ -8,6 +8,7 @@ from typing import Any, Dict, Mapping, Optional
 
 from loguru import logger
 
+from src.analytics.rejection import evaluate_revalidation_gates
 from src.data.exchange import ExchangeClient
 from src.data.multi_tf import assess_candle_quality, closed_candles
 from src.utils.config import AppConfig
@@ -53,7 +54,16 @@ def evaluate_pre_delivery_candidate(
         or not targets
     ):
         reasons.append("PRE_SEND_LEVELS_INVALID")
-        return {"ok": False, "row": updated, "reasons": reasons}
+        decision = evaluate_revalidation_gates(
+            reasons, prior=row.get("gate_evaluation")
+        )
+        updated["gate_evaluation"] = decision.to_dict()
+        return {
+            "ok": False,
+            "row": updated,
+            "reasons": reasons,
+            "gate_evaluation": decision.to_dict(),
+        }
 
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
@@ -135,7 +145,18 @@ def evaluate_pre_delivery_candidate(
             "pre_delivery_revalidated_at": current.isoformat(),
         }
     )
-    return {"ok": not reasons, "row": updated, "reasons": reasons}
+    decision = evaluate_revalidation_gates(
+        reasons, prior=row.get("gate_evaluation")
+    )
+    # A clean revalidation keeps the prior eligibility decision; it never
+    # promotes an upstream reject.
+    updated["gate_evaluation"] = decision.to_dict()
+    return {
+        "ok": not reasons,
+        "row": updated,
+        "reasons": reasons,
+        "gate_evaluation": decision.to_dict(),
+    }
 
 
 def revalidate_candidate_for_delivery(
@@ -191,10 +212,15 @@ def revalidate_candidate_for_delivery(
             symbol,
             type(exc).__name__,
         )
+        reasons = [f"PRE_SEND_DATA_FAILURE:{type(exc).__name__}"]
+        decision = evaluate_revalidation_gates(
+            reasons, prior=row.get("gate_evaluation")
+        )
         return {
             "ok": False,
             "row": dict(row),
-            "reasons": [f"PRE_SEND_DATA_FAILURE:{type(exc).__name__}"],
+            "reasons": reasons,
+            "gate_evaluation": decision.to_dict(),
         }
     finally:
         client.close()

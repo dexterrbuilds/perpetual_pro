@@ -10,12 +10,22 @@ import json
 import time
 import inspect
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Union
+from uuid import uuid4
 
 from loguru import logger
 from PIL import Image
 
+from src.analytics.rejection import (
+    ALERT_MIN_OVERALL_QUALITY,
+    GATE_POLICY_VERSION,
+    aggregate_rejection_rows,
+    candidate_analytics_snapshot,
+    evaluate_alert_gates,
+)
+from src.analytics.runtime import get_rejection_repository
 from src.analysis.confluence import ConfluenceEngine, FullAnalysis
 from src.analysis.risk import RiskManager
 from src.data.exchange import EXCHANGE_MAP, normalize_exchange_id
@@ -30,6 +40,7 @@ from src.scoring.runtime import (
     score_candidate_shadow,
 )
 from src.utils.config import AppConfig, load_config
+from src.utils.build_info import get_build_identity
 from src.utils.helpers import clamp, normalize_symbol
 from src.api.security import SCAN_BUDGET_SECONDS, SCAN_FALLBACK_EXCHANGES
 from src.vision.chart_detect import ChartVision
@@ -582,6 +593,9 @@ def scan_symbols(
     symbols: Optional[List[str]] = None,
     request: Optional[AnalyzeRequest] = None,
     config: Optional[AppConfig] = None,
+    *,
+    scan_id: Optional[str] = None,
+    trigger_type: str = "manual",
 ) -> Dict[str, Any]:
     """
     Multi-symbol scan ranked by deterministic technical/execution quality.
@@ -590,6 +604,9 @@ def scan_symbols(
     """
     req = request or AnalyzeRequest()
     cfg = config or load_config()
+    resolved_scan_id = str(scan_id or ("scan_" + uuid4().hex))
+    scan_started_at = datetime.now(timezone.utc)
+    scan_started_monotonic = time.monotonic()
     symbol_list = [s.strip() for s in (symbols or []) if s and s.strip()]
     if not symbol_list:
         return {"ok": False, "error": "no_symbols", "ranked_results": [], "skipped_flat": []}
@@ -602,13 +619,20 @@ def scan_symbols(
     ranked_results: List[Dict[str, Any]] = []
     skipped_flat: List[Dict[str, Any]] = []
     journal_records: List[Dict[str, Any]] = []
+    analytics_candidates: List[Dict[str, Any]] = []
+    llm_call_count = 0
+    llm_rate_limit_events = 0
     analysis_failures: List[Dict[str, str]] = []
     analyzed_count = 0
     scan_deadline = time.monotonic() + SCAN_BUDGET_SECONDS
     for symbol in symbol_list[:40]:
         if time.monotonic() >= scan_deadline:
             analysis_failures.append(
-                {"symbol": symbol, "reason": "scan_budget_exhausted"}
+                {
+                    "symbol": symbol,
+                    "code": "MARKET_UNAVAILABLE",
+                    "reason": "scan_budget_exhausted",
+                }
             )
             continue
         try:
@@ -647,6 +671,7 @@ def scan_symbols(
                     analysis_failures.append(
                         {
                             "symbol": normalized_symbol,
+                            "code": "MARKET_UNAVAILABLE",
                             "reason": "no_primary_market_data",
                         }
                     )
@@ -805,6 +830,9 @@ def scan_symbols(
                         "llm_invocation_status", "unknown"
                     ),
                     "llm_provider": analysis.meta.get("llm_provider", "none"),
+                    "llm_rate_limit_events": int(
+                        analysis.meta.get("llm_rate_limit_events") or 0
+                    ),
                     "rank_score": round(scan_rank_score, 2),
                     "live_rank_score": round(live_rank_score, 2),
                     "rank_policy_version": analysis.meta.get("rank_policy_version"),
@@ -818,6 +846,16 @@ def scan_symbols(
                     "signal_eligible": bool(
                         analysis.meta.get("signal_eligible", False) if analysis.meta else False
                     ),
+                    "evaluated_direction": analysis.meta.get(
+                        "evaluated_direction", analysis.direction
+                    ),
+                    "gate_evaluation": dict(
+                        analysis.meta.get("gate_evaluation") or {}
+                    ),
+                    "gate_policy_version": analysis.meta.get(
+                        "gate_policy_version", GATE_POLICY_VERSION
+                    ),
+                    "feature_schema_version": cfg.outcome_scoring.feature_schema_version,
                     "legacy_signal_eligible": bool(
                         analysis.meta.get("legacy_signal_eligible", False)
                     ),
@@ -1073,6 +1111,68 @@ def scan_symbols(
                     ]
                 row["payload"]["candidate_id"] = candidate["id"]
                 row["payload"]["outcome_scoring"] = row["outcome_scoring"]
+                if str(row.get("llm_invocation_status") or "").startswith(
+                    ("completed:", "fallback:")
+                ):
+                    llm_call_count += 1
+                llm_rate_limit_events += int(
+                    row.get("llm_rate_limit_events") or 0
+                )
+                alert_evaluation = evaluate_alert_gates(
+                    row,
+                    min_rank=float(cfg.telegram.min_rank_score or 50.0),
+                    only_prop_safe=bool(cfg.scheduler.only_prop_safe),
+                    min_confidence=max(
+                        ALERT_MIN_OVERALL_QUALITY,
+                        float(
+                            getattr(
+                                cfg.analysis,
+                                "directional_confidence_threshold",
+                                68.0,
+                            )
+                        ),
+                    ),
+                    min_execution_quality=float(
+                        getattr(cfg.analysis, "execution_min_score", 72.0)
+                    ),
+                    max_immediate_sl_risk=float(
+                        getattr(cfg.analysis, "max_immediate_sl_risk", 32.0)
+                    ),
+                    max_chase_distance_atr=float(
+                        getattr(cfg.analysis, "max_chase_distance_atr", 1.0)
+                    ),
+                    max_pre_entry_tp1_progress_pct=float(
+                        getattr(
+                            cfg.analysis,
+                            "max_pre_entry_tp1_progress_pct",
+                            70.0,
+                        )
+                    ),
+                    min_tp2_rr=float(
+                        getattr(cfg.analysis, "min_tp2_rr", 1.25)
+                    ),
+                    max_spread_bps=float(
+                        getattr(cfg.analysis, "max_spread_bps", 12.0)
+                    ),
+                    max_ticker_age_seconds=float(
+                        getattr(cfg.analysis, "max_ticker_age_seconds", 45.0)
+                    ),
+                    max_orderbook_age_seconds=float(
+                        getattr(cfg.analysis, "max_orderbook_age_seconds", 30.0)
+                    ),
+                    prior=row.get("gate_evaluation"),
+                )
+                row["gate_evaluation"] = alert_evaluation.to_dict()
+                row["payload"]["gate_evaluation"] = row["gate_evaluation"]
+                analytics_candidates.append(
+                    candidate_analytics_snapshot(
+                        row,
+                        row["gate_evaluation"],
+                        scan_id=resolved_scan_id,
+                        candidate_id=candidate["id"],
+                        analyzed_at=analysis.generated_at,
+                    )
+                )
                 journal_records.append(candidate)
                 analyzed_count += 1
 
@@ -1093,6 +1193,8 @@ def scan_symbols(
                             "execution_score": row["execution_score"],
                             "confluence_score": row["confluence_score"],
                             "rejection_reasons": row["rejection_reasons"],
+                            "candidate_id": candidate["id"],
+                            "gate_evaluation": row["gate_evaluation"],
                             "reason": analysis.llm_confidence_reason
                             or "Flat/neutral — not ranked",
                         }
@@ -1111,10 +1213,84 @@ def scan_symbols(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Scan failed for {}: {}", symbol, exc)
             analysis_failures.append(
-                {"symbol": str(symbol), "reason": type(exc).__name__}
+                {
+                    "symbol": str(symbol),
+                    "code": "ANALYSIS_ERROR",
+                    "reason": type(exc).__name__,
+                }
             )
 
     journaled_count = journal_scan_candidates(journal_records, cfg)
+
+    scan_completed_at = datetime.now(timezone.utc)
+    rejection_summary = aggregate_rejection_rows([], analytics_candidates)
+    for diagnostic in rejection_summary.get("suspicious_diagnostics") or []:
+        logger.warning(
+            "Protected rejection diagnostic: scan={} code={} gate={} sample={}",
+            resolved_scan_id,
+            diagnostic.get("code"),
+            diagnostic.get("gate") or "n/a",
+            diagnostic.get("sample") or 0,
+        )
+    build_identity = get_build_identity()
+    analytics_repository = get_rejection_repository(cfg)
+    scan_record = {
+        "scan_id": resolved_scan_id,
+        "trigger_type": (
+            trigger_type
+            if trigger_type in {"scheduled", "manual", "telegram", "api"}
+            else "manual"
+        ),
+        "started_at": scan_started_at.isoformat(),
+        "completed_at": scan_completed_at.isoformat(),
+        "requested_symbols": list(symbol_list),
+        "analyzed_symbols": [
+            str(row.get("symbol") or "") for row in analytics_candidates
+        ],
+        "failed_symbols": list(analysis_failures),
+        "directional_candidates": int(
+            rejection_summary.get("directional_candidates") or 0
+        ),
+        "eligible_candidates": int(
+            rejection_summary.get("eligible_candidates") or 0
+        ),
+        "revalidated_candidates": 0,
+        "scan_duration_seconds": round(
+            time.monotonic() - scan_started_monotonic, 3
+        ),
+        "analytics_latency_ms": 0.0,
+        "llm_calls": llm_call_count,
+        "llm_rate_limit_events": llm_rate_limit_events,
+        "public_messages": 0,
+        "private_messages": 0,
+        "no_quality_result": not bool(
+            rejection_summary.get("eligible_candidates")
+        ),
+        "status": (
+            "completed"
+            if analyzed_count and not analysis_failures
+            else ("partial" if analyzed_count else "failed")
+        ),
+        "gate_policy_version": GATE_POLICY_VERSION,
+        "feature_schema_version": cfg.outcome_scoring.feature_schema_version,
+        "execution_policy_version": cfg.analysis.execution_policy_version,
+        "rank_policy_version": str(
+            build_identity.get("rank_policy") or "deterministic_rank_v2a.1"
+        ),
+        "build_commit_sha": build_identity.get("git_commit_sha"),
+        "summary": rejection_summary,
+    }
+    analytics_persisted = analytics_repository.record_scan(
+        scan_record, analytics_candidates
+    )
+    analytics_latency_ms = analytics_repository.last_latency_ms
+    if not analytics_persisted and analytics_repository.enabled:
+        logger.error(
+            "Rejection analytics unavailable for scan={} error_type={}; "
+            "signal eligibility remains unchanged",
+            resolved_scan_id,
+            analytics_repository.last_error or "unknown",
+        )
 
     # Rank directional signals deterministically. LLM numbers are never a tie
     # breaker because that would still grant them delivery authority.
@@ -1127,6 +1303,7 @@ def scan_symbols(
     )
     return {
         "ok": analyzed_count > 0,
+        "scan_id": resolved_scan_id,
         "error": None if analyzed_count > 0 else "scan_analysis_unavailable",
         "ranked_results": ranked_results[:10],
         "skipped_flat": skipped_flat[:20],
@@ -1145,6 +1322,15 @@ def scan_symbols(
         "prop_mode": bool(getattr(cfg.risk, "prop_mode", True)),
         "candidate_journaled_count": journaled_count,
         "outcome_scoring": get_outcome_scoring_status(cfg),
+        "rejection_analytics": rejection_summary,
+        # Internal consumers use these already-computed snapshots to append
+        # revalidation/delivery stages. API serialization is protected by the
+        # existing scan authorization layer.
+        "rejection_candidates": analytics_candidates,
+        "rejection_analytics_persisted": bool(analytics_persisted),
+        "analytics_latency_ms": analytics_latency_ms,
+        "llm_calls": llm_call_count,
+        "llm_rate_limit_events": llm_rate_limit_events,
     }
 
 

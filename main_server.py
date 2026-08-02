@@ -16,6 +16,7 @@ import os
 import sys
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -39,6 +40,8 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 from src import __version__
+from src.analytics.rejection import GATE_POLICY_VERSION
+from src.analytics.runtime import get_rejection_repository
 from src.api.service import AnalyzeRequest, analyze_from_image, scan_symbols
 from src.api.security import (
     SCAN_ACCESS,
@@ -254,13 +257,86 @@ def admin_status(
     x_scan_api_key: Optional[str] = Header(None, alias="X-Scan-API-Key"),
 ) -> Dict[str, Any]:
     SCAN_ACCESS.authorize(request, x_scan_api_key)
+    rejection_repository = get_rejection_repository(get_config())
     return {
         "ok": True,
         "build": get_build_identity(),
         "scheduler": get_scheduler_status(),
         "signal_tracker": get_signal_tracker_status(),
         "outcome_scoring": get_outcome_scoring_status(get_config()),
+        "rejection_analytics": {
+            "ready": rejection_repository.check_ready(),
+            "gate_policy_version": GATE_POLICY_VERSION,
+            "last_error": rejection_repository.last_error,
+            "last_latency_ms": rejection_repository.last_latency_ms,
+        },
     }
+
+
+@app.get("/admin/rejections/latest")
+def latest_rejection_analytics(
+    request: Request,
+    x_scan_api_key: Optional[str] = Header(None, alias="X-Scan-API-Key"),
+) -> JSONResponse:
+    """Latest completed scan diagnostics; protected like the scan endpoint."""
+    SCAN_ACCESS.authorize(request, x_scan_api_key)
+    result = get_rejection_repository(get_config()).latest_scan()
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "error": "rejection_analytics_not_available"},
+        )
+    return JSONResponse(content={"ok": True, **result})
+
+
+@app.get("/admin/rejections/summary")
+def rejection_analytics_summary(
+    request: Request,
+    hours: int = 24,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    x_scan_api_key: Optional[str] = Header(None, alias="X-Scan-API-Key"),
+) -> JSONResponse:
+    """Protected 1h–31d aggregate or an explicit ISO-8601 range."""
+    SCAN_ACCESS.authorize(request, x_scan_api_key)
+    repository = get_rejection_repository(get_config())
+    if start or end:
+        try:
+            end_at = datetime.fromisoformat((end or datetime.now(timezone.utc).isoformat()).replace("Z", "+00:00"))
+            start_at = datetime.fromisoformat((start or (end_at - timedelta(hours=hours)).isoformat()).replace("Z", "+00:00"))
+            if start_at.tzinfo is None:
+                start_at = start_at.replace(tzinfo=timezone.utc)
+            if end_at.tzinfo is None:
+                end_at = end_at.replace(tzinfo=timezone.utc)
+            if start_at >= end_at or end_at - start_at > timedelta(days=31):
+                raise ValueError("invalid range")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid analytics time range") from exc
+        result = repository.range_summary(start=start_at, end=end_at)
+    else:
+        if hours < 1 or hours > 24 * 31:
+            raise HTTPException(status_code=422, detail="hours must be between 1 and 744")
+        result = repository.summary_for_hours(hours)
+    return JSONResponse(content={"ok": "error" not in result, **result})
+
+
+@app.get("/admin/rejections/candidates/{candidate_id}")
+def rejection_candidate_details(
+    candidate_id: str,
+    request: Request,
+    x_scan_api_key: Optional[str] = Header(None, alias="X-Scan-API-Key"),
+) -> JSONResponse:
+    """Complete canonical gate evaluation for one candidate."""
+    SCAN_ACCESS.authorize(request, x_scan_api_key)
+    if not candidate_id or len(candidate_id) > 128:
+        raise HTTPException(status_code=422, detail="Invalid candidate ID")
+    result = get_rejection_repository(get_config()).candidate(candidate_id)
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "error": "candidate_not_found"},
+        )
+    return JSONResponse(content={"ok": True, "candidate": result})
 
 
 @app.get("/signal-tracker/reliability")
@@ -464,7 +540,13 @@ async def scan(
     try:
         with SCAN_ACCESS.slot():
             result = await asyncio.wait_for(
-                asyncio.to_thread(scan_symbols, symbol_list, req, cfg),
+                asyncio.to_thread(
+                    scan_symbols,
+                    symbol_list,
+                    req,
+                    cfg,
+                    trigger_type="api",
+                ),
                 timeout=SCAN_TIMEOUT_SECONDS,
             )
     except asyncio.TimeoutError as exc:

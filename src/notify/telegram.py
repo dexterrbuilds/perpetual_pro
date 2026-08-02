@@ -904,6 +904,7 @@ def format_prop_scan_report(
     min_signal_confidence: float = 80.0,
     scanned_count: Optional[int] = None,
     ranked_count: Optional[int] = None,
+    rejection_summary: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Compact Telegram report for actionable, prop-safe intraday signals."""
     try:
@@ -917,6 +918,12 @@ def format_prop_scan_report(
         header += f" · {html.escape(slot_label)}"
     lines = [header, when, "15m execution · 1h/4h confirmation · ≤5x", ""]
     if not ranked:
+        diagnostic = dict(rejection_summary or {})
+        directional_count = int(
+            diagnostic.get("directional_candidates")
+            if diagnostic.get("directional_candidates") is not None
+            else (ranked_count or 0)
+        )
         lines += [
             "⏸ <b>NO QUALITY SETUP — STAND ASIDE</b>",
             "",
@@ -926,8 +933,8 @@ def format_prop_scan_report(
                 else "Scheduled scan completed"
             )
             + (
-                f" · {ranked_count} directional candidate(s)"
-                if ranked_count is not None
+                f" · {directional_count} directional candidate(s)"
+                if ranked_count is not None or diagnostic
                 else ""
             )
             + ".",
@@ -935,6 +942,53 @@ def format_prop_scan_report(
                 f"Nothing passed ≥{min_signal_confidence:.0f}% confidence, "
                 "execution/SL-risk, market-quality, R:R, and prop-safety gates."
             ),
+        ]
+        if diagnostic:
+            labels = {
+                "OVERALL_QUALITY_BELOW_MINIMUM": "Overall Quality below minimum",
+                "EXECUTION_QUALITY_BELOW_MINIMUM": "Execution Quality below minimum",
+                "CONFLUENCE_BELOW_MINIMUM": "Confluence below minimum",
+                "AVOID_CHASE": "Avoid Chase",
+                "ENTRY_BLOCKED": "Entry blocked",
+                "FLAT_DIRECTION": "Flat/non-directional",
+                "NO_FEASIBLE_TARGET": "No feasible target",
+                "PROP_COMPATIBILITY_FAILED": "Prop compatibility",
+            }
+            primary = dict(diagnostic.get("primary_rejection_counts") or {})
+            primary.pop("ELIGIBLE", None)
+            if primary:
+                lines += ["", "<b>Main blockers</b>"]
+                for code, count in sorted(
+                    primary.items(), key=lambda item: (-item[1], item[0])
+                )[:4]:
+                    label = labels.get(code, code.replace("_", " ").title())
+                    lines.append(f"• {html.escape(label)}: {int(count)}")
+            nearest = list(diagnostic.get("closest_rejected_candidates") or [])
+            nearest = [
+                row
+                for row in nearest
+                if str(row.get("direction") or "").lower() in {"long", "short"}
+            ]
+            if nearest:
+                row = nearest[0]
+                symbol = html.escape(str(row.get("symbol") or "—").split("/")[0])
+                direction = html.escape(str(row.get("direction") or "").upper())
+                overall = _number(row.get("overall_quality"))
+                gate = str(row.get("closest_to_passing_gate") or "a required gate")
+                distance = _number(row.get("distance_to_eligibility"))
+                lines += [
+                    "",
+                    "<b>Closest rejected setup — NON-ACTIONABLE</b>",
+                    f"{symbol} {direction} · Overall {overall:.1f}/100"
+                    if overall is not None
+                    else f"{symbol} {direction}",
+                    (
+                        f"Nearest gate: {html.escape(labels.get(gate, gate.replace('_', ' ').title()))}"
+                        + (f" · diagnostic gap {distance:.3f}" if distance is not None else "")
+                    ),
+                ]
+            lines += ["", "No gate was lowered. No rejected setup is a trade signal."]
+        lines += [
             "No trade is the correct position until a clean entry appears.",
             "",
             "NFA · DYOR · Trade at your own risk",

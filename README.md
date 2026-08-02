@@ -136,6 +136,8 @@ different private chats; when omitted, commands fall back to `TELEGRAM_CHAT_ID`.
 /scan BTC ETH SOL     selected markets
 /scan 1h BTC ETH      selected markets on 1h
 /status               bot, scan-worker, and next-schedule status
+/rejections           latest private rejection summary
+/rejections 24h       private 24-hour rejection summary
 /chatid               show the current chat's numeric ID
 /help                 command guide
 ```

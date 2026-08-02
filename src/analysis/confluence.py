@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+from src.analytics.rejection import evaluate_analysis_gates
 from src.analysis.execution import ExecutionProfile, build_execution_profile
 from src.analysis.execution_policy import (
     DEFAULT_EXECUTION_POLICY,
@@ -121,18 +122,27 @@ def deterministic_narrative_eligible(
     it only prevents external LLM work for candidates already rejected by the
     trading engine.
     """
+    decision = evaluate_analysis_gates(
+        direction=direction,
+        technical_quality=technical_quality,
+        execution_quality=execution.score,
+        overall_quality=overall_quality,
+        confluence_magnitude=abs(confluence_total),
+        entry_status=execution.status,
+        immediate_sl_risk=execution.immediate_sl_risk,
+        market_quality_ok=execution.market_quality_ok,
+        data_quality_ok=data_quality_ok,
+        prop_safe=prop_safe,
+        confidence_floor=confidence_floor,
+        score_floor=score_floor,
+        execution_floor=execution_floor,
+        max_immediate_sl_risk=max_immediate_sl_risk,
+        hard_failures=execution.hard_failures,
+    )
     return bool(
         use_llm
-        and direction in ("long", "short")
+        and decision.eligible
         and technical_quality >= confidence_floor
-        and overall_quality >= confidence_floor
-        and abs(confluence_total) >= score_floor
-        and execution.score >= execution_floor
-        and execution.status in ("confirmation_pending", "wait_retest")
-        and execution.immediate_sl_risk <= max_immediate_sl_risk
-        and execution.market_quality_ok
-        and data_quality_ok
-        and prop_safe
         and has_feasible_target
         and not execution.hard_failures
     )
@@ -474,6 +484,23 @@ class ConfluenceEngine:
         plan_prop_safe_before_confidence_gate = bool(
             getattr(plan, "prop_safe", True)
         )
+        analysis_gate_evaluation = evaluate_analysis_gates(
+            direction=direction,
+            technical_quality=result.technical_confidence,
+            execution_quality=execution.score,
+            overall_quality=result.confidence,
+            confluence_magnitude=abs(result.confluence_total),
+            entry_status=execution.status,
+            immediate_sl_risk=execution.immediate_sl_risk,
+            market_quality_ok=execution.market_quality_ok,
+            data_quality_ok=data_quality_ok,
+            prop_safe=plan_prop_safe_before_confidence_gate,
+            confidence_floor=confidence_floor,
+            score_floor=score_floor,
+            execution_floor=execution_floor,
+            max_immediate_sl_risk=max_immediate_sl_risk,
+            hard_failures=execution.hard_failures,
+        )
 
         # LLM narrative is optional and narrative-only. External providers are
         # contacted only after every deterministic eligibility and safety gate.
@@ -640,122 +667,27 @@ class ConfluenceEngine:
         self.risk.apply_prop_confidence_gate(
             plan, result.confidence, minimum=confidence_floor
         )
-        signal_eligible = bool(
-            direction in ("long", "short")
-            and result.confidence >= confidence_floor
-            and abs(result.confluence_total) >= score_floor
-            and execution.score >= execution_floor
-            and execution.status in ("confirmation_pending", "wait_retest")
-            and execution.immediate_sl_risk <= max_immediate_sl_risk
-            and execution.market_quality_ok
-            and data_quality_ok
-            and getattr(plan, "prop_safe", True)
-        )
-        structured_rejections: List[Dict[str, Any]] = []
+        signal_eligible = bool(analysis_gate_evaluation.eligible)
+        structured_rejections: List[Dict[str, Any]] = [
+            {
+                "code": gate.code,
+                "detail": gate.explanation,
+                "value": gate.actual_value,
+                "threshold": gate.required_value,
+                "distance": gate.distance,
+                "severity": gate.severity,
+                "stage": gate.stage,
+                "authoritative": gate.authoritative,
+            }
+            for gate in analysis_gate_evaluation.gates
+            if not gate.passed
+        ]
         if direction in ("long", "short") and not signal_eligible:
-            gate_reasons: List[str] = []
-            if result.confidence < confidence_floor:
-                detail = (
-                    f"confidence {result.confidence:.0f}% < "
-                    f"{confidence_floor:.0f}%"
-                )
-                gate_reasons.append(detail)
-                structured_rejections.append(
-                    {
-                        "code": "CONFIDENCE_BELOW_MINIMUM",
-                        "detail": detail,
-                        "value": round(result.confidence, 3),
-                        "threshold": confidence_floor,
-                    }
-                )
-            if abs(result.confluence_total) < score_floor:
-                detail = (
-                    f"confluence {abs(result.confluence_total):.2f} < "
-                    f"{score_floor:.2f}"
-                )
-                gate_reasons.append(detail)
-                structured_rejections.append(
-                    {
-                        "code": "CONFLUENCE_BELOW_MINIMUM",
-                        "detail": detail,
-                        "value": round(abs(result.confluence_total), 4),
-                        "threshold": score_floor,
-                    }
-                )
-            if execution.score < execution_floor:
-                detail = (
-                    f"execution {execution.score:.0f} < "
-                    f"{execution_floor:.0f}"
-                )
-                gate_reasons.append(detail)
-                structured_rejections.append(
-                    {
-                        "code": "EXECUTION_BELOW_MINIMUM",
-                        "detail": detail,
-                        "value": round(execution.score, 3),
-                        "threshold": execution_floor,
-                    }
-                )
-            if execution.status not in ("confirmation_pending", "wait_retest"):
-                detail = execution.status.replace("_", " ")
-                gate_reasons.append(detail)
-                structured_rejections.append(
-                    {
-                        "code": "ENTRY_STATUS_BLOCKED",
-                        "detail": detail,
-                        "value": execution.status,
-                    }
-                )
-            if execution.immediate_sl_risk > max_immediate_sl_risk:
-                detail = (
-                    f"immediate-SL risk {execution.immediate_sl_risk:.0f}%"
-                )
-                gate_reasons.append(detail)
-                structured_rejections.append(
-                    {
-                        "code": "IMMEDIATE_SL_RISK_HIGH",
-                        "detail": detail,
-                        "value": round(execution.immediate_sl_risk, 3),
-                        "threshold": max_immediate_sl_risk,
-                    }
-                )
-            if not execution.market_quality_ok:
-                gate_reasons.append("wide spread / poor market quality")
-                structured_rejections.append(
-                    {
-                        "code": "MARKET_QUALITY_BLOCKED",
-                        "detail": "wide spread / poor market quality",
-                    }
-                )
-            if not data_quality_ok:
-                failed_quality = [
-                    f"{tf}:{q.get('reason', 'invalid')}"
-                    for tf, q in required_quality.items()
-                    if not q.get("ok", False)
-                ]
-                detail = (
-                    f"live price dislocation {live_move_atr:.1f} ATR"
-                    if not live_price_ok
-                    else (
-                        "market data quality: "
-                        + ", ".join(failed_quality or ["invalid"])
-                    )
-                )
-                gate_reasons.append(detail)
-                structured_rejections.append(
-                    {
-                        "code": "DATA_QUALITY_BLOCKED",
-                        "detail": detail,
-                    }
-                )
-            if not plan.prop_safe:
-                gate_reasons.append("prop risk gate")
-                structured_rejections.append(
-                    {
-                        "code": "PROP_RISK_BLOCKED",
-                        "detail": "prop risk gate",
-                    }
-                )
+            gate_reasons = [
+                gate.explanation
+                for gate in analysis_gate_evaluation.gates
+                if not gate.passed and gate.authoritative
+            ]
             logger.info(
                 "Signal rejected: symbol={} timeframe={} bias={} "
                 "technical={:.1f} legacy_conf={:.1f} v2_conf={:.1f} "
@@ -840,6 +772,16 @@ class ConfluenceEngine:
             "llm_provider": (
                 str(result.llm.provider) if result.llm is not None else "none"
             ),
+            "llm_rate_limit_events": int(
+                getattr(result.llm, "rate_limit_events", 0)
+                if result.llm is not None
+                else 0
+            ),
+            "llm_provider_errors": list(
+                getattr(result.llm, "provider_errors", [])
+                if result.llm is not None
+                else []
+            ),
             "rank_score": result.rank_score,
             "rank_policy_version": RANK_POLICY_VERSION,
             "rank_breakdown": rank_breakdown,
@@ -849,6 +791,9 @@ class ConfluenceEngine:
             "legacy_signal_eligible": legacy_signal_eligible,
             "legacy_v2_signal_eligible": legacy_v2_signal_eligible,
             "rejection_reasons": structured_rejections,
+            "gate_evaluation": analysis_gate_evaluation.to_dict(),
+            "gate_policy_version": analysis_gate_evaluation.policy_version,
+            "evaluated_direction": direction,
             "execution": execution.to_dict(),
             "data_quality": dict(mtf.quality or {}),
             "primary_data_quality_ok": data_quality_ok,

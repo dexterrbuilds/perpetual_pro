@@ -45,6 +45,8 @@ class LLMNarrative:
     model: str = ""
     raw_ok: bool = False
     error: str = ""
+    provider_errors: List[str] = field(default_factory=list)
+    rate_limit_events: int = 0
     # Compact trader-style card (human readable, emojis ok)
     trade_card: str = ""
 
@@ -78,13 +80,33 @@ class NarrativeLLM:
             return self._fallback(context, provider="disabled")
 
         prompt = self._build_prompt(context)
+        provider_errors: List[str] = []
+
+        def _record_error(provider: str, exc: Exception) -> None:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            category = (
+                f"{provider}_rate_limited"
+                if status == 429
+                else f"{provider}_{type(exc).__name__.lower()}"
+            )
+            provider_errors.append(category)
+
+        def _annotate(narrative: LLMNarrative) -> LLMNarrative:
+            narrative.provider_errors = list(provider_errors)
+            narrative.rate_limit_events = sum(
+                1 for item in provider_errors if item.endswith("_rate_limited")
+            )
+            return narrative
         if self.groq_key:
             try:
                 text = self._call_groq(prompt)
                 parsed = self._parse_json_response(text)
                 if parsed:
-                    return self._from_parsed(parsed, "groq", self.groq_model)
+                    return _annotate(
+                        self._from_parsed(parsed, "groq", self.groq_model)
+                    )
             except Exception as exc:  # noqa: BLE001
+                _record_error("groq", exc)
                 logger.warning("Groq narrative failed: {}", exc)
 
         if self.gemini_key:
@@ -92,11 +114,14 @@ class NarrativeLLM:
                 text = self._call_gemini(prompt)
                 parsed = self._parse_json_response(text)
                 if parsed:
-                    return self._from_parsed(parsed, "gemini", self.gemini_model)
+                    return _annotate(
+                        self._from_parsed(parsed, "gemini", self.gemini_model)
+                    )
             except Exception as exc:  # noqa: BLE001
+                _record_error("gemini", exc)
                 logger.warning("Gemini narrative failed: {}", exc)
 
-        return self._fallback(context, provider="local_fallback")
+        return _annotate(self._fallback(context, provider="local_fallback"))
 
     def _build_prompt(self, ctx: Dict[str, Any]) -> str:
         # The model explains an already-computed deterministic plan. It must not

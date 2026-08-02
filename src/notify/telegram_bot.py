@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import requests
 from loguru import logger
 
+from src.analytics.runtime import get_rejection_repository
 from src.notify.telegram import (
     TELEGRAM_API_ROOT,
     get_telegram_credentials,
@@ -146,6 +147,7 @@ def configure_telegram_webhook(config: AppConfig, timeout: int = 15) -> bool:
                         {"command": "status", "description": "Show bot and scan status"},
                         {"command": "help", "description": "Show command examples"},
                         {"command": "chatid", "description": "Show this chat's numeric ID"},
+                        {"command": "rejections", "description": "Show private rejection analytics"},
                     ]
                 },
                 timeout=(5, timeout),
@@ -183,6 +185,8 @@ def _command_help() -> str:
         "<code>/scan BTC ETH SOL</code> — scan selected markets\n"
         "<code>/scan 1h BTC ETH</code> — scan selected markets on 1h\n"
         "<code>/status</code> — show scan availability\n"
+        "<code>/rejections</code> — latest private rejection summary\n"
+        "<code>/rejections 24h</code> — private 24-hour summary\n"
         "<code>/chatid</code> — show this chat's numeric ID\n"
         "<code>/help</code> — show this guide\n\n"
         "Only qualified, prop-safe setups are returned. If none pass, "
@@ -330,6 +334,67 @@ def process_telegram_update(update: Dict[str, Any], config: AppConfig) -> Dict[s
             f"Live tracker: <b>{'streaming' if tracker.get('websocket_connected') else 'standby'}</b>\n"
             f"Next scheduled scan: <code>{html.escape(str(next_run))}</code>"
         )
+        delivery = send_telegram_message_detailed(
+            message_text,
+            chat_id=incoming_chat_id,
+            parse_mode="HTML",
+        )
+        return {"ok": bool(delivery.get("ok")), "handled": True, "command": command}
+
+    if command == "/rejections":
+        pieces = text.split()
+        hours: Optional[int] = None
+        if len(pieces) > 1:
+            match = re.fullmatch(r"(24|72)h", pieces[1].lower())
+            if not match:
+                delivery = send_telegram_message_detailed(
+                    "⚠️ Use <code>/rejections</code>, "
+                    "<code>/rejections 24h</code>, or <code>/rejections 72h</code>.",
+                    chat_id=incoming_chat_id,
+                    parse_mode="HTML",
+                )
+                return {"ok": bool(delivery.get("ok")), "handled": True, "command": command}
+            hours = int(match.group(1))
+        repository = get_rejection_repository(config)
+        result = repository.summary_for_hours(hours) if hours else repository.latest_scan()
+        if not result:
+            message_text = "📊 <b>Rejection Summary</b>\nNo persisted scan analytics are available yet."
+        else:
+            analytics = dict(result.get("analytics") or result)
+            window = f" · Last {hours}h" if hours else " · Latest scan"
+            lines = [
+                f"📊 <b>Rejection Summary{window}</b>",
+                f"Scans: <b>{int(analytics.get('scans_completed') or (1 if not hours else 0))}</b>",
+                f"Analyzed: <b>{int(analytics.get('candidates_analyzed') or 0)}</b> · "
+                f"Directional: <b>{int(analytics.get('directional_candidates') or 0)}</b> · "
+                f"Eligible: <b>{int(analytics.get('eligible_candidates') or 0)}</b>",
+            ]
+            primary = dict(analytics.get("primary_rejection_counts") or {})
+            primary.pop("ELIGIBLE", None)
+            if primary:
+                lines += ["", "<b>Primary blockers</b>"]
+                for code, count in sorted(primary.items(), key=lambda item: (-item[1], item[0]))[:5]:
+                    lines.append(
+                        f"• {html.escape(code.replace('_', ' ').title())}: {int(count)}"
+                    )
+            nearest = [
+                row for row in analytics.get("closest_rejected_candidates") or []
+                if str(row.get("direction") or "").lower() in {"long", "short"}
+            ]
+            if nearest:
+                lines += ["", "<b>Closest rejected — non-actionable</b>"]
+                for index, row in enumerate(nearest[:3], 1):
+                    symbol = html.escape(str(row.get("symbol") or "—").split("/")[0])
+                    direction = html.escape(str(row.get("direction") or "").upper())
+                    overall = row.get("overall_quality")
+                    execution = row.get("execution_quality")
+                    gate = html.escape(str(row.get("closest_to_passing_gate") or "required gate").replace("_", " ").title())
+                    lines.append(
+                        f"{index}. {symbol} {direction} — Overall {float(overall or 0):.1f}/100, "
+                        f"Execution {float(execution or 0):.1f}/100\n   Nearest: {gate}"
+                    )
+            lines += ["", "No rejected setup is a trade signal."]
+            message_text = "\n".join(lines)[:3900]
         delivery = send_telegram_message_detailed(
             message_text,
             chat_id=incoming_chat_id,
