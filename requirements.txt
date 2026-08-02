@@ -18,7 +18,6 @@ loguru>=0.7.2
 python-dotenv>=1.0.0
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
-APScheduler>=3.10,<4
 python-multipart>=0.0.9
 streamlit>=1.39.0
 plotly>=5.18.0

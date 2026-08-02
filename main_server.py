@@ -63,7 +63,6 @@ from src.notify.telegram_bot import (
 from src.scheduler.scan_job import (
     get_scheduler_status,
     run_scheduled_scan_once,
-    schedule_private_one_shot,
     start_scheduler_background,
     stop_scheduler_background,
 )
@@ -482,37 +481,6 @@ async def scan(
             detail={"error": "scan_failed", "error_type": type(exc).__name__},
         ) from exc
     return JSONResponse(content=result)
-
-
-@app.post("/admin/scheduler/one-shot")
-async def schedule_operational_one_shot(
-    request: Request,
-    x_scan_api_key: Optional[str] = Header(None, alias="X-Scan-API-Key"),
-) -> JSONResponse:
-    """Queue one private DateTrigger scan exactly 120 seconds from acceptance."""
-    cfg = get_config()
-    SCAN_ACCESS.authorize(request, x_scan_api_key)
-    private_destinations = get_telegram_command_chat_ids("")
-    if not private_destinations:
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "private_telegram_destination_unavailable"},
-        )
-    try:
-        status = schedule_private_one_shot(
-            cfg,
-            private_destinations,
-            delay_seconds=120.0,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={"error": "one_shot_already_active"},
-        ) from exc
-    return JSONResponse(
-        status_code=202,
-        content={"ok": True, "one_shot": status},
-    )
 
 
 @app.post("/analyze")
