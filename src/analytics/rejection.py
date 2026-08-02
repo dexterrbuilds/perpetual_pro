@@ -176,17 +176,18 @@ def _number(value: Any) -> Optional[float]:
 
 
 def _canonical_candidate_direction(row: Mapping[str, Any]) -> str:
-    """Return the publishable direction without promoting a shadow bias.
+    """Return the direction evaluated before a rejected signal is flattened.
 
-    Flat rows may carry ``evaluated_direction`` so their shadow features remain
-    direction-aligned.  That field is diagnostic only and must not turn a
-    non-signal into a directional rejection candidate.
+    The production engine deliberately rewrites a rejected LONG/SHORT result to
+    ``flat``. ``evaluated_direction`` preserves that pre-gate direction so
+    rejection analytics can distinguish a rejected directional candidate from
+    a genuinely non-directional market reading.
     """
-    published = str(row.get("direction") or "").strip().lower()
-    if published:
-        return published if published in {"long", "short"} else "flat"
     evaluated = str(row.get("evaluated_direction") or "").strip().lower()
-    return evaluated if evaluated in {"long", "short"} else "flat"
+    if evaluated:
+        return evaluated if evaluated in {"long", "short"} else "flat"
+    published = str(row.get("direction") or "").strip().lower()
+    return published if published in {"long", "short"} else "flat"
 
 
 def _minimum_gate(
@@ -569,15 +570,20 @@ def evaluate_alert_gates(
         # Preserve the actual stage order while avoiding a second copy of the
         # same unchanged gate. A stricter downstream threshold (for example
         # Overall Quality 80 after the analysis floor) remains a distinct gate.
-        current_keys = {(gate.code, repr(gate.required_value)) for gate in gates}
-        gates = [
-            *[
-                gate
-                for gate in prior_eval.gates
-                if (gate.code, repr(gate.required_value)) not in current_keys
-            ],
-            *gates,
-        ]
+        merged = list(prior_eval.gates)
+        for current in gates:
+            unchanged = any(
+                previous.code == current.code
+                and repr(previous.required_value) == repr(current.required_value)
+                and previous.actual_value == current.actual_value
+                and previous.passed == current.passed
+                and previous.authoritative == current.authoritative
+                and previous.severity == current.severity
+                for previous in prior_eval.gates
+            )
+            if not unchanged:
+                merged.append(current)
+        gates = merged
     elif row.get("signal_eligible") is False:
         gates.insert(
             0,

@@ -118,9 +118,10 @@ def test_flat_candidate_is_non_directional_and_not_a_near_trade():
     assert decision.proximity_label == "NON_DIRECTIONAL"
 
 
-def test_flat_publish_direction_is_not_promoted_by_shadow_evaluated_direction():
-    row = _alert_row(direction="flat", evaluated_direction="long")
-    decision = _alert(row)
+def test_flat_candidate_stays_first_blocker_after_alert_stage_merge():
+    row = _alert_row(direction="flat", evaluated_direction="flat")
+    prior = _analysis(direction="flat", overall_quality=40).to_dict()
+    decision = _alert(row, prior=prior)
     snapshot = candidate_analytics_snapshot(
         row,
         decision.to_dict(),
@@ -131,6 +132,20 @@ def test_flat_publish_direction_is_not_promoted_by_shadow_evaluated_direction():
     assert decision.primary_rejection_reason == "FLAT_DIRECTION"
     assert decision.proximity_label == "NON_DIRECTIONAL"
     assert snapshot["direction"] == "flat"
+
+
+def test_rejected_directional_candidate_keeps_pre_gate_direction_for_analytics():
+    row = _alert_row(direction="flat", evaluated_direction="short", confidence=60)
+    decision = _alert(row)
+    snapshot = candidate_analytics_snapshot(
+        row,
+        decision.to_dict(),
+        scan_id="scan-short",
+        candidate_id="candidate-short",
+        analyzed_at="2026-08-02T00:00:00Z",
+    )
+    assert snapshot["direction"] == "short"
+    assert decision.primary_rejection_reason == "OVERALL_QUALITY_BELOW_MINIMUM"
 
 
 def test_flat_rows_are_counted_but_excluded_from_nearest_candidates():
