@@ -35,6 +35,10 @@ class PermanentExchangeAccessError(RuntimeError):
     """The deployment cannot use this venue until its network/location changes."""
 
 
+class UnsupportedMarketError(RuntimeError):
+    """A loaded venue market map proves the requested perpetual is unavailable."""
+
+
 _PERMANENT_ACCESS_MARKERS = (
     "403 forbidden",
     "451",
@@ -51,6 +55,11 @@ def is_permanent_exchange_access_error(error: Any) -> bool:
     """Identify geo/permission failures that retries cannot repair."""
     message = str(error or "").lower()
     return any(marker in message for marker in _PERMANENT_ACCESS_MARKERS)
+
+
+def is_unsupported_market_error(error: Any) -> bool:
+    """Identify a conclusive unsupported-perpetual result without retrying venues."""
+    return "unsupported_market:" in str(error or "").lower()
 
 
 def _cache_get(key: Tuple[Any, ...]) -> Any:
@@ -406,7 +415,10 @@ class ExchangeClient:
             symbol.upper(),
         ]
 
-        if unified in markets:
+        exact_market = markets.get(unified)
+        if exact_market and (
+            exact_market.get("swap") or exact_market.get("future")
+        ):
             _cache_put(cache_key, unified, max(3600, getattr(self, "cache_ttl_seconds", 300)))
             return unified
 
@@ -430,14 +442,24 @@ class ExchangeClient:
             return resolved
 
         for c in candidates:
-            if c in markets:
+            market = markets.get(c)
+            if market and (market.get("swap") or market.get("future")):
                 logger.debug("Resolved {} → {}", symbol, c)
                 _cache_put(cache_key, c, max(3600, getattr(self, "cache_ttl_seconds", 300)))
                 return c
 
-        # Last resort: return normalized; fetch may still work
+        # A non-empty market map is authoritative: do not turn a known missing
+        # perpetual into many slow exchange retries. An empty map may indicate a
+        # transient load failure, so the direct-fetch fallback remains intact.
         if markets:
-            logger.warning("Symbol {} not in markets map; using {}", symbol, unified)
+            logger.info(
+                "Unsupported market: {} perpetual is not listed on {}",
+                base,
+                self.exchange_id,
+            )
+            raise UnsupportedMarketError(
+                f"unsupported_market:{self.exchange_id}:{unified}"
+            )
         _cache_put(cache_key, unified, getattr(self, "cache_ttl_seconds", 300))
         return unified
 

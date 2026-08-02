@@ -13,9 +13,15 @@ from src.notify.telegram import (
     diagnose_telegram,
     format_prop_scan_report,
     format_signal_photo_caption,
+    get_delivery_mode,
+    get_delivery_status,
+    get_private_beta_chat_ids,
     get_telegram_alert_chat_ids,
+    get_telegram_public_alert_chat_ids,
     get_telegram_credentials,
     is_telegram_ready,
+    quality_badge,
+    rejection_explanation,
     send_telegram_message_detailed,
     send_telegram_photo_detailed,
 )
@@ -89,11 +95,88 @@ def test_format_empty():
         ranked_count=2,
     )
     assert "NO QUALITY SETUP" in text
-    assert "STAND ASIDE" in text
-    assert "Scanned 15 symbols" in text
-    assert "2 directional candidate" in text
-    assert "≥80% confidence" in text
+    assert "15 symbols scanned" in text
+    assert "2 directional setup" in text
+    assert "No setup passed every production safety gate" in text
+    assert "No rules were relaxed" in text
     assert text.endswith("NFA · DYOR · Trade at your own risk")
+
+
+def test_quality_badges_are_visual_only_and_cover_boundaries():
+    assert quality_badge(90) == "⭐ Excellent"
+    assert quality_badge(89.9) == "💚 Strong setup"
+    assert quality_badge(85) == "💚 Strong setup"
+    assert quality_badge(84.9) == "🟡 Watch closely"
+    assert quality_badge(80) == "🟡 Watch closely"
+    assert quality_badge(79.9) == "⚪ Below quality floor"
+
+
+def test_rejection_explanation_shows_actual_and_requirement():
+    row = {
+        "primary_rejection_reason": "GROSS_RR_BELOW_MINIMUM",
+        "gate_evaluation": {
+            "gates": [
+                {
+                    "code": "GROSS_RR_BELOW_MINIMUM",
+                    "passed": False,
+                    "actual_value": 1.18,
+                    "required_value": 1.25,
+                }
+            ]
+        },
+    }
+    detail, why = rejection_explanation(row)
+    assert "Gross R:R = 1.18R" in detail
+    assert "minimum 1.25R" in detail
+    assert "reward did not justify" in why
+
+
+def test_no_quality_report_includes_statistics_and_closest_explanation():
+    text = format_prop_scan_report(
+        [],
+        scanned_count=45,
+        ranked_count=3,
+        rejection_summary={
+            "directional_candidates": 3,
+            "eligible_candidates": 0,
+            "scan_duration_seconds": 18.4,
+            "primary_rejection_counts": {
+                "OVERALL_QUALITY_BELOW_MINIMUM": 2,
+                "GROSS_RR_BELOW_MINIMUM": 1,
+            },
+            "score_distributions": {
+                "overall_quality": {"average": 76.2, "maximum": 83.4}
+            },
+            "freshness": {"highest_age_seconds": 7.2},
+            "closest_rejected_candidates": [
+                {
+                    "symbol": "HYPE/USDT:USDT",
+                    "direction": "short",
+                    "overall_quality": 83.4,
+                    "execution_quality": 81.0,
+                    "primary_rejection_reason": "GROSS_RR_BELOW_MINIMUM",
+                    "gate_evaluation": {
+                        "gates": [
+                            {
+                                "code": "GROSS_RR_BELOW_MINIMUM",
+                                "passed": False,
+                                "actual_value": 1.18,
+                                "required_value": 1.25,
+                            }
+                        ]
+                    },
+                }
+            ],
+        },
+    )
+    assert "Market Summary" in text
+    assert "average Overall 76.2/100" in text
+    assert "highest 83.4/100" in text
+    assert "18.4s" in text
+    assert "freshness age 7.2s" in text
+    assert "Closest Setup — REJECTED / NON-ACTIONABLE" in text
+    assert "Gross R:R = 1.18R" in text
+    assert "minimum 1.25R" in text
 
 
 def test_filter_high_confidence():
@@ -354,6 +437,7 @@ def test_session_schedule_follows_london_and_new_york_dst():
 
 
 def test_alert_destinations_include_primary_and_additional(monkeypatch):
+    monkeypatch.setenv("DELIVERY_MODE", "public")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1001111")
     monkeypatch.setenv(
         "TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS",
@@ -367,7 +451,46 @@ def test_alert_destinations_include_primary_and_additional(monkeypatch):
     assert get_telegram_alert_chat_ids(["999999"]) == ["999999"]
 
 
+def test_private_beta_is_default_and_deduplicates_valid_dm_recipients(monkeypatch):
+    monkeypatch.delenv("DELIVERY_MODE", raising=False)
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1001111")
+    monkeypatch.setenv(
+        "PRIVATE_BETA_CHAT_IDS",
+        "111111, 222222,111111, invalid, @channel, -100999",
+    )
+
+    assert get_delivery_mode() == "private_beta"
+    assert get_private_beta_chat_ids() == ["111111", "222222"]
+    assert get_telegram_alert_chat_ids() == ["111111", "222222"]
+    assert "-1001111" not in get_telegram_alert_chat_ids()
+    status = get_delivery_status()
+    assert status["beta_recipient_count"] == 2
+    assert status["public_delivery_enabled"] is False
+
+
+def test_public_mode_restores_public_and_optional_copy_destinations(monkeypatch):
+    monkeypatch.setenv("DELIVERY_MODE", "public")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1001111")
+    monkeypatch.setenv("TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS", "333333,-1001111")
+    monkeypatch.setenv("PRIVATE_BETA_CHAT_IDS", "111111,222222")
+
+    assert get_telegram_public_alert_chat_ids() == ["-1001111", "333333"]
+    assert get_telegram_alert_chat_ids() == ["-1001111", "333333"]
+    status = get_delivery_status()
+    assert status["mode"] == "public"
+    assert status["public_delivery_enabled"] is True
+
+
+def test_invalid_delivery_mode_fails_closed_to_private_beta(monkeypatch):
+    monkeypatch.setenv("DELIVERY_MODE", "unsafe-mode")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1001111")
+    monkeypatch.setenv("PRIVATE_BETA_CHAT_IDS", "111111")
+    assert get_delivery_mode() == "private_beta"
+    assert get_telegram_alert_chat_ids() == ["111111"]
+
+
 def test_credentials_from_env_only(monkeypatch):
+    monkeypatch.setenv("DELIVERY_MODE", "public")
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
     # Even if YAML had secrets historically, load_config must not invent them
@@ -518,16 +641,16 @@ def test_signal_photo_caption_is_clean_and_actionable():
     assert "<b>Hold after fill:</b> 1–8h · hard max 12h" in caption
     assert "<b>Price at scan:</b> $112,900.00" in caption
     assert "already beyond Entry toward TP1" in caption
-    assert "cancel at expiry" in caption
+    assert "Cancel at expiry" in caption
     assert "<b>Entry:</b>" in caption
     assert "<b>Entry mode:</b> RETEST ONLY" in caption
     assert "<b>Stop:</b>" in caption
     assert "<b>TP1:</b>" in caption
     assert "<b>Setup:</b> Long Momentum" in caption
     assert "<b>R:R (TP2):</b> gross 2.40R" in caption
-    assert "<b>Why:</b>" in caption
-    assert "<b>Beginner rule:</b>" in caption
-    assert "after TP1, move it to breakeven" in caption
+    assert "<b>Primary strength:</b>" in caption
+    assert "Cancel at expiry" in caption
+    assert "After TP1: breakeven" in caption
     assert "Educational" not in caption
     assert caption.endswith("NFA · DYOR · Trade at your own risk")
     assert len(caption) <= 1024
@@ -644,6 +767,7 @@ def test_scheduled_scan_calls_detailed_sender(monkeypatch):
 
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "123456")
+    monkeypatch.setenv("DELIVERY_MODE", "public")
     cfg = load_config(ROOT / "config.yaml")
     row = {
         "direction": "long",
@@ -685,6 +809,7 @@ def test_scheduled_scan_sends_no_quality_setup_message(monkeypatch):
 
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100-public")
+    monkeypatch.setenv("DELIVERY_MODE", "public")
     monkeypatch.setenv("TELEGRAM_COMMAND_CHAT_IDS", "123456")
     cfg = load_config(ROOT / "config.yaml")
     assert cfg.telegram.notify_on_empty is True
@@ -719,6 +844,7 @@ def test_scheduled_scan_suppresses_public_empty_without_private_operator(monkeyp
 
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100-public")
+    monkeypatch.setenv("DELIVERY_MODE", "public")
     monkeypatch.delenv("TELEGRAM_COMMAND_CHAT_IDS", raising=False)
     cfg = load_config(ROOT / "config.yaml")
     monkeypatch.setattr(
@@ -749,6 +875,7 @@ def test_scheduled_scan_failure_is_private_operator_only(monkeypatch):
 
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100-public")
+    monkeypatch.setenv("DELIVERY_MODE", "public")
     monkeypatch.setenv("TELEGRAM_COMMAND_CHAT_IDS", "654321")
     cfg = load_config(ROOT / "config.yaml")
     monkeypatch.setattr(
@@ -835,6 +962,7 @@ def test_scheduled_scan_sends_chart_alert_without_text_fallback(monkeypatch):
 
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "123456")
+    monkeypatch.setenv("DELIVERY_MODE", "public")
     cfg = load_config(ROOT / "config.yaml")
     row = {
         "symbol": "BTC/USDT:USDT",
@@ -889,6 +1017,7 @@ def test_scheduled_scan_fans_out_but_manual_override_stays_private(monkeypatch):
 
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1001111")
+    monkeypatch.setenv("DELIVERY_MODE", "public")
     monkeypatch.setenv("TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS", "-1002222")
     cfg = load_config(ROOT / "config.yaml")
     row = {
@@ -952,3 +1081,204 @@ def test_scheduled_scan_fans_out_but_manual_override_stays_private(monkeypatch):
     assert photo_chats == ["999999"]
     assert manual["telegram_delivery"]["destination_count"] == 1
     assert manual["telegram_delivery_status"] == "sent_chart_alerts"
+
+
+def test_private_beta_scheduled_signal_routes_only_to_beta_dms(monkeypatch):
+    from src.scheduler import scan_job
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100-public")
+    monkeypatch.setenv("DELIVERY_MODE", "private_beta")
+    monkeypatch.setenv("PRIVATE_BETA_CHAT_IDS", "111111, 222222, 111111")
+    cfg = load_config(ROOT / "config.yaml")
+    row = {
+        "symbol": "BTC/USDT:USDT",
+        "direction": "long",
+        "confidence": 86,
+        "technical_confidence": 85,
+        "rank_score": 82,
+        "prop_safe": True,
+        "signal_eligible": True,
+        "entry_status": "wait_retest",
+        "execution_score": 80,
+        "entry_low": 100,
+        "entry_high": 101,
+        "stop_loss": 98,
+        "take_profits": [103, 105],
+        "payload": {"chart": {"candles": [{}] * 10}},
+    }
+    monkeypatch.setattr(
+        scan_job,
+        "scan_symbols",
+        lambda *a, **k: {"ok": True, "ranked_results": [row]},
+    )
+    monkeypatch.setattr(
+        scan_job,
+        "revalidate_candidate_for_delivery",
+        lambda candidate, config: {"ok": True, "row": candidate, "reasons": []},
+    )
+    monkeypatch.setattr(scan_job, "render_signal_chart_png", lambda candidate: b"png")
+    monkeypatch.setattr(
+        scan_job,
+        "format_signal_photo_caption",
+        lambda candidate, slot_label="": "<b>PRIVATE BETA SIGNAL</b>",
+    )
+    photo_chats = []
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_photo_detailed",
+        lambda photo, caption, **kwargs: photo_chats.append(kwargs["chat_id"])
+        or {"ok": True, "message_id": len(photo_chats)},
+    )
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_message_detailed",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fallback called")),
+    )
+    tracked = []
+    monkeypatch.setattr(
+        scan_job,
+        "register_delivered_signals",
+        lambda rows, destinations, **kwargs: tracked.append(destinations)
+        or {"ok": True, "registered": 1},
+    )
+
+    result = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label="private beta scheduled",
+        send=True,
+    )
+
+    assert photo_chats == ["111111", "222222"]
+    assert "-100-public" not in photo_chats
+    assert tracked == [[['111111', '222222']]]
+    assert result["delivery_mode"] == "private_beta"
+    assert result["delivery_recipient_count"] == 2
+    assert result["telegram_delivery_status"] == "sent_chart_alerts"
+
+
+def test_private_beta_empty_report_goes_to_beta_dms_only(monkeypatch):
+    from src.scheduler import scan_job
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100-public")
+    monkeypatch.setenv("TELEGRAM_COMMAND_CHAT_IDS", "333333")
+    monkeypatch.setenv("DELIVERY_MODE", "private_beta")
+    monkeypatch.setenv("PRIVATE_BETA_CHAT_IDS", "111111,222222")
+    cfg = load_config(ROOT / "config.yaml")
+    cfg.telegram.notify_on_empty = False
+    monkeypatch.setattr(
+        scan_job,
+        "scan_symbols",
+        lambda *a, **k: {"ok": True, "ranked_results": []},
+    )
+    chats = []
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_message_detailed",
+        lambda text, **kwargs: chats.append(kwargs["chat_id"])
+        or {"ok": True, "message_id": len(chats)},
+    )
+
+    result = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label="private beta no setup",
+        send=True,
+    )
+
+    assert chats == ["111111", "222222"]
+    assert "-100-public" not in chats
+    assert "333333" not in chats
+    assert result["telegram_delivery_status"] == "sent_empty_report"
+    assert result["delivery_mode"] == "private_beta"
+
+
+def test_private_beta_recipient_failure_does_not_block_other_dm(monkeypatch):
+    from src.scheduler import scan_job
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100-public")
+    monkeypatch.setenv("DELIVERY_MODE", "private_beta")
+    monkeypatch.setenv("PRIVATE_BETA_CHAT_IDS", "111111,222222")
+    cfg = load_config(ROOT / "config.yaml")
+    row = {
+        "symbol": "ETH/USDT:USDT",
+        "direction": "short",
+        "confidence": 87,
+        "technical_confidence": 86,
+        "rank_score": 83,
+        "prop_safe": True,
+        "signal_eligible": True,
+        "entry_status": "wait_retest",
+        "execution_score": 81,
+        "entry_low": 100,
+        "entry_high": 101,
+        "stop_loss": 103,
+        "take_profits": [98, 96],
+        "payload": {"chart": {"candles": [{}] * 10}},
+    }
+    monkeypatch.setattr(
+        scan_job,
+        "scan_symbols",
+        lambda *a, **k: {"ok": True, "ranked_results": [row]},
+    )
+    monkeypatch.setattr(
+        scan_job,
+        "revalidate_candidate_for_delivery",
+        lambda candidate, config: {"ok": True, "row": candidate, "reasons": []},
+    )
+    monkeypatch.setattr(scan_job, "render_signal_chart_png", lambda candidate: b"png")
+    monkeypatch.setattr(scan_job, "format_signal_photo_caption", lambda *a, **k: "signal")
+    attempted = []
+
+    def photo_send(photo, caption, **kwargs):
+        chat = kwargs["chat_id"]
+        attempted.append(chat)
+        return {
+            "ok": chat == "222222",
+            "message_id": 22 if chat == "222222" else None,
+            "error": None if chat == "222222" else "forbidden",
+        }
+
+    monkeypatch.setattr(scan_job, "send_telegram_photo_detailed", photo_send)
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_message_detailed",
+        lambda text, **kwargs: {"ok": False, "error": "forbidden"},
+    )
+    monkeypatch.setattr(
+        scan_job,
+        "register_delivered_signals",
+        lambda *a, **k: {"ok": True, "registered": 1},
+    )
+
+    result = scan_job.run_scheduled_scan_once(cfg, slot_label="beta partial", send=True)
+
+    assert attempted == ["111111", "222222"]
+    assert result["telegram_sent"] is True
+    assert result["telegram_delivery_status"] == "partial_delivery"
+
+
+def test_telegram_status_exposes_redacted_delivery_mode(monkeypatch):
+    import main_server
+
+    monkeypatch.setenv("DELIVERY_MODE", "private_beta")
+    monkeypatch.setenv("PRIVATE_BETA_CHAT_IDS", "111111,222222")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:secret-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100-public")
+    payload = main_server.telegram_status()
+    telegram = payload["telegram"]
+    assert telegram["delivery_mode"] == "private_beta"
+    assert telegram["beta_recipient_count"] == 2
+    assert telegram["public_delivery_enabled"] is False
+    assert "111111" not in str(payload)
+    assert "222222" not in str(payload)
+
+
+def test_delivery_mode_does_not_change_scheduler_windows(monkeypatch):
+    monkeypatch.setenv("DELIVERY_MODE", "private_beta")
+    beta_sessions = load_config(ROOT / "config.yaml").scheduler.sessions
+    monkeypatch.setenv("DELIVERY_MODE", "public")
+    public_sessions = load_config(ROOT / "config.yaml").scheduler.sessions
+    assert beta_sessions == public_sessions
+    assert len(beta_sessions) == 4

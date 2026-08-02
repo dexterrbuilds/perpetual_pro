@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html
 import os
+import re
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -21,6 +22,9 @@ from loguru import logger
 from src.utils.config import AppConfig, TelegramConfig
 
 TELEGRAM_API_ROOT = "https://api.telegram.org"
+DELIVERY_MODE_PRIVATE_BETA = "private_beta"
+DELIVERY_MODE_PUBLIC = "public"
+VALID_DELIVERY_MODES = {DELIVERY_MODE_PRIVATE_BETA, DELIVERY_MODE_PUBLIC}
 
 
 def _masked_chat_id(chat_id: str) -> str:
@@ -48,7 +52,55 @@ def get_telegram_credentials(
     return token, chat
 
 
-def get_telegram_alert_chat_ids(
+def _split_chat_ids(sources: Iterable[str]) -> List[str]:
+    """Split and deduplicate destination values while preserving order."""
+    destinations: List[str] = []
+    for source in sources:
+        for candidate in str(source or "").replace(";", ",").split(","):
+            for value in candidate.split():
+                chat_id = value.strip()
+                if chat_id and chat_id not in destinations:
+                    destinations.append(chat_id)
+    return destinations
+
+
+def get_delivery_mode() -> str:
+    """Return the safe delivery mode; invalid values fail closed to beta."""
+    mode = (os.getenv("DELIVERY_MODE") or DELIVERY_MODE_PRIVATE_BETA).strip().lower()
+    if mode not in VALID_DELIVERY_MODES:
+        logger.warning(
+            "Invalid DELIVERY_MODE; using PRIVATE BETA delivery mode"
+        )
+        return DELIVERY_MODE_PRIVATE_BETA
+    return mode
+
+
+def get_private_beta_chat_ids() -> List[str]:
+    """Return validated numeric beta DM IDs without exposing them in logs."""
+    candidates = _split_chat_ids(
+        [os.getenv("PRIVATE_BETA_CHAT_IDS") or ""]
+    )
+    valid: List[str] = []
+    invalid_count = 0
+    for value in candidates:
+        # Telegram private-user chat IDs are positive integers. Negative group
+        # IDs and @usernames are rejected because beta mode is deliberately
+        # restricted to direct messages.
+        if re.fullmatch(r"[1-9][0-9]{0,19}", value):
+            if value not in valid:
+                valid.append(value)
+        else:
+            invalid_count += 1
+    if invalid_count:
+        logger.warning(
+            "Private beta recipient validation skipped {} invalid value(s); "
+            "identifiers are redacted",
+            invalid_count,
+        )
+    return valid
+
+
+def get_telegram_public_alert_chat_ids(
     override_chat_ids: Optional[Iterable[str]] = None,
 ) -> List[str]:
     """
@@ -67,14 +119,23 @@ def get_telegram_alert_chat_ids(
             os.getenv("TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS") or "",
         ]
 
-    destinations: List[str] = []
-    for source in sources:
-        for candidate in str(source or "").replace(";", ",").split(","):
-            for value in candidate.split():
-                chat_id = value.strip()
-                if chat_id and chat_id not in destinations:
-                    destinations.append(chat_id)
-    return destinations
+    return _split_chat_ids(sources)
+
+
+def get_telegram_alert_chat_ids(
+    override_chat_ids: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """Resolve signal destinations for the current delivery mode.
+
+    Explicit per-run overrides remain exclusive for authorized private commands.
+    Scheduled production scans use only beta DMs in ``private_beta`` and restore
+    the configured public destinations in ``public`` mode.
+    """
+    if override_chat_ids is not None:
+        return _split_chat_ids(list(override_chat_ids))
+    if get_delivery_mode() == DELIVERY_MODE_PRIVATE_BETA:
+        return get_private_beta_chat_ids()
+    return get_telegram_public_alert_chat_ids()
 
 
 def get_telegram_private_operator_chat_ids() -> List[str]:
@@ -85,15 +146,35 @@ def get_telegram_private_operator_chat_ids() -> List[str]:
     production. Private operator routing is intentionally opt-in through
     ``TELEGRAM_COMMAND_CHAT_IDS``.
     """
-    sources = [os.getenv("TELEGRAM_COMMAND_CHAT_IDS") or ""]
-    destinations: List[str] = []
-    for source in sources:
-        for candidate in str(source or "").replace(";", ",").split(","):
-            for value in candidate.split():
-                chat_id = value.strip()
-                if chat_id and chat_id not in destinations:
-                    destinations.append(chat_id)
-    return destinations
+    return _split_chat_ids([os.getenv("TELEGRAM_COMMAND_CHAT_IDS") or ""])
+
+
+def get_telegram_report_chat_ids(
+    override_chat_ids: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """Resolve no-setup, scan-summary, and operational-report destinations."""
+    if override_chat_ids is not None:
+        return _split_chat_ids(list(override_chat_ids))
+    if get_delivery_mode() == DELIVERY_MODE_PRIVATE_BETA:
+        return get_private_beta_chat_ids()
+    return get_telegram_private_operator_chat_ids()
+
+
+def get_delivery_status() -> Dict[str, Any]:
+    """Return non-secret routing status for health and admin endpoints."""
+    mode = get_delivery_mode()
+    beta_count = len(get_private_beta_chat_ids())
+    public_count = len(get_telegram_public_alert_chat_ids())
+    return {
+        "mode": mode,
+        "mode_label": "PRIVATE BETA" if mode == DELIVERY_MODE_PRIVATE_BETA else "PUBLIC",
+        "beta_recipient_count": beta_count,
+        "public_delivery_enabled": bool(
+            mode == DELIVERY_MODE_PUBLIC and public_count > 0
+        ),
+        "public_recipient_count": public_count,
+        "active_signal_recipient_count": len(get_telegram_alert_chat_ids()),
+    }
 
 
 def _response_detail(response: requests.Response) -> Dict[str, Any]:
@@ -510,14 +591,14 @@ def format_signal_photo_caption(
 
     lines = [
         f"{icon} <b>{html.escape(symbol)} {call}</b>",
+        f"{quality_badge(confidence)}",
         (
-            (
-                f"<b>Calibrated TP1 probability {confidence:.0f}%</b> · "
-                if outcome_active else f"<b>Overall Quality {confidence:.0f}/100</b> · "
-            )
-            + f"Technical Quality {technical:.0f}/100 · Execution Quality {execution_score:.0f}/100"
+            f"<b>Calibrated TP1 probability {confidence:.0f}%</b>"
+            if outcome_active
+            else f"<b>Overall Quality {confidence:.0f}/100</b>"
         ),
-        "",
+        f"Technical Quality {technical:.0f}/100 · Execution Quality {execution_score:.0f}/100",
+        "━━━━━━━━━━━━━━",
         (
             f"⏱ {html.escape(timeframe)} · 1h/4h · "
             f"{html.escape(hold_style)}"
@@ -546,7 +627,7 @@ def format_signal_photo_caption(
         if scan_price is not None
         else "",
         f"🎯 <b>Entry:</b> {_caption_price(entry_low)} – {_caption_price(entry_high)}",
-        f"🚦 <b>Entry mode:</b> {html.escape(entry_mode)}",
+        f"📌 <b>Entry mode:</b> {html.escape(entry_mode)}",
         f"🛑 <b>Stop:</b> {_caption_price(stop)}",
     ]
     lines = [line for line in lines if line]
@@ -557,10 +638,10 @@ def format_signal_photo_caption(
         )
     setup_label = setup_name or f"{direction.title()} {hold_style}"
     lines += [
-        "",
+        "━━━━━━━━━━━━━━",
         f"📐 <b>Setup:</b> {html.escape(setup_label)}",
         _telegram_rr_line(row, primary, rr_tp2, risk_pct, leverage),
-        f"🧠 <b>Why:</b> {html.escape(reason)}",
+        f"🧠 <b>Primary strength:</b> {html.escape(reason)}",
     ]
     if components:
         component_bits = [
@@ -570,16 +651,22 @@ def format_signal_photo_caption(
         ]
         freshness = str(row.get("data_freshness_state") or execution.get("data_freshness_state") or "unknown")
         lines.append(
-            "🔎 <b>Execution:</b> "
+            "📈 <b>Execution:</b> "
             + " · ".join(component_bits)
             + f" · data {html.escape(freshness)}"
         )
+    elif row.get("data_freshness_state") or execution.get("data_freshness_state"):
+        freshness = str(
+            row.get("data_freshness_state")
+            or execution.get("data_freshness_state")
+        )
+        lines.append(f"🛡 <b>Freshness:</b> {html.escape(freshness)}")
     risks = list(execution.get("risks") or row.get("rejection_reasons") or [])
     if risks:
         risk_text = risks[0]
         if isinstance(risk_text, dict):
             risk_text = risk_text.get("detail") or risk_text.get("code") or "Execution uncertainty"
-        lines.append(f"⚠️ <b>Primary risk:</b> {html.escape(str(risk_text)[:150])}")
+        lines.append(f"⚠️ <b>Primary weakness:</b> {html.escape(str(risk_text)[:110])}")
     if outcome_active:
         lines.append(
             "🧮 <b>Calibrated EV:</b> "
@@ -594,19 +681,28 @@ def format_signal_photo_caption(
     elif not execution_note and status in ("ready", "confirmation_pending"):
         execution_note = "Enter only after the confirmation candle closes."
     if execution_note:
-        lines += ["", f"📌 {html.escape(execution_note)}"]
+        lines += ["", f"📌 <b>Note:</b> {html.escape(execution_note)}"]
     invalidation_side = "below" if direction == "LONG" else "above"
     lines.append(
-        "🧱 <b>Beginner rule:</b> Before fill: cancel at expiry, if TP1 trades, "
-        f"or if a {html.escape(timeframe)} candle closes {invalidation_side} Stop; "
-        "wicks alone do not count. After fill, honor Stop; "
-        "after TP1, move it to breakeven."
+        "🛡 Cancel at expiry, TP1 trade, or "
+        f"{html.escape(timeframe)} candle closes {invalidation_side} Stop "
+        "(wicks ignored). After TP1: breakeven."
     )
     lines += [
         "",
         "NFA · DYOR · Trade at your own risk",
     ]
     caption = "\n".join(lines)
+    if len(caption) > 1024:
+        # The execution note repeats the entry-mode requirement and is the
+        # safest optional detail to remove from a photo caption. Core trade,
+        # quality, risk, freshness, and confirmation fields remain intact.
+        lines = [
+            line
+            for line in lines
+            if not line.startswith("📌 <b>Note:</b>")
+        ]
+        caption = "\n".join(lines).replace("\n\n\n", "\n\n")
     return caption
 
 
@@ -637,6 +733,174 @@ def _number(value: Any, default: float = 0.0) -> float:
         return float(value) if value is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def _optional_number(value: Any) -> Optional[float]:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def quality_badge(score: Any) -> str:
+    """Return a visual-only quality label; never affects eligibility."""
+    value = _number(score)
+    if value >= 90:
+        return "⭐ Excellent"
+    if value >= 85:
+        return "💚 Strong setup"
+    if value >= 80:
+        return "🟡 Watch closely"
+    return "⚪ Below quality floor"
+
+
+_REJECTION_LABELS = {
+    "FLAT_DIRECTION": "Flat / no direction",
+    "CONFLUENCE_BELOW_MINIMUM": "Confluence below minimum",
+    "TECHNICAL_QUALITY_BELOW_MINIMUM": "Technical Quality below minimum",
+    "EXECUTION_QUALITY_BELOW_MINIMUM": "Execution Quality below minimum",
+    "OVERALL_QUALITY_BELOW_MINIMUM": "Overall Quality below minimum",
+    "RANK_BELOW_MINIMUM": "Rank below minimum",
+    "IMMEDIATE_SL_RISK_TOO_HIGH": "Immediate-SL risk too high",
+    "DATA_QUALITY_FAILED": "Market data quality failed",
+    "MARKET_QUALITY_FAILED": "Market quality failed",
+    "STALE_TICKER": "Ticker data stale",
+    "STALE_ORDER_BOOK": "Order book stale",
+    "SPREAD_TOO_WIDE": "Spread too wide",
+    "ENTRY_BLOCKED": "Entry blocked",
+    "ENTRY_EXPIRED": "Entry expired",
+    "CONFIRMATION_PENDING": "Confirmation still pending",
+    "AVOID_CHASE": "Entry already too extended",
+    "PRICE_TOO_EXTENDED": "Price too extended",
+    "INVALIDATED_BEFORE_ENTRY": "Invalidated before entry",
+    "TP1_ALREADY_PROGRESSING": "Too much of the TP1 move already occurred",
+    "NO_FEASIBLE_TARGET": "No feasible target",
+    "TP1_BLOCKED": "TP1 blocked by structure",
+    "NET_RR_BELOW_MINIMUM": "Net R:R below minimum",
+    "GROSS_RR_BELOW_MINIMUM": "Gross R:R below minimum",
+    "STOP_QUALITY_FAILED": "Stop quality too poor",
+    "STOP_TOO_TIGHT": "Stop too tight for normal volatility",
+    "STOP_TOO_WIDE": "Stop too wide for an efficient trade",
+    "PROP_COMPATIBILITY_FAILED": "Prop compatibility failed",
+    "RANGE_DURING_TREND_EXPANSION": "Range setup conflicts with trend expansion",
+    "REVERSAL_CONFIRMATION_INSUFFICIENT": "Reversal confirmation insufficient",
+    "STRUCTURE_CONFLICT": "Market structure conflicts with the setup",
+    "REVALIDATION_FAILED": "Final revalidation failed",
+    "ANALYSIS_ERROR": "Analysis unavailable",
+    "MARKET_UNAVAILABLE": "Market unavailable",
+}
+
+_REJECTION_WHY = {
+    "GROSS_RR_BELOW_MINIMUM": "The available reward did not justify the planned risk.",
+    "NET_RR_BELOW_MINIMUM": "Trading costs reduced the achievable reward below the production requirement.",
+    "OVERALL_QUALITY_BELOW_MINIMUM": "The complete setup did not reach the required production quality.",
+    "EXECUTION_QUALITY_BELOW_MINIMUM": "The direction may be valid, but entry and trade execution were not clean enough.",
+    "IMMEDIATE_SL_RISK_TOO_HIGH": "Normal short-term movement could reach the stop before the setup develops.",
+    "ENTRY_BLOCKED": "The published entry rules could not be followed safely at the current price.",
+    "AVOID_CHASE": "Price moved too far from the planned entry, so entering now would be chasing.",
+    "PRICE_TOO_EXTENDED": "Price is too extended from the planned entry for controlled risk.",
+    "TP1_ALREADY_PROGRESSING": "Too much of the expected move occurred before a valid entry was available.",
+    "TP1_BLOCKED": "Nearby opposing structure makes the first target unrealistic.",
+    "NO_FEASIBLE_TARGET": "No target remained realistic after structure, volatility, and costs were considered.",
+    "STOP_QUALITY_FAILED": "The stop did not represent a clean, efficient thesis invalidation level.",
+    "STOP_TOO_TIGHT": "The stop sits inside normal volatility and is vulnerable to a routine sweep.",
+    "STOP_TOO_WIDE": "The stop requires too much risk for the available target distance.",
+    "SPREAD_TOO_WIDE": "Current spread makes entry and exit costs unsafe.",
+    "STALE_TICKER": "The current-price source was too old for a safe execution decision.",
+    "STALE_ORDER_BOOK": "The liquidity snapshot was too old for a safe execution decision.",
+    "DATA_QUALITY_FAILED": "The bot could not verify sufficiently fresh and complete market data.",
+    "MARKET_QUALITY_FAILED": "Liquidity or market conditions were not suitable for dependable execution.",
+    "PROP_COMPATIBILITY_FAILED": "The plan did not satisfy every active prop-account safety requirement.",
+    "REVERSAL_CONFIRMATION_INSUFFICIENT": "The reversal lacked enough structure shift and confirmation.",
+    "STRUCTURE_CONFLICT": "Current market structure disagreed with the proposed trade direction.",
+}
+
+
+def _required_number(required: Any) -> Optional[float]:
+    if isinstance(required, dict):
+        return _optional_number(required.get("value"))
+    return _optional_number(required)
+
+
+def _failed_gate(row: Dict[str, Any], code: str) -> Dict[str, Any]:
+    evaluation = row.get("gate_evaluation")
+    gates = list(evaluation.get("gates") or []) if isinstance(evaluation, dict) else []
+    matches = [
+        gate
+        for gate in gates
+        if str(gate.get("code") or "") == code and not gate.get("passed")
+    ]
+    authoritative = [gate for gate in matches if gate.get("authoritative") is not False]
+    return dict((authoritative or matches)[-1]) if (authoritative or matches) else {}
+
+
+def _rr_value(row: Dict[str, Any], key: str) -> Optional[float]:
+    values = list(row.get(key) or [])
+    if not values:
+        return None
+    index = 1 if len(values) > 1 else 0
+    return _optional_number(values[index])
+
+
+def rejection_explanation(row: Dict[str, Any], code: Optional[str] = None) -> Tuple[str, str]:
+    """Return an exact failed-gate statement plus a plain-language reason."""
+    selected = str(
+        code
+        or row.get("primary_rejection_reason")
+        or row.get("closest_to_passing_gate")
+        or ((row.get("all_rejection_reasons") or [""])[0])
+    )
+    gate = _failed_gate(row, selected)
+    actual = _optional_number(gate.get("actual_value"))
+    required = _required_number(gate.get("required_value"))
+    label = _REJECTION_LABELS.get(selected, selected.replace("_", " ").title())
+
+    if selected == "GROSS_RR_BELOW_MINIMUM":
+        actual = actual if actual is not None else _rr_value(row, "gross_rr")
+        detail = f"🚫 Gross R:R = {actual:.2f}R" if actual is not None else f"🚫 {label}"
+        if required is not None:
+            detail += f" · minimum {required:.2f}R"
+    elif selected == "NET_RR_BELOW_MINIMUM":
+        actual = actual if actual is not None else _rr_value(row, "net_rr")
+        detail = f"🚫 Net R:R = {actual:.2f}R" if actual is not None else f"🚫 {label}"
+        if required is not None:
+            detail += f" · minimum {required:.2f}R"
+    elif selected in {
+        "OVERALL_QUALITY_BELOW_MINIMUM",
+        "TECHNICAL_QUALITY_BELOW_MINIMUM",
+        "EXECUTION_QUALITY_BELOW_MINIMUM",
+        "RANK_BELOW_MINIMUM",
+    } and actual is not None:
+        detail = f"🚫 {label}: {actual:.1f}/100"
+        if required is not None:
+            detail += f" · minimum {required:.1f}/100"
+    elif selected == "IMMEDIATE_SL_RISK_TOO_HIGH" and actual is not None:
+        detail = f"⚠️ Immediate-SL risk = {actual:.1f}/100"
+        if required is not None:
+            detail += f" · maximum {required:.1f}/100"
+    elif selected == "SPREAD_TOO_WIDE" and actual is not None:
+        detail = f"⚠️ Spread = {actual:.2f} bps"
+        if required is not None:
+            detail += f" · maximum {required:.2f} bps"
+    elif selected in {"PRICE_TOO_EXTENDED", "AVOID_CHASE"} and actual is not None:
+        detail = f"⚠️ Entry extension = {actual:.2f} ATR"
+        if required is not None:
+            detail += f" · maximum {required:.2f} ATR"
+    elif selected in {"STALE_TICKER", "STALE_ORDER_BOOK"} and actual is not None:
+        detail = f"⚠️ {label}: {actual:.1f}s old"
+        if required is not None:
+            detail += f" · maximum {required:.1f}s"
+    else:
+        explanation = str(gate.get("explanation") or "").strip()
+        detail = f"🚫 {label}"
+        if explanation and explanation.lower() != label.lower():
+            detail += f" · {explanation}"
+
+    why = _REJECTION_WHY.get(
+        selected,
+        "The setup did not pass every production safety requirement.",
+    )
+    return detail, why
 
 
 def _caption_price(value: Any) -> str:
@@ -916,7 +1180,12 @@ def format_prop_scan_report(
     header = "📊 <b>Perpetual Pro Prop Scan</b>"
     if slot_label:
         header += f" · {html.escape(slot_label)}"
-    lines = [header, when, "15m execution · 1h/4h confirmation · ≤5x", ""]
+    lines = [
+        header,
+        f"🕒 {html.escape(when)}",
+        "15m Execution • 1h/4h Confirmation • ≤5x",
+        "━━━━━━━━━━━━━━",
+    ]
     if not ranked:
         diagnostic = dict(rejection_summary or {})
         directional_count = int(
@@ -924,45 +1193,61 @@ def format_prop_scan_report(
             if diagnostic.get("directional_candidates") is not None
             else (ranked_count or 0)
         )
+        eligible_count = int(diagnostic.get("eligible_candidates") or 0)
+        rejected_count = max(0, directional_count - eligible_count)
         lines += [
-            "⏸ <b>NO QUALITY SETUP — STAND ASIDE</b>",
+            "⏸️ <b>NO QUALITY SETUP</b>",
             "",
             (
-                f"Scanned {scanned_count} symbols"
+                f"{scanned_count} symbols scanned"
                 if scanned_count is not None
-                else "Scheduled scan completed"
-            )
-            + (
-                f" · {directional_count} directional candidate(s)"
-                if ranked_count is not None or diagnostic
-                else ""
-            )
-            + ".",
-            (
-                f"Nothing passed ≥{min_signal_confidence:.0f}% confidence, "
-                "execution/SL-risk, market-quality, R:R, and prop-safety gates."
+                else "Watchlist scan completed"
             ),
+            f"{directional_count} directional setup(s) · {rejected_count} rejected",
+            "No setup passed every production safety gate.",
         ]
         if diagnostic:
-            labels = {
-                "OVERALL_QUALITY_BELOW_MINIMUM": "Overall Quality below minimum",
-                "EXECUTION_QUALITY_BELOW_MINIMUM": "Execution Quality below minimum",
-                "CONFLUENCE_BELOW_MINIMUM": "Confluence below minimum",
-                "AVOID_CHASE": "Avoid Chase",
-                "ENTRY_BLOCKED": "Entry blocked",
-                "FLAT_DIRECTION": "Flat/non-directional",
-                "NO_FEASIBLE_TARGET": "No feasible target",
-                "PROP_COMPATIBILITY_FAILED": "Prop compatibility",
-            }
+            distributions = dict(diagnostic.get("score_distributions") or {})
+            overall_stats = dict(distributions.get("overall_quality") or {})
+            average_overall = _optional_number(overall_stats.get("average"))
+            highest_overall = _optional_number(overall_stats.get("maximum"))
+            duration = _optional_number(diagnostic.get("scan_duration_seconds"))
+            freshness = dict(diagnostic.get("freshness") or {})
+            highest_age = _optional_number(freshness.get("highest_age_seconds"))
+            market_bits = []
+            if average_overall is not None:
+                market_bits.append(f"average Overall {average_overall:.1f}/100")
+            if highest_overall is not None:
+                market_bits.append(f"highest {highest_overall:.1f}/100")
+            if duration is not None:
+                market_bits.append(f"{duration:.1f}s")
+            if highest_age is not None:
+                market_bits.append(f"freshness age {highest_age:.1f}s")
+            if market_bits:
+                lines += [
+                    "━━━━━━━━━━━━━━",
+                    "📈 <b>Market Summary</b>",
+                    " • ".join(market_bits),
+                ]
             primary = dict(diagnostic.get("primary_rejection_counts") or {})
             primary.pop("ELIGIBLE", None)
             if primary:
-                lines += ["", "<b>Main blockers</b>"]
+                blocker_icons = {
+                    "FLAT_DIRECTION": "⚪",
+                    "OVERALL_QUALITY_BELOW_MINIMUM": "🟡",
+                    "EXECUTION_QUALITY_BELOW_MINIMUM": "🔴",
+                    "ENTRY_BLOCKED": "⚠️",
+                    "PROP_COMPATIBILITY_FAILED": "🛡",
+                }
+                lines += ["━━━━━━━━━━━━━━", "🚫 <b>Main blockers</b>"]
                 for code, count in sorted(
                     primary.items(), key=lambda item: (-item[1], item[0])
                 )[:4]:
-                    label = labels.get(code, code.replace("_", " ").title())
-                    lines.append(f"• {html.escape(label)}: {int(count)}")
+                    label = _REJECTION_LABELS.get(
+                        code, code.replace("_", " ").title()
+                    )
+                    icon = blocker_icons.get(code, "❌")
+                    lines.append(f"{icon} {html.escape(label)}: {int(count)}")
             nearest = list(diagnostic.get("closest_rejected_candidates") or [])
             nearest = [
                 row
@@ -973,29 +1258,77 @@ def format_prop_scan_report(
                 row = nearest[0]
                 symbol = html.escape(str(row.get("symbol") or "—").split("/")[0])
                 direction = html.escape(str(row.get("direction") or "").upper())
-                overall = _number(row.get("overall_quality"))
-                gate = str(row.get("closest_to_passing_gate") or "a required gate")
-                distance = _number(row.get("distance_to_eligibility"))
+                overall = _optional_number(row.get("overall_quality"))
+                execution = _optional_number(row.get("execution_quality"))
+                gate = str(
+                    row.get("primary_rejection_reason")
+                    or row.get("closest_to_passing_gate")
+                    or ""
+                )
+                rejection_detail, rejection_why = rejection_explanation(row, gate)
                 lines += [
-                    "",
-                    "<b>Closest rejected setup — NON-ACTIONABLE</b>",
-                    f"{symbol} {direction} · Overall {overall:.1f}/100"
+                    "━━━━━━━━━━━━━━",
+                    "⭐ <b>Closest Setup — REJECTED / NON-ACTIONABLE</b>",
+                    f"<b>{symbol} {direction}</b>",
+                    quality_badge(overall),
+                    f"Overall Quality {overall:.1f}/100"
                     if overall is not None
                     else f"{symbol} {direction}",
-                    (
-                        f"Nearest gate: {html.escape(labels.get(gate, gate.replace('_', ' ').title()))}"
-                        + (f" · diagnostic gap {distance:.3f}" if distance is not None else "")
-                    ),
+                    f"Execution Quality {execution:.1f}/100"
+                    if execution is not None
+                    else "",
+                    "",
+                    "🚫 <b>Why it was rejected</b>",
+                    html.escape(rejection_detail),
+                    f"🧠 {html.escape(rejection_why)}",
                 ]
-            lines += ["", "No gate was lowered. No rejected setup is a trade signal."]
+                lines = [line for line in lines if line]
         lines += [
-            "No trade is the correct position until a clean entry appears.",
-            "",
+            "━━━━━━━━━━━━━━",
+            "🛡 <b>No rules were relaxed.</b>",
+            "Sometimes the highest-probability trade is waiting.",
+            "No rejected setup is a trade signal.",
             "NFA · DYOR · Trade at your own risk",
         ]
         return "\n".join(lines)
 
-    lines.append(f"<b>{len(ranked)} actionable signal(s)</b>\n")
+    diagnostic = dict(rejection_summary or {})
+    directional_count = int(diagnostic.get("directional_candidates") or ranked_count or len(ranked))
+    eligible_count = int(diagnostic.get("eligible_candidates") or len(ranked))
+    rejected_count = max(0, directional_count - len(ranked))
+    scan_bits = [
+        f"Scanned {scanned_count}" if scanned_count is not None else None,
+        f"Directional {directional_count}",
+        f"Eligible {eligible_count}",
+        f"Accepted {len(ranked)}",
+        f"Rejected {rejected_count}",
+    ]
+    lines += [
+        "📈 <b>Scan Statistics</b>",
+        " • ".join(bit for bit in scan_bits if bit),
+    ]
+    overall_stats = dict(
+        (diagnostic.get("score_distributions") or {}).get("overall_quality")
+        or {}
+    )
+    summary_bits = []
+    average_overall = _optional_number(overall_stats.get("average"))
+    highest_overall = _optional_number(overall_stats.get("maximum"))
+    duration = _optional_number(diagnostic.get("scan_duration_seconds"))
+    highest_age = _optional_number(
+        (diagnostic.get("freshness") or {}).get("highest_age_seconds")
+    )
+    if average_overall is not None:
+        summary_bits.append(f"Average {average_overall:.1f}/100")
+    if highest_overall is not None:
+        summary_bits.append(f"Highest {highest_overall:.1f}/100")
+    if duration is not None:
+        summary_bits.append(f"{duration:.1f}s")
+    if highest_age is not None:
+        summary_bits.append(f"Freshness {highest_age:.1f}s")
+    if summary_bits:
+        lines.append(" • ".join(summary_bits))
+    lines.append("━━━━━━━━━━━━━━")
 
     def fmt_price(value: Any) -> str:
         try:
@@ -1046,6 +1379,23 @@ def format_prop_scan_report(
             if execution_score is not None
             else "—"
         )
+        gross_values = list(row.get("gross_risk_reward") or [])
+        net_values = list(row.get("net_risk_reward") or [])
+        rr_index = 1 if len(gross_values) > 1 else 0
+        gross_rr = (
+            _optional_number(gross_values[rr_index]) if gross_values else None
+        )
+        net_rr = (
+            _optional_number(net_values[rr_index])
+            if len(net_values) > rr_index
+            else gross_rr
+        )
+        rr_summary = ""
+        if gross_rr is not None:
+            rr_summary = f"   📊 Gross R:R {gross_rr:.2f}R"
+            if net_rr is not None and abs(net_rr - gross_rr) >= 0.01:
+                rr_summary += f" • Net {net_rr:.2f}R"
+        freshness_state = str(row.get("data_freshness_state") or "").strip()
         targets = list(row.get("take_profits") or [])
         target_line = ""
         if targets:
@@ -1072,32 +1422,50 @@ def format_prop_scan_report(
             )
             else ""
         )
+        badge = quality_badge(confidence)
+        primary_risk = ""
+        risks = list(row.get("rejection_reasons") or [])
+        if risks:
+            risk_value = risks[0]
+            if isinstance(risk_value, dict):
+                risk_value = risk_value.get("detail") or risk_value.get("code") or ""
+            primary_risk = str(risk_value)[:100]
         lines.append(
-            f"{side_icon} <b>{i}. {html.escape(base)} {direction}</b> · "
-            f"<b>{'Calibrated TP1 probability ' + format(confidence, '.0f') + '%' if str(row.get('scoring_source') or '').startswith('outcome_champion') else 'Overall Quality ' + format(confidence, '.0f') + '/100'}</b>\n"
-            f"   Technical Quality {technical:.0f}/100 · Execution Quality {execution_s} · {entry_status}\n"
-            f"   Entry {entry_s}{target_line}\n"
-            f"   SL {fmt_price(row.get('stop_loss'))} · {lev}x · risk {risk_s} · {hold}\n"
+            f"{side_icon} <b>{i}. {html.escape(base)} {direction}</b>\n"
+            f"   {badge}\n"
+            f"   <b>{'Calibrated TP1 probability ' + format(confidence, '.0f') + '%' if str(row.get('scoring_source') or '').startswith('outcome_champion') else 'Overall Quality ' + format(confidence, '.0f') + '/100'}</b>\n"
+            f"   Technical Quality {technical:.0f}/100 • Execution Quality {execution_s} • {entry_status}\n"
+            f"   🎯 Entry {entry_s}{target_line}\n"
+            f"   🛑 Stop {fmt_price(row.get('stop_loss'))} • {lev}x • risk {risk_s} • {hold}\n"
+            + (f"{rr_summary}\n" if rr_summary else "")
+            + (
+                f"   🛡 Freshness: {html.escape(freshness_state)}\n"
+                if freshness_state
+                else ""
+            )
             + (
                 f"   Entry expires {valid_minutes}m · hold {hold_min:g}–{hold_typical:g}h\n"
                 if valid_minutes and hold_min and hold_typical
                 else ""
             )
             + outcome_line
-            + (f"\n   Why: {safe_reason}" if safe_reason else "")
+            + (f"\n   🧠 Strength: {safe_reason}" if safe_reason else "")
+            + (f"\n   ⚠️ Weakness: {html.escape(primary_risk)}" if primary_risk else "")
             + (f"\n   ⚠ {html.escape(', '.join(flags))}" if flags else "")
         )
-        lines.append("")
+        lines.append("━━━━━━━━━━━━━━")
     displayed_rows = ranked[:max_rows]
     calibrated = bool(displayed_rows) and all(
         str(row.get("scoring_source") or "").startswith("outcome_champion")
         for row in displayed_rows
     )
-    confidence_label = (
-        "calibrated confidence" if calibrated else "signal confidence"
+    threshold_text = (
+        f"≥{min_signal_confidence:.0f}% calibrated confidence"
+        if calibrated
+        else f"Overall Quality ≥{min_signal_confidence:.0f}/100"
     )
     lines.append(
-        f"🛡 Prop gate: <b>≥{min_signal_confidence:.0f}% {confidence_label}</b> · "
+        f"🛡 <b>Safety:</b> {threshold_text} · "
         "clean execution · TP2 ≥1.25R · 0.5–1% each · ≤2% total open risk · ≤5x"
     )
     lines.append("NFA · DYOR · Trade at your own risk")
@@ -1111,8 +1479,10 @@ def telegram_from_config(config: AppConfig) -> TelegramConfig:
 
 def is_telegram_ready(config: Optional[AppConfig] = None) -> bool:
     """True when env credentials exist (and policy not force-disabled)."""
-    token, chat = get_telegram_credentials()
-    if not token or not chat:
+    token, public_chat = get_telegram_credentials()
+    # Bot/webhook readiness is broader than scheduled delivery readiness. The
+    # scheduler separately verifies that the active mode has destinations.
+    if not token or not (public_chat or get_private_beta_chat_ids()):
         return False
     if config is not None and not config.telegram.enabled:
         return False

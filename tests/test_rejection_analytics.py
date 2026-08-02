@@ -300,8 +300,8 @@ def test_manual_no_quality_report_is_explicitly_non_actionable():
     report = format_prop_scan_report(
         [], scanned_count=21, ranked_count=1, rejection_summary=summary
     )
-    assert "Closest rejected setup — NON-ACTIONABLE" in report
-    assert "No gate was lowered" in report
+    assert "Closest Setup — REJECTED / NON-ACTIONABLE" in report
+    assert "No rules were relaxed" in report
 
 
 def test_llm_rate_limit_is_observability_only(monkeypatch):

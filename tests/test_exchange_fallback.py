@@ -141,6 +141,112 @@ def test_fallback_closes_clients_on_exception(monkeypatch):
     result.client.close()
 
 
+def test_known_unsupported_preferred_market_exits_without_fallback(monkeypatch):
+    import src.data.multi_tf as multi_tf
+
+    def fake_order(preferred, config=None, auto_fallback=None):
+        return ["okx", "bybit", "binanceusdm"]
+
+    def fake_fetch(
+        client,
+        symbol,
+        primary_tf,
+        higher_tfs=None,
+        limit=500,
+        include_snapshot=True,
+        config=None,
+    ):
+        assert client.exchange_id == "okx"
+        mtf = _empty_mtf(symbol, "okx", primary_tf)
+        mtf.errors = [f"unsupported_market:okx:{symbol}"]
+        return mtf
+
+    monkeypatch.setattr(multi_tf, "build_exchange_attempt_order", fake_order)
+    monkeypatch.setattr(multi_tf, "ExchangeClient", _FakeClient)
+    monkeypatch.setattr(multi_tf, "fetch_multi_timeframe", fake_fetch)
+
+    result = fetch_multi_timeframe_with_fallback(
+        symbol="NOTLISTED/USDT:USDT",
+        primary_tf="15m",
+        preferred_exchange="okx",
+    )
+
+    assert result.mtf.primary.empty
+    assert result.attempted_exchanges == ["okx"]
+    assert result.exchange_used == "okx"
+    assert result.fallback_used is False
+    assert _FakeClient.open_ids == ["okx"]
+    assert "bybit" not in _FakeClient.open_ids
+    result.client.close()
+
+
+def test_loaded_market_map_rejects_missing_perpetual_without_direct_fetch():
+    from src.data.exchange import ExchangeClient, UnsupportedMarketError
+
+    class DummyExchange:
+        markets = {
+            "ABSENT/USDT": {
+                "base": "ABSENT",
+                "quote": "USDT",
+                "spot": True,
+                "swap": False,
+                "future": False,
+            },
+            "BTC/USDT:USDT": {
+                "base": "BTC",
+                "quote": "USDT",
+                "swap": True,
+                "future": False,
+                "linear": True,
+            },
+        }
+
+    client = ExchangeClient.__new__(ExchangeClient)
+    client.exchange_id = "unsupported-test-okx"
+    client._exchange = DummyExchange()
+    client._markets_loaded = True
+    client.cache_ttl_seconds = 300
+    client.load_markets = lambda reload=False: client._exchange.markets
+
+    with pytest.raises(UnsupportedMarketError, match="unsupported_market"):
+        client.resolve_symbol("ABSENT")
+
+
+def test_multi_timeframe_unsupported_preflight_makes_no_market_calls():
+    from src.data.exchange import UnsupportedMarketError
+    from src.data.multi_tf import fetch_multi_timeframe
+
+    class UnsupportedClient:
+        exchange_id = "okx"
+
+        def __init__(self):
+            self.market_calls = 0
+
+        def resolve_symbol(self, symbol):
+            raise UnsupportedMarketError(f"unsupported_market:okx:{symbol}")
+
+        def fetch_ohlcv(self, *args, **kwargs):
+            self.market_calls += 1
+            raise AssertionError("OHLCV must not be requested")
+
+        def fetch_market_snapshot(self, *args, **kwargs):
+            self.market_calls += 1
+            raise AssertionError("snapshot must not be requested")
+
+    client = UnsupportedClient()
+    result = fetch_multi_timeframe(
+        client,
+        symbol="ABSENT/USDT:USDT",
+        primary_tf="15m",
+        higher_tfs=["1h", "4h"],
+    )
+
+    assert result.primary.empty
+    assert client.market_calls == 0
+    assert result.errors == ["unsupported_market:okx:ABSENT/USDT:USDT"]
+    assert all(item["reason"] == "unsupported_market" for item in result.quality.values())
+
+
 def test_build_exchange_attempt_order_prefers_requested():
     from src.data.exchange import build_exchange_attempt_order
 

@@ -391,6 +391,8 @@ def test_complete_scan_failure_is_not_reported_as_legitimate_empty(monkeypatch):
 def test_scheduler_reports_complete_failure_differently_from_no_setup(monkeypatch):
     cfg = _config()
     cfg.telegram.notify_on_empty = False
+    monkeypatch.setenv("DELIVERY_MODE", "public")
+    monkeypatch.setenv("TELEGRAM_COMMAND_CHAT_IDS", "1")
     monkeypatch.setattr(scan_job, "is_telegram_ready", lambda config: True)
     monkeypatch.setattr(scan_job, "get_telegram_alert_chat_ids", lambda override=None: ["1"])
     monkeypatch.setattr(

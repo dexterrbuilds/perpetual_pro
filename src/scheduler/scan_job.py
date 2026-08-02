@@ -24,8 +24,9 @@ from src.analysis.revalidation import revalidate_candidate_for_delivery
 from src.notify.telegram import (
     format_signal_photo_caption,
     format_prop_scan_report,
+    get_delivery_status,
     get_telegram_alert_chat_ids,
-    get_telegram_private_operator_chat_ids,
+    get_telegram_report_chat_ids,
     is_telegram_ready,
     send_telegram_message_detailed,
     send_telegram_photo_detailed,
@@ -572,6 +573,17 @@ def _run_scheduled_scan_once_unlocked(
         filtered = [row for row in accepted if row is not None]
 
     scan_failed = not bool(result.get("ok"))
+    report_summary = dict(result.get("rejection_analytics") or {})
+    report_summary.update(
+        {
+            "scan_duration_seconds": round(
+                time.monotonic() - scan_started_monotonic, 3
+            ),
+            "accepted_candidates": len(filtered),
+            "revalidated_candidates": len(filtered),
+            "pre_delivery_rejected_count": len(pre_delivery_rejected),
+        }
+    )
     if scan_failed:
         report = (
             "⚠️ <b>SCAN UNAVAILABLE</b>\n\n"
@@ -590,9 +602,7 @@ def _run_scheduled_scan_once_unlocked(
             ),
             scanned_count=len(watchlist),
             ranked_count=len(ranked),
-            rejection_summary=(
-                result.get("rejection_analytics") if manual_delivery else None
-            ),
+            rejection_summary=report_summary,
         )
     sent = False
     delivery: Optional[Dict[str, Any]] = None
@@ -600,13 +610,20 @@ def _run_scheduled_scan_once_unlocked(
     tracking: Optional[Dict[str, Any]] = None
     delivery_status = "not_requested"
     # Manual commands keep their exclusive per-request destination. Recurring
-    # scans send eligible signals to public alert channels, while no-setup and
-    # operational reports are restricted to explicit private operator chats.
+    # scans use the configured delivery mode; this routing layer does not alter
+    # signal generation, eligibility, or lifecycle rules.
     destinations = get_telegram_alert_chat_ids(telegram_chat_ids)
-    report_destinations = (
-        destinations
-        if manual_delivery
-        else get_telegram_private_operator_chat_ids()
+    report_destinations = get_telegram_report_chat_ids(
+        telegram_chat_ids if manual_delivery else None
+    )
+    routing_status = get_delivery_status()
+    logger.info(
+        "Delivery Mode: {} recipients_attempted={} report_recipients={} "
+        "public_enabled={}",
+        routing_status["mode_label"],
+        len(destinations),
+        len(report_destinations),
+        routing_status["public_delivery_enabled"],
     )
     # Credentials from env only (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — never YAML
     tg_ready = is_telegram_ready(cfg) and bool(
@@ -798,6 +815,14 @@ def _run_scheduled_scan_once_unlocked(
                         "was incomplete: errors={}",
                         tracking.get("errors") or tracking.get("error"),
                     )
+            logger.info(
+                "Telegram signal delivery summary: mode={} attempted={} "
+                "successful={} failed={}",
+                routing_status["mode_label"],
+                len(destinations),
+                sum(1 for item in destination_results if item.get("ok")),
+                sum(1 for item in destination_results if not item.get("ok")),
+            )
         elif suppressed_duplicates:
             delivery_status = "skipped_duplicate_signals"
             logger.info(
@@ -805,10 +830,14 @@ def _run_scheduled_scan_once_unlocked(
                 "signal(s) were already sent and remain valid",
                 len(suppressed_duplicates),
             )
-        elif scan_failed or (
-            bool(notify_on_empty)
-            if notify_on_empty is not None
-            else cfg.telegram.notify_on_empty
+        elif (
+            scan_failed
+            or routing_status["mode"] == "private_beta"
+            or (
+                bool(notify_on_empty)
+                if notify_on_empty is not None
+                else cfg.telegram.notify_on_empty
+            )
         ):
             destination_results = []
             report_type = "scan_failure" if scan_failed else "no_quality_report"
@@ -876,6 +905,14 @@ def _run_scheduled_scan_once_unlocked(
                     slot_label or "scan",
                     "scan_unavailable" if scan_failed else "no_quality_setup",
                 )
+            logger.info(
+                "Telegram report delivery summary: mode={} attempted={} "
+                "successful={} failed={}",
+                routing_status["mode_label"],
+                len(report_destinations),
+                sent_count,
+                max(0, len(report_destinations) - sent_count),
+            )
         else:
             delivery_status = "skipped_no_actionable_signals"
             logger.info(
@@ -887,7 +924,7 @@ def _run_scheduled_scan_once_unlocked(
         delivery_status = "failed_not_configured"
         logger.warning(
             "Scheduled Telegram alert failed before send: credentials disabled or missing. "
-            "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the running process environment."
+            "Set TELEGRAM_BOT_TOKEN and recipients for the active delivery mode."
         )
     elif not send:
         delivery_status = "disabled_for_run"
@@ -927,7 +964,13 @@ def _run_scheduled_scan_once_unlocked(
         1 for item in delivery_audit if item.get("ok")
     )
     public_messages = (
-        successful_delivery_events if not manual_delivery and filtered else 0
+        successful_delivery_events
+        if (
+            not manual_delivery
+            and filtered
+            and routing_status["public_delivery_enabled"]
+        )
+        else 0
     )
     private_messages = successful_delivery_events - public_messages
     candidate_updates: List[Dict[str, Any]] = []
@@ -1006,6 +1049,8 @@ def _run_scheduled_scan_once_unlocked(
         "main_rejection_reasons": rejection_counts,
         "llm_invocation_counts": llm_counts,
         "public_empty_suppressed": public_empty_suppressed,
+        "delivery_mode": routing_status["mode"],
+        "delivery_recipient_count": len(destinations),
         "rejection_analytics": result.get("rejection_analytics") or {},
         "rejection_analytics_finalized": analytics_finalized,
         "slot_label": slot_label,

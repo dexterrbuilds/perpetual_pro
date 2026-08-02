@@ -49,6 +49,7 @@ from src.vision.url_symbol import parse_chart_url
 
 # Web / scan UI prioritizes conservative display leverage (model may suggest higher)
 SCAN_LEVERAGE_CAP = 5
+MAX_INTERNAL_SCAN_SYMBOLS = 50
 
 
 def apply_diagnostic_backtest_to_rank(
@@ -625,7 +626,7 @@ def scan_symbols(
     analysis_failures: List[Dict[str, str]] = []
     analyzed_count = 0
     scan_deadline = time.monotonic() + SCAN_BUDGET_SECONDS
-    for symbol in symbol_list[:40]:
+    for symbol in symbol_list[:MAX_INTERNAL_SCAN_SYMBOLS]:
         if time.monotonic() >= scan_deadline:
             analysis_failures.append(
                 {
@@ -663,16 +664,25 @@ def scan_symbols(
             try:
                 mtf = fetch.mtf
                 if mtf.primary.empty:
+                    unsupported_market = any(
+                        "unsupported_market:" in str(error).lower()
+                        for error in mtf.errors
+                    )
                     logger.info(
-                        "Scan skip {}: empty OHLCV after {}",
+                        "Scan skip {}: {} after {}",
                         normalized_symbol,
+                        "unsupported market" if unsupported_market else "empty OHLCV",
                         " → ".join(fetch.attempted_exchanges),
                     )
                     analysis_failures.append(
                         {
                             "symbol": normalized_symbol,
                             "code": "MARKET_UNAVAILABLE",
-                            "reason": "no_primary_market_data",
+                            "reason": (
+                                "unsupported_market"
+                                if unsupported_market
+                                else "no_primary_market_data"
+                            ),
                         }
                     )
                     continue

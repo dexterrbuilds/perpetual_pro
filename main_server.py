@@ -51,6 +51,7 @@ from src.api.security import (
     validate_timeframe,
 )
 from src.notify.telegram import (
+    get_delivery_status,
     get_telegram_alert_chat_ids,
     get_telegram_credentials,
     is_telegram_ready,
@@ -108,6 +109,15 @@ async def lifespan(app: FastAPI):
         str(identity["git_commit_sha"])[:12], identity["build_timestamp"],
         identity["feature_schema"], identity["execution_policy"],
         identity["rank_policy"], identity["environment"],
+    )
+    delivery = get_delivery_status()
+    logger.info(
+        "Delivery Mode: {} beta_recipients={} public_enabled={} "
+        "active_signal_recipients={}",
+        delivery["mode_label"],
+        delivery["beta_recipient_count"],
+        delivery["public_delivery_enabled"],
+        delivery["active_signal_recipient_count"],
     )
     scoring_runtime = get_outcome_scoring_runtime(cfg)
     scoring_database_ready = scoring_runtime.repository.check_ready()
@@ -261,6 +271,7 @@ def admin_status(
     return {
         "ok": True,
         "build": get_build_identity(),
+        "delivery": get_delivery_status(),
         "scheduler": get_scheduler_status(),
         "signal_tracker": get_signal_tracker_status(),
         "outcome_scoring": get_outcome_scoring_status(get_config()),
@@ -357,6 +368,7 @@ def telegram_status() -> Dict[str, Any]:
     cfg = get_config()
     token, chat = get_telegram_credentials()
     alert_chats = get_telegram_alert_chat_ids()
+    delivery = get_delivery_status()
     command_chats = get_telegram_command_chat_ids(chat)
     return {
         "ok": True,
@@ -366,6 +378,9 @@ def telegram_status() -> Dict[str, Any]:
             "token_configured": bool(token),
             "chat_id_configured": bool(chat),
             "alert_chat_count": len(alert_chats),
+            "delivery_mode": delivery["mode"],
+            "beta_recipient_count": delivery["beta_recipient_count"],
+            "public_delivery_enabled": delivery["public_delivery_enabled"],
             "additional_alert_chats_configured": bool(
                 (os.getenv("TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS") or "").strip()
             ),

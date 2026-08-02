@@ -835,9 +835,25 @@ def aggregate_rejection_rows(
         distributions[field_name] = {
             "count": len(values),
             "minimum": min(values) if values else None,
+            "average": (
+                round(sum(values) / len(values), 4) if values else None
+            ),
             "median": median(values) if values else None,
             "maximum": max(values) if values else None,
         }
+    ticker_ages = [
+        value
+        for value in (_number(row.get("ticker_age_seconds")) for row in candidates)
+        if value is not None
+    ]
+    orderbook_ages = [
+        value
+        for value in (
+            _number(row.get("orderbook_age_seconds")) for row in candidates
+        )
+        if value is not None
+    ]
+    all_freshness_ages = [*ticker_ages, *orderbook_ages]
     suspicious = detect_suspicious_gate_behavior(
         candidates, minimum_directional_sample=suspicious_minimum_sample
     )
@@ -870,6 +886,15 @@ def aggregate_rejection_rows(
         "primary_rejections_by_timeframe": {key: dict(value) for key, value in primary_by_timeframe.items()},
         "failed_gates_by_stage": dict(failures_by_stage),
         "score_distributions": distributions,
+        "freshness": {
+            "max_ticker_age_seconds": max(ticker_ages) if ticker_ages else None,
+            "max_orderbook_age_seconds": (
+                max(orderbook_ages) if orderbook_ages else None
+            ),
+            "highest_age_seconds": (
+                max(all_freshness_ages) if all_freshness_ages else None
+            ),
+        },
         "closest_rejected_candidates": nearest,
         "suspicious_diagnostics": suspicious,
     }

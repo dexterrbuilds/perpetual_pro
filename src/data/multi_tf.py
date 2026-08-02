@@ -15,8 +15,10 @@ from loguru import logger
 from src.data.exchange import (
     ExchangeClient,
     MarketSnapshot,
+    UnsupportedMarketError,
     build_exchange_attempt_order,
     is_permanent_exchange_access_error,
+    is_unsupported_market_error,
     normalize_exchange_id,
 )
 from src.utils.config import AppConfig
@@ -225,6 +227,25 @@ def fetch_multi_timeframe(
         primary_tf=primary_tf,
     )
 
+    resolver = getattr(client, "resolve_symbol", None)
+    try:
+        resolved_symbol = resolver(symbol) if callable(resolver) else symbol
+    except UnsupportedMarketError as exc:
+        error = str(exc)
+        logger.info("Unsupported market: {}; skipping fetch", error)
+        result.errors.append(error)
+        result.frames = {tf: pd.DataFrame() for tf in ordered}
+        result.quality = {
+            tf: {
+                "ok": False,
+                "score": 0.0,
+                "reason": "unsupported_market",
+                "bars": 0,
+            }
+            for tf in ordered
+        }
+        return result
+
     workers = max(
         1,
         min(
@@ -235,10 +256,18 @@ def fetch_multi_timeframe(
     futures: Dict[Future, tuple[str, str]] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for tf in ordered:
-            future = pool.submit(client.fetch_ohlcv, symbol, timeframe=tf, limit=limit)
+            future = pool.submit(
+                client.fetch_ohlcv,
+                resolved_symbol,
+                timeframe=tf,
+                limit=limit,
+            )
             futures[future] = ("ohlcv", tf)
         if include_snapshot:
-            futures[pool.submit(client.fetch_market_snapshot, symbol)] = ("snapshot", "snapshot")
+            futures[pool.submit(client.fetch_market_snapshot, resolved_symbol)] = (
+                "snapshot",
+                "snapshot",
+            )
 
         for future in as_completed(futures):
             kind, label = futures[future]
@@ -367,12 +396,30 @@ def fetch_multi_timeframe_with_fallback(
                     attempted_exchanges=list(attempted),
                 )
 
+            failure_detail = " | ".join(mtf.errors)
+            if is_unsupported_market_error(failure_detail):
+                logger.info(
+                    "Unsupported market: {} is unavailable on preferred venue {}; "
+                    "skipping exchange fallback",
+                    symbol,
+                    ex_id,
+                )
+                if last_client is not None:
+                    last_client.close()
+                return FallbackFetchResult(
+                    mtf=mtf,
+                    client=client,
+                    requested_exchange=requested,
+                    exchange_used=ex_id,
+                    fallback_used=False,
+                    attempted_exchanges=list(attempted),
+                )
+
             logger.warning(
                 "Empty OHLCV for {} on {} — trying next exchange",
                 symbol,
                 ex_id,
             )
-            failure_detail = " | ".join(mtf.errors)
             if is_permanent_exchange_access_error(failure_detail):
                 _block_venue(ex_id, failure_detail)
             # Keep this client as last-resort shell; drop previous empty one

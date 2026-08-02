@@ -256,28 +256,57 @@ def test_liquid_crypto_watchlist_is_consistent():
         "ETH",
         "SOL",
         "BNB",
-        "TRX",
-        "UNI",
         "XRP",
         "DOGE",
-        "LTC",
+        "TRX",
         "LINK",
-        "BCH",
-        "HBAR",
-        "XLM",
-        "HYPE",
-        "ZEC",
-        "XMR",
-        "ICP",
-        "ALGO",
         "AVAX",
-        "PENGU",
+        "ADA",
+        "SUI",
+        "APT",
+        "ARB",
+        "OP",
+        "INJ",
+        "SEI",
+        "HYPE",
         "WIF",
         "BONK",
+        "PENGU",
+        "FET",
+        "TAO",
+        "RENDER",
+        "NEAR",
+        "TON",
+        "LTC",
+        "BCH",
+        "ICP",
+        "ALGO",
+        "FIL",
+        "AAVE",
+        "UNI",
+        "CRV",
+        "ENA",
+        "JUP",
+        "PYTH",
+        "TIA",
+        "KAS",
+        "VIRTUAL",
+        "HBAR",
+        "XLM",
+        "ZEC",
+        "DOT",
+        "ATOM",
+        "ETC",
     ]
     cfg = load_config(ROOT / "config.yaml")
 
     assert DEFAULT_CRYPTO_WATCHLIST == expected
     assert SchedulerConfig().watchlist == expected
-    assert cfg.scheduler.watchlist == [symbol for symbol in expected if symbol != "XMR"]
-    assert "XMR" in DEFAULT_CRYPTO_WATCHLIST  # generic venue support is preserved
+    assert cfg.scheduler.watchlist == expected
+    assert len(expected) == 45
+    assert "XMR" not in DEFAULT_CRYPTO_WATCHLIST
+    assert "XMR" not in cfg.scheduler.watchlist
+
+    from src.api.service import MAX_INTERNAL_SCAN_SYMBOLS
+
+    assert MAX_INTERNAL_SCAN_SYMBOLS >= len(expected)

@@ -89,6 +89,8 @@ Built to feel like a senior prop trader sitting next to you.
 # Copy .env.example → .env (gitignored) and fill:
 export TELEGRAM_BOT_TOKEN="your-bot-token-from-BotFather"
 export TELEGRAM_CHAT_ID="your-alert-group-id"
+export DELIVERY_MODE="private_beta"
+export PRIVATE_BETA_CHAT_IDS="your-dm-id,beta-tester-dm-id"
 export TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS="your-private-channel-id"
 export TELEGRAM_COMMAND_CHAT_IDS="your-private-chat-id"
 export TELEGRAM_TEST_KEY="a-long-random-admin-key"
@@ -125,9 +127,12 @@ curl -X POST https://your-host/telegram/test-scan \
 
 The API registers a secured Telegram webhook at startup. On Render it uses
 `RENDER_EXTERNAL_URL` automatically; other hosts can set `TELEGRAM_WEBHOOK_URL`.
-Set `TELEGRAM_CHAT_ID` to the group/channel that receives alerts. Optionally set
-comma/space-separated `TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS` to mirror scheduled
-alerts to more destinations, such as a private channel. Set
+`DELIVERY_MODE` defaults to `private_beta`. In that mode, scheduled signals,
+no-setup reports, and diagnostics go only to the validated numeric DMs in
+comma-separated `PRIVATE_BETA_CHAT_IDS`; `TELEGRAM_CHAT_ID` is never used for
+production delivery. Set `DELIVERY_MODE=public` to restore public signals to
+`TELEGRAM_CHAT_ID` and optional comma/space-separated
+`TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS`. Set
 comma/space-separated `TELEGRAM_COMMAND_CHAT_IDS` to accept commands from
 different private chats; when omitted, commands fall back to `TELEGRAM_CHAT_ID`.
 
@@ -143,11 +148,10 @@ different private chats; when omitted, commands fall back to `TELEGRAM_CHAT_ID`.
 ```
 
 Manual `/scan` acknowledgements, qualified charts, and stand-aside results stay
-in the requesting authorized DM. Scheduled scans fan out to the main group in
-`TELEGRAM_CHAT_ID` and every destination in
-`TELEGRAM_ADDITIONAL_ALERT_CHAT_IDS`. Overlapping scheduled/on-demand scans are
-blocked. The bot must be started by the user for a private chat, added to a group,
-or made an administrator with posting permission for a channel. Telegram numeric
+in the requesting authorized DM. Scheduled destinations follow `DELIVERY_MODE`.
+Overlapping scheduled/on-demand scans are blocked. The bot must be started by
+each beta user before their DM can receive alerts, and must be an administrator
+with posting permission before public channel mode is enabled. Telegram numeric
 group/channel IDs commonly begin with `-100`.
 
 > A scheduler embedded in a web service runs only while that process is awake.
