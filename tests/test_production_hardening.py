@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -23,6 +24,7 @@ from src.tracking.durable_repository import (
     remaining_size_for,
 )
 from src.tracking.signal_tracker import SignalStore, SignalTracker
+from src.scheduler import scan_job
 from src.utils.build_info import get_build_identity
 from src.utils.config import load_config
 
@@ -327,6 +329,47 @@ def test_build_identity_reports_policy_versions(monkeypatch):
     assert identity["execution_policy"] == "execution_quality_v2a.1"
     assert identity["rank_policy"] == "deterministic_rank_v2a.1"
     assert identity["identity_complete"] is True
+
+
+def test_private_one_shot_uses_date_trigger_once_and_cleans_up(monkeypatch):
+    completed = threading.Event()
+    calls = []
+    cfg = load_config()
+
+    def fake_run(config, **kwargs):
+        calls.append(kwargs)
+        completed.set()
+        now = datetime.now(UTC).isoformat()
+        return {
+            "ok": True,
+            "scanned": 20,
+            "ranked_count": 0,
+            "alert_count": 0,
+            "telegram_sent": True,
+            "telegram_delivery_status": "sent_empty_report",
+            "started_at": now,
+            "completed_at": now,
+        }
+
+    monkeypatch.setattr(scan_job, "run_scheduled_scan_once", fake_run)
+    status = scan_job.schedule_private_one_shot(
+        cfg,
+        ["private-test", "private-test"],
+        delay_seconds=0.1,
+    )
+    assert status["status"] == "scheduled"
+    assert status["destination_count"] == 1
+    assert completed.wait(timeout=3.0)
+    for _ in range(50):
+        final = scan_job.get_scheduler_status()["one_shot"]
+        if not final["active"]:
+            break
+        threading.Event().wait(0.02)
+    assert final["status"] == "completed"
+    assert final["job_removed"] is True
+    assert len(calls) == 1
+    assert calls[0]["telegram_chat_ids"] == ["private-test"]
+    assert calls[0]["notify_on_empty"] is True
 
 
 def test_supabase_outage_blocks_tracker_recovery_but_not_process_object(tmp_path):

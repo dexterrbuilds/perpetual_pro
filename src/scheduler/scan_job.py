@@ -7,8 +7,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Event, Lock, Thread
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED, EVENT_JOB_MISSED
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
 from loguru import logger
 
 from src.api.service import AnalyzeRequest, scan_symbols
@@ -55,6 +59,21 @@ _BACKGROUND_STOP: Optional[Event] = None
 _SCAN_RUN_LOCK = Lock()
 _RECENT_SIGNAL_LOCK = Lock()
 _RECENT_SIGNAL_ALERTS: Dict[Tuple[str, str], Dict[str, float]] = {}
+_ONE_SHOT_LOCK = Lock()
+_ONE_SHOT_SCHEDULER: Optional[BackgroundScheduler] = None
+_ONE_SHOT_STATUS: Dict[str, Any] = {
+    "active": False,
+    "job_id": None,
+    "run_id": None,
+    "scheduled_for": None,
+    "triggered_at": None,
+    "completed_at": None,
+    "status": "idle",
+    "destination_count": 0,
+    "job_removed": True,
+    "result": None,
+    "error": None,
+}
 
 
 def _status_update(**values: Any) -> None:
@@ -72,7 +91,153 @@ def get_scheduler_status() -> Dict[str, Any]:
     status["thread_alive"] = bool(
         _BACKGROUND_THREAD and _BACKGROUND_THREAD.is_alive()
     )
+    with _ONE_SHOT_LOCK:
+        status["one_shot"] = dict(_ONE_SHOT_STATUS)
     return status
+
+
+def schedule_private_one_shot(
+    config: AppConfig,
+    private_chat_ids: List[str],
+    *,
+    delay_seconds: float = 120.0,
+) -> Dict[str, Any]:
+    """Schedule one private operational scan without changing recurring windows."""
+    global _ONE_SHOT_SCHEDULER
+    destinations = list(dict.fromkeys(
+        str(value or "").strip() for value in private_chat_ids
+        if str(value or "").strip()
+    ))
+    if not destinations:
+        raise ValueError("A verified private Telegram destination is required")
+    delay = float(delay_seconds)
+    if delay < 0.05 or delay > 600.0:
+        raise ValueError("One-shot delay must be between 0.05 and 600 seconds")
+
+    with _ONE_SHOT_LOCK:
+        if _ONE_SHOT_STATUS.get("active"):
+            raise RuntimeError("An operational one-shot job is already active")
+        run_id = "ops_" + uuid4().hex
+        job_id = "perpetual-pro-" + run_id
+        scheduled_for = datetime.now(ZoneInfo("UTC")) + timedelta(seconds=delay)
+        scheduler = BackgroundScheduler(timezone=ZoneInfo("UTC"), daemon=True)
+        _ONE_SHOT_SCHEDULER = scheduler
+        _ONE_SHOT_STATUS.update(
+            active=True,
+            job_id=job_id,
+            run_id=run_id,
+            scheduled_for=scheduled_for.isoformat(),
+            triggered_at=None,
+            completed_at=None,
+            status="scheduled",
+            destination_count=len(destinations),
+            job_removed=False,
+            result=None,
+            error=None,
+        )
+
+    def execute() -> None:
+        triggered_at = datetime.now(ZoneInfo("UTC"))
+        with _ONE_SHOT_LOCK:
+            _ONE_SHOT_STATUS.update(
+                status="running",
+                triggered_at=triggered_at.isoformat(),
+            )
+        logger.info(
+            "Operational one-shot triggered: run_id={} job_id={} "
+            "scheduled_for={} destination_count={}",
+            run_id,
+            job_id,
+            scheduled_for.isoformat(),
+            len(destinations),
+        )
+        outcome = run_scheduled_scan_once(
+            config,
+            slot_label=f"Private operational verification · {run_id[-8:]}",
+            send=True,
+            notify_on_empty=True,
+            telegram_chat_ids=destinations,
+        )
+        summary = {
+            "ok": bool(outcome.get("ok")),
+            "scanned": int(outcome.get("scanned") or 0),
+            "ranked_count": int(outcome.get("ranked_count") or 0),
+            "alert_count": int(outcome.get("alert_count") or 0),
+            "telegram_sent": bool(outcome.get("telegram_sent")),
+            "delivery_status": outcome.get("telegram_delivery_status"),
+            "started_at": outcome.get("started_at"),
+            "completed_at": outcome.get("completed_at"),
+        }
+        with _ONE_SHOT_LOCK:
+            _ONE_SHOT_STATUS.update(result=summary)
+        logger.info(
+            "Operational one-shot completed: run_id={} ok={} scanned={} "
+            "actionable={} delivery_status={}",
+            run_id,
+            summary["ok"],
+            summary["scanned"],
+            summary["alert_count"],
+            summary["delivery_status"],
+        )
+
+    def finish(event: Any) -> None:
+        failed = bool(getattr(event, "exception", None)) or event.code in {
+            EVENT_JOB_ERROR,
+            EVENT_JOB_MISSED,
+        }
+        completed_at = datetime.now(ZoneInfo("UTC")).isoformat()
+        with _ONE_SHOT_LOCK:
+            _ONE_SHOT_STATUS.update(
+                active=False,
+                completed_at=completed_at,
+                status=("failed" if failed else "completed"),
+                job_removed=True,
+                error=(
+                    type(event.exception).__name__
+                    if getattr(event, "exception", None)
+                    else ("misfired" if event.code == EVENT_JOB_MISSED else None)
+                ),
+            )
+
+        def shutdown() -> None:
+            global _ONE_SHOT_SCHEDULER
+            try:
+                scheduler.shutdown(wait=False)
+            finally:
+                with _ONE_SHOT_LOCK:
+                    if _ONE_SHOT_SCHEDULER is scheduler:
+                        _ONE_SHOT_SCHEDULER = None
+
+        Thread(
+            target=shutdown,
+            name="perpetual-pro-one-shot-cleanup",
+            daemon=True,
+        ).start()
+
+    scheduler.add_listener(
+        finish,
+        EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED,
+    )
+    scheduler.add_job(
+        execute,
+        trigger=DateTrigger(run_date=scheduled_for),
+        id=job_id,
+        name="Perpetual Pro private operational verification",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+        replace_existing=False,
+    )
+    scheduler.start()
+    logger.info(
+        "Operational one-shot scheduled: run_id={} job_id={} run_at={} "
+        "destination_count={}",
+        run_id,
+        job_id,
+        scheduled_for.isoformat(),
+        len(destinations),
+    )
+    return get_scheduler_status()["one_shot"]
 
 
 def _parse_hhmm(s: str) -> Tuple[int, int]:
