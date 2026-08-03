@@ -675,6 +675,12 @@ def format_signal_photo_caption(
         )
     if quality_bits:
         lines.append(f"🛡 <b>Quality:</b> {html.escape(' · '.join(quality_bits))}")
+    qualification = dict(
+        row.get("qualification")
+        or payload.get("qualification")
+        or {}
+    )
+    lines.extend(_signal_qualification_lines(qualification))
     guidance = dict(
         row.get("prop_guidance")
         or payload.get("prop_guidance")
@@ -966,6 +972,173 @@ def rejection_explanation(row: Dict[str, Any], code: Optional[str] = None) -> Tu
         "The setup did not pass every production safety requirement.",
     )
     return detail, why
+
+
+def _gate_value_text(value: Any) -> str:
+    if isinstance(value, dict):
+        operator = str(value.get("operator") or "").strip()
+        rendered = _gate_value_text(value.get("value"))
+        return f"{operator}{rendered}" if operator else rendered
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(_gate_value_text(item) for item in value)
+    number = _optional_number(value)
+    if number is not None:
+        return f"{number:.2f}".rstrip("0").rstrip(".")
+    text = str(value or "—").strip()
+    return text[:80] or "—"
+
+
+def _failed_gate_report_lines(row: Dict[str, Any]) -> List[str]:
+    evaluation = dict(row.get("gate_evaluation") or {})
+    gates = [dict(gate) for gate in evaluation.get("gates") or [] if not gate.get("passed")]
+    lines: List[str] = []
+    for gate in gates:
+        code = str(gate.get("code") or "UNKNOWN_GATE")
+        label = _REJECTION_LABELS.get(code, code.replace("_", " ").title())
+        severity = str(gate.get("severity") or "hard").lower()
+        if gate.get("authoritative") is False or severity == "advisory":
+            classification = "ADVISORY"
+        elif severity == "soft":
+            classification = "SOFT"
+        else:
+            classification = "HARD"
+        actual = gate.get("actual_value")
+        required = gate.get("required_value")
+        comparison = ""
+        if actual is not None or required is not None:
+            comparison = (
+                f" — actual {_gate_value_text(actual)} · "
+                f"required {_gate_value_text(required)}"
+            )
+        lines.append(
+            f"• {html.escape(label)}{html.escape(comparison)} · <b>{classification}</b>"
+        )
+    if lines:
+        return lines
+    for code in row.get("all_rejection_reasons") or []:
+        label = _REJECTION_LABELS.get(str(code), str(code).replace("_", " ").title())
+        lines.append(f"• {html.escape(label)} · <b>HARD</b>")
+    return lines or ["• Rejection details unavailable · <b>HARD</b>"]
+
+
+def _qualification_check_line(check: Dict[str, Any]) -> str:
+    label = html.escape(str(check.get("display_name") or "Qualification check"))
+    actual = _gate_value_text(check.get("actual_value"))
+    required = _gate_value_text(check.get("required_value"))
+    classification = str(check.get("classification") or "hard").upper()
+    reason = html.escape(str(check.get("failure_reason") or "Check failed")[:105])
+    improvement = (
+        " · may improve before entry"
+        if check.get("may_improve_before_entry")
+        else ""
+    )
+    return (
+        f"• {label} — actual {html.escape(actual)} · required "
+        f"{html.escape(required)} · <b>{classification}</b>\n"
+        f"  {reason}{improvement}"
+    )
+
+
+def _qualification_failure_lines(qualification: Dict[str, Any]) -> List[str]:
+    failed: List[Dict[str, Any]] = list(
+        qualification.get("failed_hard_checks") or []
+    )
+    for key in ("overall_quality_result", "execution_quality_result"):
+        result = qualification.get(key)
+        if isinstance(result, dict) and not result.get("passed"):
+            failed.append(result)
+    failed.extend(qualification.get("failed_soft_checks") or [])
+    return [_qualification_check_line(dict(check)) for check in failed]
+
+
+def _signal_qualification_lines(qualification: Dict[str, Any]) -> List[str]:
+    if not qualification:
+        return []
+    qualification_type = str(qualification.get("qualification_type") or "")
+    if qualification_type == "fully_qualified":
+        title = "💎 <b>FULLY QUALIFIED SIGNAL</b>"
+        soft_icon = "✅"
+    elif qualification_type == "qualified_beta":
+        title = "💎 <b>QUALIFIED BETA SIGNAL</b>"
+        soft_icon = "🟡"
+    else:
+        return []
+    hard_passed = int(qualification.get("hard_pass_count") or 0)
+    hard_total = int(qualification.get("hard_applicable_count") or 0)
+    soft_passed = int(qualification.get("soft_pass_count") or 0)
+    soft_total = int(qualification.get("soft_applicable_count") or 0)
+    soft_pct = _number(qualification.get("soft_pass_percentage"), 100.0)
+    lines = [
+        title,
+        f"✅ Hard checks: {hard_passed}/{hard_total} passed · 100%",
+        f"{soft_icon} Soft checks: {soft_passed}/{soft_total} passed · {soft_pct:.0f}%",
+    ]
+    failed_soft = list(qualification.get("failed_soft_checks") or [])
+    if failed_soft:
+        lines.append("⚠️ <b>Failed soft checks</b>")
+        lines.extend(
+            _qualification_check_line(dict(check)) for check in failed_soft
+        )
+    return lines
+
+
+def _rejected_setup_report_lines(
+    row: Dict[str, Any],
+    *,
+    heading: str,
+    closest: bool = False,
+) -> List[str]:
+    symbol = html.escape(str(row.get("symbol") or "—").split("/")[0])
+    direction = html.escape(str(row.get("direction") or "").upper())
+    overall = _optional_number(row.get("overall_quality"))
+    execution = _optional_number(row.get("execution_quality"))
+    primary_code = str(row.get("primary_rejection_reason") or "")
+    why = _REJECTION_WHY.get(
+        primary_code,
+        "The setup did not pass every production requirement.",
+    )
+    lines = [
+        "━━━━━━━━━━━━━━",
+        heading,
+        "❌ <b>REJECTED / NON-ACTIONABLE</b>",
+        f"<b>{symbol} {direction}</b>",
+        f"Overall Quality {overall:.1f}/100" if overall is not None else "Overall Quality —",
+        f"Execution Quality {execution:.1f}/100" if execution is not None else "Execution Quality —",
+    ]
+    qualification = dict(row.get("qualification") or {})
+    if qualification:
+        lines.extend(
+            [
+                (
+                    f"Hard checks: {int(qualification.get('hard_pass_count') or 0)}/"
+                    f"{int(qualification.get('hard_applicable_count') or 0)} passed"
+                ),
+                (
+                    f"Soft checks: {int(qualification.get('soft_pass_count') or 0)}/"
+                    f"{int(qualification.get('soft_applicable_count') or 0)} passed · "
+                    f"{_number(qualification.get('soft_pass_percentage'), 100.0):.0f}%"
+                ),
+                "",
+                "🚫 <b>Failed qualification checks</b>",
+                *_qualification_failure_lines(qualification),
+            ]
+        )
+    else:
+        lines.extend(
+            ["", "🚫 <b>Failed gates</b>", *_failed_gate_report_lines(row)]
+        )
+    if closest:
+        gap = _optional_number(row.get("normalized_qualification_gap"))
+        if gap is not None:
+            lines.append(
+                "🧠 Closest because its remaining comparable numeric gate "
+                f"shortfalls had the smallest combined normalized gap ({gap:.4f})."
+            )
+    else:
+        lines.append(f"🧠 {html.escape(why)}")
+    return lines
 
 
 def _caption_price(value: Any) -> str:
@@ -1319,35 +1492,62 @@ def format_prop_scan_report(
                 for row in nearest
                 if str(row.get("direction") or "").lower() in {"long", "short"}
             ]
-            if nearest:
-                row = nearest[0]
-                symbol = html.escape(str(row.get("symbol") or "—").split("/")[0])
-                direction = html.escape(str(row.get("direction") or "").upper())
-                overall = _optional_number(row.get("overall_quality"))
-                execution = _optional_number(row.get("execution_quality"))
-                gate = str(
-                    row.get("primary_rejection_reason")
-                    or row.get("closest_to_passing_gate")
-                    or ""
+            highest = diagnostic.get("highest_quality_rejected_candidate")
+            if not isinstance(highest, dict) and nearest:
+                highest = max(
+                    nearest,
+                    key=lambda row: _optional_number(row.get("overall_quality"))
+                    if _optional_number(row.get("overall_quality")) is not None
+                    else float("-inf"),
                 )
-                rejection_detail, rejection_why = rejection_explanation(row, gate)
-                lines += [
-                    "━━━━━━━━━━━━━━",
-                    "⭐ <b>Closest Setup — REJECTED / NON-ACTIONABLE</b>",
-                    f"<b>{symbol} {direction}</b>",
-                    quality_badge(overall),
-                    f"Overall Quality {overall:.1f}/100"
-                    if overall is not None
-                    else f"{symbol} {direction}",
-                    f"Execution Quality {execution:.1f}/100"
-                    if execution is not None
-                    else "",
-                    "",
-                    "🚫 <b>Why it was rejected</b>",
-                    html.escape(rejection_detail),
-                    f"🧠 {html.escape(rejection_why)}",
-                ]
-                lines = [line for line in lines if line]
+            closest = diagnostic.get("closest_to_full_qualification")
+            if not isinstance(closest, dict):
+                closest = None
+            same_candidate = bool(diagnostic.get("highest_is_closest"))
+            if highest and closest and not same_candidate:
+                highest_id = str(highest.get("candidate_id") or "")
+                closest_id = str(closest.get("candidate_id") or "")
+                same_candidate = bool(
+                    highest_id
+                    and closest_id
+                    and highest_id == closest_id
+                )
+            if highest:
+                lines.extend(
+                    _rejected_setup_report_lines(
+                        highest,
+                        heading="⭐ <b>Highest-Quality Rejected Setup</b>",
+                    )
+                )
+            if highest and closest and same_candidate:
+                same_label = (
+                    "qualification"
+                    if diagnostic.get("closest_heading") == "Closest to Qualification"
+                    else "full qualification"
+                )
+                lines.append(
+                    "🎯 This was both the highest-quality rejected setup and "
+                    f"the closest to {same_label}."
+                )
+            elif closest:
+                closest_heading = html.escape(
+                    str(
+                        diagnostic.get("closest_heading")
+                        or "Closest to Full Qualification"
+                    )
+                )
+                lines.extend(
+                    _rejected_setup_report_lines(
+                        closest,
+                        heading=f"🎯 <b>{closest_heading}</b>",
+                        closest=True,
+                    )
+                )
+            elif highest:
+                lines.append(
+                    "🎯 No rejected setup had only comparable numeric gaps; "
+                    "categorical hard failures are not treated as near-passes."
+                )
         lines += [
             "━━━━━━━━━━━━━━",
             "🛡 <b>No rules were relaxed.</b>",

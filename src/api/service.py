@@ -6,6 +6,7 @@ news + confluence, returning a clean JSON-serializable dict.
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 import inspect
@@ -27,6 +28,7 @@ from src.analytics.rejection import (
 )
 from src.analytics.runtime import get_rejection_repository
 from src.analysis.confluence import ConfluenceEngine, FullAnalysis
+from src.analysis.qualification import evaluate_private_beta_qualification
 from src.analysis.risk import RiskManager
 from src.data.exchange import EXCHANGE_MAP, normalize_exchange_id
 from src.data.multi_tf import fetch_multi_timeframe_with_fallback
@@ -618,6 +620,7 @@ def scan_symbols(
     use_llm = bool(getattr(req, "use_llm", True))
 
     ranked_results: List[Dict[str, Any]] = []
+    qualification_candidates: List[Dict[str, Any]] = []
     skipped_flat: List[Dict[str, Any]] = []
     journal_records: List[Dict[str, Any]] = []
     analytics_candidates: List[Dict[str, Any]] = []
@@ -1231,6 +1234,48 @@ def scan_symbols(
                 candidate["production_eligible"] = row[
                     "production_qualified"
                 ]
+                qualification = evaluate_private_beta_qualification(
+                    row, row.get("gate_evaluation")
+                )
+                row["qualification"] = qualification
+                row["qualification_policy_version"] = qualification[
+                    "qualification_policy_version"
+                ]
+                row["gate_evaluation"]["private_beta_qualification"] = qualification
+                row["payload"]["qualification"] = qualification
+                candidate["decision"]["qualification"] = qualification
+                candidate["decision"]["qualification_policy_version"] = qualification[
+                    "qualification_policy_version"
+                ]
+                candidate["production_scores"]["private_beta_qualification"] = {
+                    "qualification_type": qualification["qualification_type"],
+                    "hard_pass_percentage": qualification["hard_pass_percentage"],
+                    "soft_pass_percentage": qualification["soft_pass_percentage"],
+                }
+                evaluated_direction = str(
+                    row.get("evaluated_direction") or ""
+                ).lower()
+                if evaluated_direction in {"long", "short"}:
+                    beta_row = copy.deepcopy(row)
+                    beta_row["direction"] = evaluated_direction
+                    beta_payload = beta_row.get("payload") or {}
+                    beta_payload["direction"] = evaluated_direction
+                    for key in ("primary_setup", "trade_plan"):
+                        if isinstance(beta_payload.get(key), dict):
+                            beta_payload[key]["direction"] = evaluated_direction
+                            beta_payload[key]["entry_status"] = beta_row.get(
+                                "entry_status"
+                            )
+                    chart_trade = (
+                        (beta_payload.get("chart") or {}).get("trade")
+                        if isinstance(beta_payload.get("chart"), dict)
+                        else None
+                    )
+                    if isinstance(chart_trade, dict):
+                        chart_trade["direction"] = evaluated_direction
+                        chart_trade["entry_status"] = beta_row.get("entry_status")
+                    beta_row["payload"] = beta_payload
+                    qualification_candidates.append(beta_row)
                 analytics_candidates.append(
                     candidate_analytics_snapshot(
                         row,
@@ -1373,6 +1418,7 @@ def scan_symbols(
         "scan_id": resolved_scan_id,
         "error": None if analyzed_count > 0 else "scan_analysis_unavailable",
         "ranked_results": ranked_results[:10],
+        "qualification_candidates": qualification_candidates,
         "skipped_flat": skipped_flat[:20],
         "count": len(ranked_results),
         "flat_count": len(skipped_flat),

@@ -338,8 +338,109 @@ def test_manual_no_quality_report_is_explicitly_non_actionable():
     report = format_prop_scan_report(
         [], scanned_count=21, ranked_count=1, rejection_summary=summary
     )
-    assert "Closest Setup — REJECTED / NON-ACTIONABLE" in report
+    assert "Highest-Quality Rejected Setup" in report
     assert "No rules were relaxed" in report
+
+
+def test_highest_quality_and_closest_qualification_are_distinct_and_authoritative():
+    highest = {
+        "candidate_id": "high-hard",
+        "symbol": "TIA",
+        "direction": "long",
+        "eligible": False,
+        "overall_quality": 84.2,
+        "execution_quality": 82.0,
+        "primary_rejection_reason": "ENTRY_BLOCKED",
+        "all_rejection_reasons": ["ENTRY_BLOCKED"],
+        "distance_to_eligibility": 0.01,
+        "proximity_label": "NEAR_PASS",
+        "gate_evaluation": {
+            "failed_hard_gates": 1,
+            "gates": [{
+                "code": "ENTRY_BLOCKED",
+                "passed": False,
+                "actual_value": "blocked",
+                "required_value": ["confirmation_pending", "wait_retest"],
+                "normalized_distance": 0.01,
+                "severity": "hard",
+                "authoritative": True,
+            }],
+        },
+    }
+    closest = {
+        "candidate_id": "lower-numeric",
+        "symbol": "SOL",
+        "direction": "short",
+        "eligible": False,
+        "overall_quality": 65.3,
+        "payload": {"confidence": 99.0},
+        "execution_quality": 74.0,
+        "primary_rejection_reason": "OVERALL_QUALITY_BELOW_MINIMUM",
+        "all_rejection_reasons": ["OVERALL_QUALITY_BELOW_MINIMUM"],
+        "distance_to_eligibility": 0.18375,
+        "proximity_label": "MODERATE_GAP",
+        "gate_evaluation": {
+            "failed_hard_gates": 1,
+            "gates": [{
+                "code": "OVERALL_QUALITY_BELOW_MINIMUM",
+                "passed": False,
+                "actual_value": 65.3,
+                "required_value": {"operator": ">=", "value": 80.0},
+                "normalized_distance": 0.18375,
+                "severity": "hard",
+                "authoritative": True,
+            }],
+        },
+    }
+    flat = {
+        **closest,
+        "candidate_id": "flat-high",
+        "symbol": "BTC",
+        "direction": "flat",
+        "overall_quality": 99.0,
+    }
+    summary = aggregate_rejection_rows([], [flat, highest, closest])
+
+    assert summary["highest_quality_rejected_candidate"]["candidate_id"] == "high-hard"
+    assert summary["highest_quality_rejected_candidate"]["overall_quality"] == 84.2
+    assert summary["closest_to_full_qualification"]["candidate_id"] == "lower-numeric"
+    assert summary["closest_to_full_qualification"]["overall_quality"] == 65.3
+    assert summary["highest_is_closest"] is False
+
+    report = format_prop_scan_report(
+        [], scanned_count=3, ranked_count=2, rejection_summary=summary
+    )
+    assert "<b>TIA LONG</b>" in report
+    assert "Overall Quality 84.2/100" in report
+    assert "<b>SOL SHORT</b>" in report
+    assert "Closest to Full Qualification" in report
+    assert "<b>BTC FLAT</b>" not in report
+    assert report.index("<b>TIA LONG</b>") < report.index("<b>SOL SHORT</b>")
+
+
+def test_same_candidate_is_not_duplicated_in_no_quality_report():
+    evaluation = _alert(_alert_row(confidence=79.5)).to_dict()
+    candidate = {
+        "candidate_id": "same",
+        "symbol": "BTC",
+        "direction": "long",
+        "eligible": False,
+        "overall_quality": 79.5,
+        "execution_quality": 79.0,
+        "primary_rejection_reason": evaluation["primary_rejection_reason"],
+        "all_rejection_reasons": evaluation["all_rejection_reasons"],
+        "distance_to_eligibility": evaluation["distance_to_eligibility"],
+        "proximity_label": evaluation["proximity_label"],
+        "gate_evaluation": evaluation,
+    }
+    summary = aggregate_rejection_rows([], [candidate])
+    report = format_prop_scan_report(
+        [], scanned_count=1, ranked_count=1, rejection_summary=summary
+    )
+    assert summary["highest_is_closest"] is True
+    assert report.count("<b>BTC LONG</b>") == 1
+    assert report.count("REJECTED / NON-ACTIONABLE") == 1
+    assert "both the highest-quality rejected setup and the closest" in report
 
 
 def test_llm_rate_limit_is_observability_only(monkeypatch):

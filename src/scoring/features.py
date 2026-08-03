@@ -389,6 +389,8 @@ def build_candidate_record(
             "universal_eligible",
             "production_qualified",
             "signal_eligible",
+            "qualification_policy_version",
+            "qualification",
             "historical_edge_ok",
             "data_quality_ok",
             "market_quality_ok",
@@ -466,6 +468,8 @@ def build_candidate_record(
         "production_qualified": bool(
             row.get("production_qualified", row.get("signal_eligible", False))
         ),
+        "qualification_policy_version": row.get("qualification_policy_version"),
+        "private_beta_qualification": dict(row.get("qualification") or {}),
         "legacy_signal_eligible": bool(
             row.get("legacy_signal_eligible", False)
         ),

@@ -167,6 +167,48 @@ def test_no_quality_report_includes_statistics_and_closest_explanation():
                     },
                 }
             ],
+            "highest_quality_rejected_candidate": {
+                "candidate_id": "hype",
+                "symbol": "HYPE/USDT:USDT",
+                "direction": "short",
+                "overall_quality": 83.4,
+                "execution_quality": 81.0,
+                "primary_rejection_reason": "GROSS_RR_BELOW_MINIMUM",
+                "gate_evaluation": {
+                    "gates": [
+                        {
+                            "code": "GROSS_RR_BELOW_MINIMUM",
+                            "passed": False,
+                            "actual_value": 1.18,
+                            "required_value": {"operator": ">=", "value": 1.25},
+                            "severity": "hard",
+                            "authoritative": True,
+                        }
+                    ]
+                },
+            },
+            "closest_to_full_qualification": {
+                "candidate_id": "hype",
+                "symbol": "HYPE/USDT:USDT",
+                "direction": "short",
+                "overall_quality": 83.4,
+                "execution_quality": 81.0,
+                "normalized_qualification_gap": 0.056,
+                "primary_rejection_reason": "GROSS_RR_BELOW_MINIMUM",
+                "gate_evaluation": {
+                    "gates": [
+                        {
+                            "code": "GROSS_RR_BELOW_MINIMUM",
+                            "passed": False,
+                            "actual_value": 1.18,
+                            "required_value": {"operator": ">=", "value": 1.25},
+                            "severity": "hard",
+                            "authoritative": True,
+                        }
+                    ]
+                },
+            },
+            "highest_is_closest": True,
         },
     )
     assert "Market Summary" in text
@@ -174,9 +216,10 @@ def test_no_quality_report_includes_statistics_and_closest_explanation():
     assert "highest 83.4/100" in text
     assert "18.4s" in text
     assert "freshness age 7.2s" in text
-    assert "Closest Setup — REJECTED / NON-ACTIONABLE" in text
-    assert "Gross R:R = 1.18R" in text
-    assert "minimum 1.25R" in text
+    assert "Highest-Quality Rejected Setup" in text
+    assert "both the highest-quality rejected setup" in text
+    assert "Gross R:R below minimum — actual 1.18 · required &gt;=1.25" in text
+    assert "HARD" in text
 
 
 def test_filter_high_confidence():

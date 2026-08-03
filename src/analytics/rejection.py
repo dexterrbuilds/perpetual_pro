@@ -16,6 +16,38 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 GATE_POLICY_VERSION = "rejection_analytics_v1.0"
 ALERT_MIN_OVERALL_QUALITY = 80.0
 
+# These conditions are categorical execution/safety failures, not comparable
+# numeric shortfalls. A candidate carrying any of them may still be the
+# highest-quality reject, but it cannot be labelled closest to qualification.
+_NONCOMPARABLE_QUALIFICATION_FAILURES = frozenset(
+    {
+        "FLAT_DIRECTION",
+        "DATA_QUALITY_FAILED",
+        "MARKET_QUALITY_FAILED",
+        "STALE_TICKER",
+        "STALE_ORDER_BOOK",
+        "SPREAD_TOO_WIDE",
+        "ENTRY_BLOCKED",
+        "ENTRY_EXPIRED",
+        "CONFIRMATION_PENDING",
+        "AVOID_CHASE",
+        "PRICE_TOO_EXTENDED",
+        "INVALIDATED_BEFORE_ENTRY",
+        "TP1_ALREADY_PROGRESSING",
+        "NO_FEASIBLE_TARGET",
+        "TP1_BLOCKED",
+        "STOP_QUALITY_FAILED",
+        "STOP_TOO_TIGHT",
+        "STOP_TOO_WIDE",
+        "RANGE_DURING_TREND_EXPANSION",
+        "REVERSAL_CONFIRMATION_INSUFFICIENT",
+        "STRUCTURE_CONFLICT",
+        "REVALIDATION_FAILED",
+        "ANALYSIS_ERROR",
+        "MARKET_UNAVAILABLE",
+    }
+)
+
 # These checks define Perpetual Pro's production selectivity, not universal
 # market/entry safety. They still block publication at their existing thresholds.
 _SELECTIVITY_CODES = frozenset(
@@ -879,6 +911,37 @@ def aggregate_rejection_rows(
         if not row.get("eligible")
         and str(row.get("direction") or "").lower() in {"long", "short"}
     ]
+    highest_quality_rejected = max(
+        rejected,
+        key=lambda row: (
+            _number(row.get("overall_quality"))
+            if _number(row.get("overall_quality")) is not None
+            else float("-inf"),
+            _number(row.get("execution_quality"))
+            if _number(row.get("execution_quality")) is not None
+            else float("-inf"),
+        ),
+        default=None,
+    )
+
+    comparable_candidates = []
+    for row in rejected:
+        gap = _legitimate_normalized_qualification_gap(row)
+        if gap is not None:
+            comparable_candidates.append((gap, row))
+    closest_to_full = None
+    if comparable_candidates:
+        gap, closest_row = min(
+            comparable_candidates,
+            key=lambda item: (
+                item[0],
+                -(_number(item[1].get("overall_quality")) or 0.0),
+            ),
+        )
+        closest_to_full = {
+            **dict(closest_row),
+            "normalized_qualification_gap": round(gap, 6),
+        }
     nearest = sorted(
         rejected,
         key=lambda row: (
@@ -960,5 +1023,63 @@ def aggregate_rejection_rows(
             ),
         },
         "closest_rejected_candidates": nearest,
+        "highest_quality_rejected_candidate": highest_quality_rejected,
+        "closest_to_full_qualification": closest_to_full,
+        "highest_is_closest": bool(
+            highest_quality_rejected
+            and closest_to_full
+            and _candidate_identity(highest_quality_rejected)
+            == _candidate_identity(closest_to_full)
+        ),
         "suspicious_diagnostics": suspicious,
     }
+
+
+def _candidate_identity(row: Mapping[str, Any]) -> tuple:
+    candidate_id = str(row.get("candidate_id") or "").strip()
+    if candidate_id:
+        return (candidate_id,)
+    return (
+        str(row.get("symbol") or ""),
+        str(row.get("direction") or "").lower(),
+        str(row.get("analyzed_at") or ""),
+        _number(row.get("overall_quality")),
+    )
+
+
+def _legitimate_normalized_qualification_gap(
+    row: Mapping[str, Any],
+) -> Optional[float]:
+    """Return a unitless numeric-only gap, or ``None`` for hard conditions."""
+    evaluation = dict(row.get("gate_evaluation") or {})
+    failed = [
+        dict(gate)
+        for gate in evaluation.get("gates") or []
+        if not gate.get("passed")
+        and gate.get("authoritative") is not False
+        and str(gate.get("severity") or "hard") == "hard"
+    ]
+    if not failed:
+        return None
+    codes = {str(gate.get("code") or "") for gate in failed}
+    if codes & _NONCOMPARABLE_QUALIFICATION_FAILURES:
+        return None
+    if any(code.startswith("HARD_FAILURE_") for code in codes):
+        return None
+
+    distances: List[float] = []
+    for gate in failed:
+        actual = _number(gate.get("actual_value"))
+        required_raw = gate.get("required_value")
+        required = _number(
+            required_raw.get("value")
+            if isinstance(required_raw, Mapping)
+            else required_raw
+        )
+        normalized = _number(gate.get("normalized_distance"))
+        if actual is None or required is None or normalized is None:
+            return None
+        if normalized < 0:
+            return None
+        distances.append(normalized)
+    return sum(distances) if distances else None

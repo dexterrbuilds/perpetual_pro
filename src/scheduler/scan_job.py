@@ -21,6 +21,11 @@ from src.analytics.rejection import (
 from src.analytics.runtime import get_rejection_repository
 from src.api.service import AnalyzeRequest, scan_symbols
 from src.analysis.revalidation import revalidate_candidate_for_delivery
+from src.analysis.qualification import (
+    build_private_beta_rejection_summary,
+    evaluate_private_beta_qualification,
+    qualify_private_beta_candidates,
+)
 from src.notify.telegram import (
     format_signal_photo_caption,
     format_prop_scan_report,
@@ -282,6 +287,43 @@ def filter_high_confidence(
     return out
 
 
+def _filter_with_configured_public_policy(
+    rows: List[Dict[str, Any]],
+    cfg: AppConfig,
+) -> List[Dict[str, Any]]:
+    """Apply the unchanged public policy and populate canonical gate details."""
+    return filter_high_confidence(
+        rows,
+        min_llm=float(cfg.telegram.min_llm_confidence or 65),
+        min_rank=float(cfg.telegram.min_rank_score or 50),
+        only_prop_safe=bool(cfg.scheduler.only_prop_safe),
+        min_confidence=max(
+            MIN_TELEGRAM_SIGNAL_CONFIDENCE,
+            float(getattr(cfg.analysis, "directional_confidence_threshold", 68.0)),
+        ),
+        min_execution_score=float(
+            getattr(cfg.analysis, "execution_min_score", 65.0)
+        ),
+        max_immediate_sl_risk=float(
+            getattr(cfg.analysis, "max_immediate_sl_risk", 32.0)
+        ),
+        max_chase_distance_atr=float(
+            getattr(cfg.analysis, "max_chase_distance_atr", 1.0)
+        ),
+        max_pre_entry_tp1_progress_pct=float(
+            getattr(cfg.analysis, "max_pre_entry_tp1_progress_pct", 70.0)
+        ),
+        min_tp2_rr=float(getattr(cfg.analysis, "min_tp2_rr", 1.25)),
+        max_spread_bps=float(getattr(cfg.analysis, "max_spread_bps", 12.0)),
+        max_ticker_age_seconds=float(
+            getattr(cfg.analysis, "max_ticker_age_seconds", 45.0)
+        ),
+        max_orderbook_age_seconds=float(
+            getattr(cfg.analysis, "max_orderbook_age_seconds", 30.0)
+        ),
+    )
+
+
 def suppress_recent_scheduled_signals(
     rows: List[Dict[str, Any]],
     *,
@@ -471,40 +513,27 @@ def _run_scheduled_scan_once_unlocked(
         trigger_type=trigger_type,
     )
     ranked = result.get("ranked_results") or []
-    filtered = filter_high_confidence(
-        ranked,
-        min_llm=float(cfg.telegram.min_llm_confidence or 65),
-        min_rank=float(cfg.telegram.min_rank_score or 50),
-        only_prop_safe=bool(cfg.scheduler.only_prop_safe),
-        min_confidence=max(
-            MIN_TELEGRAM_SIGNAL_CONFIDENCE,
-            float(getattr(cfg.analysis, "directional_confidence_threshold", 68.0)),
-        ),
-        min_execution_score=float(
-            getattr(cfg.analysis, "execution_min_score", 65.0)
-        ),
-        max_immediate_sl_risk=float(
-            getattr(cfg.analysis, "max_immediate_sl_risk", 32.0)
-        ),
-        max_chase_distance_atr=float(
-            getattr(cfg.analysis, "max_chase_distance_atr", 1.0)
-        ),
-        max_pre_entry_tp1_progress_pct=float(
-            getattr(
-                cfg.analysis,
-                "max_pre_entry_tp1_progress_pct",
-                70.0,
-            )
-        ),
-        min_tp2_rr=float(getattr(cfg.analysis, "min_tp2_rr", 1.25)),
-        max_spread_bps=float(getattr(cfg.analysis, "max_spread_bps", 12.0)),
-        max_ticker_age_seconds=float(
-            getattr(cfg.analysis, "max_ticker_age_seconds", 45.0)
-        ),
-        max_orderbook_age_seconds=float(
-            getattr(cfg.analysis, "max_orderbook_age_seconds", 30.0)
-        ),
+    routing_status = get_delivery_status()
+    private_beta_mode = routing_status["mode"] == "private_beta"
+    qualification_candidates = list(
+        result.get("qualification_candidates") or ranked
     )
+    if private_beta_mode:
+        missing_gate_rows = [
+            row for row in qualification_candidates
+            if not (row.get("gate_evaluation") or {}).get("gates")
+        ]
+        if missing_gate_rows:
+            # Compatibility for stored/tests/older API producers: use the
+            # existing alert evaluator solely to materialize canonical checks.
+            _filter_with_configured_public_policy(missing_gate_rows, cfg)
+        filtered = qualify_private_beta_candidates(
+            qualification_candidates, limit=2
+        )
+    else:
+        # Public-mode qualification remains byte-for-byte governed by the
+        # existing deterministic alert filter.
+        filtered = _filter_with_configured_public_policy(ranked, cfg)
     suppressed_duplicates: List[Dict[str, Any]] = []
     if send and not manual_delivery and filtered:
         filtered, suppressed_duplicates = suppress_recent_scheduled_signals(filtered)
@@ -553,18 +582,63 @@ def _run_scheduled_scan_once_unlocked(
                         "gate_evaluation": decision.to_dict(),
                     }
                 if validation.get("ok"):
-                    accepted[index] = dict(validation.get("row") or original)
+                    refreshed = dict(validation.get("row") or original)
+                    if private_beta_mode:
+                        refreshed["pre_delivery_revalidation_ok"] = True
+                        qualification = evaluate_private_beta_qualification(
+                            refreshed, refreshed.get("gate_evaluation")
+                        )
+                        refreshed["qualification"] = qualification
+                        refreshed["qualification_policy_version"] = qualification[
+                            "qualification_policy_version"
+                        ]
+                        refreshed["gate_evaluation"][
+                            "private_beta_qualification"
+                        ] = qualification
+                        refreshed.setdefault("payload", {})[
+                            "qualification"
+                        ] = qualification
+                        if not qualification["private_beta_qualified"]:
+                            refreshed["pre_delivery_rejection_reasons"] = [
+                                "PRIVATE_BETA_QUALIFICATION_FAILED"
+                            ]
+                            pre_delivery_rejected.append(refreshed)
+                            continue
+                    accepted[index] = refreshed
                 else:
-                    rejected = dict(original)
+                    # Preserve the pre-existing public-mode rejection payload.
+                    # Private beta needs the refreshed row so its final
+                    # revalidation check can be included in the deduplicated
+                    # qualification record.
+                    rejected = dict(
+                        (
+                            validation.get("row")
+                            if private_beta_mode
+                            else original
+                        )
+                        or original
+                    )
                     rejected["pre_delivery_rejection_reasons"] = list(
                         validation.get("reasons") or ["PRE_SEND_REJECTED"]
                     )
-                    pre_delivery_rejected.append(rejected)
                     rejected["gate_evaluation"] = dict(
                         validation.get("gate_evaluation")
                         or rejected.get("gate_evaluation")
                         or {}
                     )
+                    if private_beta_mode:
+                        rejected["pre_delivery_revalidation_ok"] = False
+                        qualification = evaluate_private_beta_qualification(
+                            rejected, rejected.get("gate_evaluation")
+                        )
+                        rejected["qualification"] = qualification
+                        rejected["qualification_policy_version"] = qualification[
+                            "qualification_policy_version"
+                        ]
+                        rejected["gate_evaluation"][
+                            "private_beta_qualification"
+                        ] = qualification
+                    pre_delivery_rejected.append(rejected)
                     logger.warning(
                         "Telegram candidate failed final revalidation: symbol={} reasons={}",
                         original.get("symbol"),
@@ -574,6 +648,16 @@ def _run_scheduled_scan_once_unlocked(
 
     scan_failed = not bool(result.get("ok"))
     report_summary = dict(result.get("rejection_analytics") or {})
+    if private_beta_mode:
+        latest_beta_rows: Dict[str, Dict[str, Any]] = {
+            str(row.get("candidate_id") or index): row
+            for index, row in enumerate(qualification_candidates)
+        }
+        for row in [*pre_delivery_rejected, *filtered]:
+            latest_beta_rows[str(row.get("candidate_id") or id(row))] = row
+        report_summary = build_private_beta_rejection_summary(
+            report_summary, latest_beta_rows.values()
+        )
     report_summary.update(
         {
             "scan_duration_seconds": round(
@@ -616,7 +700,6 @@ def _run_scheduled_scan_once_unlocked(
     report_destinations = get_telegram_report_chat_ids(
         telegram_chat_ids if manual_delivery else None
     )
-    routing_status = get_delivery_status()
     logger.info(
         "Delivery Mode: {} recipients_attempted={} report_recipients={} "
         "public_enabled={}",
