@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.analysis.risk import RiskManager
+from src.analysis.risk import RiskManager, TradePlan, build_prop_guidance
 from src.utils.config import RiskConfig, load_config
 
 
@@ -60,6 +60,42 @@ def test_prop_signal_requires_final_60_percent_confidence():
     rm.apply_prop_confidence_gate(plan, 60.0)
     assert "LOW_CONFIDENCE" not in plan.prop_flags
     assert plan.prop_safe is True
+
+
+def test_high_volatility_plan_gets_advisory_without_geometry_mutation():
+    plan = TradePlan(
+        direction="long",
+        entry_low=99.5,
+        entry_high=100.0,
+        stop_loss=97.0,
+        take_profits=[103.0, 105.0],
+        risk_reward=[1.2, 2.0],
+        prop_safe=False,
+        prop_flags=["WIDE_STOP", "HIGH_DRAWDOWN_RISK"],
+        leverage_suggested=5.0,
+    )
+    immutable_trade = (
+        plan.direction,
+        plan.entry_low,
+        plan.entry_high,
+        plan.stop_loss,
+        list(plan.take_profits),
+        list(plan.risk_reward),
+        plan.leverage_suggested,
+    )
+    guidance = build_prop_guidance(plan)
+
+    assert guidance["status"] == "not_recommended_for_strict_prop"
+    assert guidance["suggested_leverage_max"] <= 5
+    assert immutable_trade == (
+        plan.direction,
+        plan.entry_low,
+        plan.entry_high,
+        plan.stop_loss,
+        plan.take_profits,
+        plan.risk_reward,
+        plan.leverage_suggested,
+    )
 
 
 def test_non_prop_day_trade_leverage_is_10_to_30x():

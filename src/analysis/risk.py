@@ -58,6 +58,7 @@ class TradePlan:
     prop_mode: bool = True
     prop_safe: bool = True
     prop_flags: List[str] = field(default_factory=list)
+    prop_guidance: Dict[str, Any] = field(default_factory=dict)
     max_leverage_allowed: float = 5.0
     # Execution quality: prevents treating a directional bias as a market order.
     entry_status: str = "blocked"  # confirmation_pending | wait_retest | avoid_chase | blocked
@@ -140,6 +141,7 @@ class TradePlan:
             "prop_mode": self.prop_mode,
             "prop_safe": self.prop_safe,
             "prop_flags": list(self.prop_flags),
+            "prop_guidance": dict(self.prop_guidance),
             "max_leverage_allowed": self.max_leverage_allowed,
             "risk_pct": self.risk_pct,
             "entry_status": self.entry_status,
@@ -186,6 +188,7 @@ class TradePlan:
             "prop_mode": self.prop_mode,
             "prop_safe": self.prop_safe,
             "prop_flags": list(self.prop_flags),
+            "prop_guidance": dict(self.prop_guidance),
             "max_leverage_allowed": self.max_leverage_allowed,
             "entry_status": self.entry_status,
             "entry_reason": self.entry_reason,
@@ -258,6 +261,65 @@ class ScenarioSet:
     bullish: dict
     base: dict
     bearish: dict
+
+
+def build_prop_guidance(plan: TradePlan) -> Dict[str, Any]:
+    """Return conservative prop guidance without changing the trade plan.
+
+    Leverage controls margin usage; account risk remains defined by position
+    size and loss at the published stop. This advisory never affects signal
+    eligibility, scores, or trade geometry.
+    """
+    flags = list(dict.fromkeys(str(flag) for flag in plan.prop_flags if flag))
+    severe = {"HIGH_DRAWDOWN_RISK", "WIDE_STOP"}
+    reduced = {
+        "LOW_RR",
+        "LOW_CONFIDENCE",
+        "POOR_EXECUTION",
+        "IMMEDIATE_SL_RISK",
+        "MARKET_QUALITY",
+        "AVOID_CHASE",
+    }
+    reason_map = {
+        "HIGH_DRAWDOWN_RISK": "Elevated volatility may conflict with tight drawdown rules.",
+        "WIDE_STOP": "Elevated volatility produces wider stop geometry relative to price.",
+        "LOW_RR": "Cost-adjusted reward is marginal for strict prop constraints.",
+        "LOW_CONFIDENCE": "Overall setup quality is below the prop guidance preference.",
+        "POOR_EXECUTION": "Execution conditions require additional caution.",
+        "IMMEDIATE_SL_RISK": "Near-term stop pressure is elevated.",
+        "MARKET_QUALITY": "Current market quality is unsuitable for strict prop execution.",
+        "AVOID_CHASE": "The entry cannot be executed conservatively without chasing.",
+    }
+    if any(flag in severe for flag in flags):
+        status = "not_recommended_for_strict_prop"
+        risk_low = risk_high = 0.25
+        leverage_low = leverage_high = 1.0
+        note = (
+            "The signal remains valid for personal-capital traders using "
+            "appropriate position sizing, but may not suit tight prop drawdown rules."
+        )
+    elif any(flag in reduced for flag in flags):
+        status = "suitable_with_reduced_risk"
+        risk_low, risk_high = 0.25, 0.5
+        leverage_low, leverage_high = 1.0, 2.0
+        note = "Use reduced size and verify the firm's remaining drawdown allowance."
+    else:
+        status = "suitable"
+        risk_low = risk_high = 0.5
+        leverage_low, leverage_high = 1.0, 2.0
+        note = "Prop suitability is guidance only; firm-specific limits still apply."
+    reasons = [reason_map[flag] for flag in flags if flag in reason_map]
+    if not reasons:
+        reasons = ["No active prop-specific caution flag."]
+    return {
+        "status": status,
+        "suggested_risk_pct_min": risk_low,
+        "suggested_risk_pct_max": risk_high,
+        "suggested_leverage_min": leverage_low,
+        "suggested_leverage_max": min(5.0, leverage_high),
+        "reasons": reasons,
+        "note": note,
+    }
 
 
 class RiskManager:
@@ -721,6 +783,7 @@ class RiskManager:
     ) -> TradePlan:
         """Apply the final blended-confidence gate to a drafted trade plan."""
         if not plan.prop_mode or plan.direction not in ("long", "short"):
+            plan.prop_guidance = build_prop_guidance(plan)
             return plan
         plan.prop_flags = [flag for flag in plan.prop_flags if flag != "LOW_CONFIDENCE"]
         if confidence < minimum:
@@ -740,6 +803,7 @@ class RiskManager:
         }
         plan.prop_flags = list(dict.fromkeys(plan.prop_flags))
         plan.prop_safe = not any(flag in unsafe for flag in plan.prop_flags)
+        plan.prop_guidance = build_prop_guidance(plan)
         return plan
 
     def _prop_flags(

@@ -781,6 +781,9 @@ def scan_symbols(
                 primary = plan.to_primary_setup() if plan else None
                 prop_safe = bool(getattr(plan, "prop_safe", True)) if plan else True
                 prop_flags = list(getattr(plan, "prop_flags", None) or []) if plan else []
+                prop_guidance = dict(
+                    getattr(plan, "prop_guidance", None) or {}
+                ) if plan else {}
                 execution = (
                     analysis.execution.to_dict()
                     if getattr(analysis, "execution", None)
@@ -853,6 +856,15 @@ def scan_symbols(
                     "model_leverage": int(round(float(model_lev))),
                     "risk_pct": round(float(getattr(plan, "risk_pct", 1.0) or 1.0), 2) if plan else 1.0,
                     "prop_safe": prop_safe,
+                    "prop_guidance": prop_guidance,
+                    "universal_eligible": bool(
+                        analysis.meta.get("universal_eligible", False)
+                        if analysis.meta else False
+                    ),
+                    "production_qualified": bool(
+                        analysis.meta.get("production_qualified", False)
+                        if analysis.meta else False
+                    ),
                     "signal_eligible": bool(
                         analysis.meta.get("signal_eligible", False) if analysis.meta else False
                     ),
@@ -1034,6 +1046,13 @@ def scan_symbols(
                         "primary_setup": primary,
                         "prop_safe": prop_safe,
                         "prop_flags": prop_flags,
+                        "prop_guidance": prop_guidance,
+                        "universal_eligible": bool(
+                            analysis.meta.get("universal_eligible", False)
+                        ),
+                        "production_qualified": bool(
+                            analysis.meta.get("production_qualified", False)
+                        ),
                         "legacy_signal_eligible": analysis.meta.get(
                             "legacy_signal_eligible",
                             False,
@@ -1173,7 +1192,45 @@ def scan_symbols(
                     prior=row.get("gate_evaluation"),
                 )
                 row["gate_evaluation"] = alert_evaluation.to_dict()
+                row["universal_eligible"] = bool(
+                    alert_evaluation.universal_eligible
+                )
+                # A promoted outcome model remains veto-only. It cannot make a
+                # deterministically rejected candidate production-qualified.
+                row["production_qualified"] = bool(
+                    alert_evaluation.production_qualified
+                    and row.get("signal_eligible") is not False
+                )
+                row["signal_eligible"] = row["production_qualified"]
                 row["payload"]["gate_evaluation"] = row["gate_evaluation"]
+                row["payload"]["universal_eligible"] = row[
+                    "universal_eligible"
+                ]
+                row["payload"]["production_qualified"] = row[
+                    "production_qualified"
+                ]
+                row["payload"]["signal_eligible"] = row["signal_eligible"]
+                candidate["decision"].update(
+                    {
+                        "prop_safe": prop_safe,
+                        "prop_guidance": prop_guidance,
+                        "universal_eligible": row["universal_eligible"],
+                        "production_qualified": row["production_qualified"],
+                        "signal_eligible": row["signal_eligible"],
+                        "gate_evaluation": row["gate_evaluation"],
+                    }
+                )
+                candidate["production_scores"].update(
+                    {
+                        "prop_safe": prop_safe,
+                        "prop_guidance": prop_guidance,
+                        "universal_eligible": row["universal_eligible"],
+                        "production_qualified": row["production_qualified"],
+                    }
+                )
+                candidate["production_eligible"] = row[
+                    "production_qualified"
+                ]
                 analytics_candidates.append(
                     candidate_analytics_snapshot(
                         row,

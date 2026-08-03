@@ -166,10 +166,11 @@ def test_llm_gate_requires_complete_deterministic_eligibility():
         {"execution": _execution(market_quality_ok=False)},
         {"execution": _execution(hard_failures=["TARGET_BLOCKED"])},
         {"data_quality_ok": False},
-        {"prop_safe": False},
         {"has_feasible_target": False},
         {"use_llm": False},
     ]
     for change in rejected:
         candidate = {**base, **change}
         assert deterministic_narrative_eligible(**candidate) is False
+
+    assert deterministic_narrative_eligible(**{**base, "prop_safe": False}) is True

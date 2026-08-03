@@ -15,6 +15,11 @@ from src.utils.config import AppConfig
 from src.utils.helpers import clamp, safe_float
 
 
+# Candle-quality validation requires at least 60 closed bars. Request a small
+# buffer because the exchange response may include one still-forming candle.
+PRE_DELIVERY_CANDLE_LIMIT = 64
+
+
 def _age_seconds(timestamp_ms: Any) -> Optional[float]:
     source = safe_float(timestamp_ms)
     if source <= 0:
@@ -174,7 +179,7 @@ def revalidate_candidate_for_delivery(
         candles = client.fetch_ohlcv(
             symbol,
             timeframe=timeframe,
-            limit=8,
+            limit=PRE_DELIVERY_CANDLE_LIMIT,
             force_refresh=True,
         )
         candles = closed_candles(candles, timeframe)

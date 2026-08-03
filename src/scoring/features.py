@@ -385,6 +385,9 @@ def build_candidate_record(
             "hold_hours_max",
             "risk_pct",
             "prop_safe",
+            "prop_guidance",
+            "universal_eligible",
+            "production_qualified",
             "signal_eligible",
             "historical_edge_ok",
             "data_quality_ok",
@@ -457,6 +460,12 @@ def build_candidate_record(
         "confluence": row.get("confluence_score"),
         "llm": row.get("llm_confidence"),
         "immediate_sl_risk": row.get("immediate_sl_risk"),
+        "prop_safe": bool(row.get("prop_safe", False)),
+        "prop_guidance": dict(row.get("prop_guidance") or {}),
+        "universal_eligible": bool(row.get("universal_eligible", False)),
+        "production_qualified": bool(
+            row.get("production_qualified", row.get("signal_eligible", False))
+        ),
         "legacy_signal_eligible": bool(
             row.get("legacy_signal_eligible", False)
         ),
@@ -485,7 +494,9 @@ def build_candidate_record(
         "features": features,
         "decision": decision,
         "production_scores": production_scores,
-        "production_eligible": bool(row.get("signal_eligible", False)),
+        "production_eligible": bool(
+            row.get("production_qualified", row.get("signal_eligible", False))
+        ),
         "production_rank": _number(row.get("rank_score")),
         "source": source,
     }

@@ -112,6 +112,44 @@ def test_canonical_gate_result_records_first_and_all_blockers_with_shortfalls():
     assert decision.failed_hard_gates == 3
 
 
+def test_prop_assessment_is_advisory_not_signal_authority():
+    decision = _analysis(prop_safe=False, net_rr=1.5)
+    assert decision.eligible is True
+    assert decision.universal_eligible is True
+    assert decision.production_qualified is True
+    prop_gate = next(
+        gate for gate in decision.gates
+        if gate.code == "PROP_COMPATIBILITY_FAILED"
+    )
+    assert prop_gate.passed is False
+    assert prop_gate.authoritative is False
+    assert prop_gate.severity == "advisory"
+
+    alert = _alert(
+        _alert_row(prop_safe=False, net_risk_reward=[0.8, 1.4]),
+        prior=decision.to_dict(),
+    )
+    assert alert.eligible is True
+
+
+def test_quality_thresholds_remain_production_gates_after_prop_separation():
+    overall = _analysis(overall_quality=67, prop_safe=False, net_rr=1.5)
+    execution = _analysis(execution_quality=71.9, prop_safe=False, net_rr=1.5)
+    assert overall.eligible is False
+    assert overall.universal_eligible is True
+    assert overall.production_qualified is False
+    assert "OVERALL_QUALITY_BELOW_MINIMUM" in overall.all_rejection_reasons
+    assert execution.eligible is False
+    assert execution.universal_eligible is True
+    assert execution.production_qualified is False
+    assert "EXECUTION_QUALITY_BELOW_MINIMUM" in execution.all_rejection_reasons
+
+    net_rr = _analysis(prop_safe=False, net_rr=1.24)
+    assert net_rr.eligible is False
+    assert net_rr.universal_eligible is False
+    assert "NET_RR_BELOW_MINIMUM" in net_rr.all_rejection_reasons
+
+
 def test_flat_candidate_is_non_directional_and_not_a_near_trade():
     decision = _analysis(direction="flat")
     assert decision.primary_rejection_reason == "FLAT_DIRECTION"

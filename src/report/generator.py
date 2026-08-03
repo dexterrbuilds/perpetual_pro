@@ -251,7 +251,16 @@ class ReportGenerator:
                 "strategy_tags": analysis.strategy_tags,
                 "confluence_score": analysis.confluence_total,
                 "eligible": bool((analysis.meta or {}).get("signal_eligible", False)),
+                "universal_eligible": bool(
+                    (analysis.meta or {}).get("universal_eligible", False)
+                ),
+                "production_qualified": bool(
+                    (analysis.meta or {}).get("production_qualified", False)
+                ),
                 "prop_safe": bool(getattr(plan, "prop_safe", False)) if plan else False,
+                "prop_guidance": dict(
+                    getattr(plan, "prop_guidance", None) or {}
+                ) if plan else {},
                 "holding_window": "30m–24h",
             },
             "bias": analysis.bias,
@@ -346,6 +355,9 @@ class ReportGenerator:
                 "prop_mode": getattr(plan, "prop_mode", True),
                 "prop_safe": getattr(plan, "prop_safe", True),
                 "prop_flags": list(getattr(plan, "prop_flags", None) or []),
+                "prop_guidance": dict(
+                    getattr(plan, "prop_guidance", None) or {}
+                ),
                 "max_leverage_allowed": getattr(plan, "max_leverage_allowed", 5.0),
                 "entry_status": getattr(plan, "entry_status", "blocked"),
                 "entry_reason": getattr(plan, "entry_reason", ""),
@@ -357,6 +369,15 @@ class ReportGenerator:
             }
             data["prop_safe"] = getattr(plan, "prop_safe", True)
             data["prop_flags"] = list(getattr(plan, "prop_flags", None) or [])
+            data["prop_guidance"] = dict(
+                getattr(plan, "prop_guidance", None) or {}
+            )
+            data["universal_eligible"] = bool(
+                (analysis.meta or {}).get("universal_eligible", False)
+            )
+            data["production_qualified"] = bool(
+                (analysis.meta or {}).get("production_qualified", False)
+            )
         if getattr(analysis, "llm", None):
             llm = analysis.llm
             data["llm_narrative"] = {

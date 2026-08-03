@@ -11,7 +11,12 @@ import pytest
 
 from src.analysis.confluence import ConfluenceEngine
 from src.analysis.indicators import _session_vwap
-from src.analysis.revalidation import evaluate_pre_delivery_candidate
+from src.analysis import revalidation as revalidation_module
+from src.analysis.revalidation import (
+    PRE_DELIVERY_CANDLE_LIMIT,
+    evaluate_pre_delivery_candidate,
+    revalidate_candidate_for_delivery,
+)
 from src.analysis.risk import RiskManager
 from src.api import service
 from src.scheduler import scan_job
@@ -273,6 +278,84 @@ def test_pre_delivery_revalidation_updates_cmp_state_and_rejects_stale_sources()
         "PRE_SEND_STRUCTURE_INVALIDATED",
         "PRE_SEND_TP1_ALREADY_TRADED",
     }.issubset(set(rejected["reasons"]))
+
+
+def test_force_refresh_wrapper_supplies_sixty_fresh_closed_candles(monkeypatch):
+    cfg = _config()
+    observed_limits = []
+    current = pd.Timestamp.now(tz="UTC")
+    last_closed_open = current.floor("15min") - pd.Timedelta(minutes=15)
+    index = pd.date_range(end=last_closed_open, periods=64, freq="15min")
+    candles = pd.DataFrame(
+        {
+            "open": [100.0] * 64,
+            "high": [101.0] * 64,
+            "low": [99.0] * 64,
+            "close": [100.5] * 64,
+            "volume": [1000.0] * 64,
+        },
+        index=index,
+    )
+
+    class FreshClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fetch_ticker(self, symbol, *, force_refresh=False):
+            assert force_refresh is True
+            return {
+                "last": 100.5,
+                "_perpetual_pro_observed_at_ms": int(datetime.now(timezone.utc).timestamp() * 1000),
+            }
+
+        def fetch_order_book_summary(self, symbol, limit, *, force_refresh=False):
+            assert force_refresh is True
+            return {
+                "spread_bps": 2.0,
+                "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            }
+
+        def fetch_ohlcv(self, symbol, *, timeframe, limit, force_refresh=False):
+            observed_limits.append(limit)
+            assert force_refresh is True
+            return candles
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(revalidation_module, "ExchangeClient", FreshClient)
+    result = revalidate_candidate_for_delivery(
+        _delivery_row(datetime.now(timezone.utc)), cfg
+    )
+
+    assert observed_limits == [PRE_DELIVERY_CANDLE_LIMIT]
+    assert PRE_DELIVERY_CANDLE_LIMIT >= 61
+    assert result["ok"] is True
+    assert "PRE_SEND_CANDLES_STALE" not in result["reasons"]
+
+
+def test_universal_pre_delivery_failures_remain_authoritative():
+    cfg = _config()
+    now = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    cases = [
+        (_delivery_row(now), 100.5, 60.0, 3.0, 100.4, False, "PRE_SEND_TICKER_STALE"),
+        ({**_delivery_row(now), "take_profits": []}, 100.5, 2.0, 3.0, 100.4, True, "PRE_SEND_LEVELS_INVALID"),
+        (_delivery_row(now), 97.5, 2.0, 3.0, 97.5, True, "PRE_SEND_STOP_ALREADY_TRADED"),
+    ]
+    for row, price, ticker_age, book_age, close, candle_ok, expected in cases:
+        result = evaluate_pre_delivery_candidate(
+            row,
+            current_price=price,
+            spread_bps=2.0,
+            ticker_age_seconds=ticker_age,
+            orderbook_age_seconds=book_age,
+            latest_closed_price=close,
+            candle_data_ok=candle_ok,
+            config=cfg,
+            now=now,
+        )
+        assert result["ok"] is False
+        assert expected in result["reasons"]
 
 
 def test_directional_features_use_signal_support_sign_and_schema_isolated():

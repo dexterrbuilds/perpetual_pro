@@ -237,9 +237,26 @@ def test_phase2a_instrumentation_is_persisted_additively():
         "depth_bands_bps": {"10": {"bid_usd": 10000}},
         "hard_failures": [], "execution_uncertainties": ["tick_size_unknown"],
         "execution": {"status": "confirmation_pending"},
+        "universal_eligible": True,
+        "production_qualified": True,
+        "signal_eligible": True,
+        "prop_safe": False,
+        "prop_guidance": {
+            "status": "not_recommended_for_strict_prop",
+            "suggested_risk_pct_min": 0.25,
+            "suggested_risk_pct_max": 0.25,
+            "suggested_leverage_min": 1,
+            "suggested_leverage_max": 1,
+            "reasons": ["Wider stop geometry."],
+        },
     }
     record = build_candidate_record(None, row, source="phase2a_test")
     assert record["decision"]["execution_policy_version"] == "execution_quality_v2a.1"
     assert record["decision"]["stop_distance_atr"] == 1.0
     assert record["decision"]["depth_bands_bps"]["10"]["bid_usd"] == 10000
+    assert record["decision"]["universal_eligible"] is True
+    assert record["decision"]["production_qualified"] is True
+    assert record["decision"]["prop_safe"] is False
+    assert record["decision"]["prop_guidance"]["status"] == "not_recommended_for_strict_prop"
+    assert record["production_eligible"] is True
     assert record["feature_schema_version"] == "3.0"

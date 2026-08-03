@@ -675,6 +675,26 @@ def format_signal_photo_caption(
         )
     if quality_bits:
         lines.append(f"🛡 <b>Quality:</b> {html.escape(' · '.join(quality_bits))}")
+    guidance = dict(
+        row.get("prop_guidance")
+        or payload.get("prop_guidance")
+        or primary.get("prop_guidance")
+        or {}
+    )
+    if not guidance:
+        guidance = {
+            "status": (
+                "suitable"
+                if row.get("prop_safe") is not False
+                else "not_recommended_for_strict_prop"
+            ),
+            "suggested_risk_pct_min": 0.5 if row.get("prop_safe") is not False else 0.25,
+            "suggested_risk_pct_max": 0.5 if row.get("prop_safe") is not False else 0.25,
+            "suggested_leverage_min": 1.0,
+            "suggested_leverage_max": 2.0 if row.get("prop_safe") is not False else 1.0,
+            "reasons": [],
+        }
+    lines.extend(_prop_guidance_lines(guidance))
     execution_note = entry_reason
     if not execution_note and status == "wait_retest":
         execution_note = "Wait for retest of the zone. Do not chase."
@@ -703,7 +723,52 @@ def format_signal_photo_caption(
             if not line.startswith("📌 <b>Note:</b>")
         ]
         caption = "\n".join(lines).replace("\n\n\n", "\n\n")
+    if len(caption) > 1024:
+        # Retain the trade geometry and the prop advisory. Secondary execution
+        # detail is available in the persisted payload and operator analytics.
+        optional_prefixes = (
+            "📈 <b>Execution:</b>",
+            "🛡 <b>Quality:</b>",
+            "📍 <b>Price at scan:</b>",
+            "🕒 <b>Hold after fill:</b>",
+        )
+        lines = [
+            line for line in lines
+            if not line.startswith(optional_prefixes)
+        ]
+        caption = "\n".join(lines).replace("\n\n\n", "\n\n")
     return caption
+
+
+def _prop_guidance_lines(guidance: Dict[str, Any]) -> List[str]:
+    """Format advisory-only prop guidance without implying trade safety."""
+    status = str(guidance.get("status") or "suitable").strip().lower()
+    labels = {
+        "suitable": "Suitable",
+        "suitable_with_reduced_risk": "Suitable with reduced risk",
+        "not_recommended_for_strict_prop": "Not recommended for strict prop accounts",
+    }
+    label = labels.get(status, "Review firm-specific limits")
+    lev_low = min(5.0, max(1.0, _number(guidance.get("suggested_leverage_min"), 1.0)))
+    lev_high = min(5.0, max(lev_low, _number(guidance.get("suggested_leverage_max"), lev_low)))
+    risk_low = max(0.0, _number(guidance.get("suggested_risk_pct_min"), 0.25))
+    risk_high = max(risk_low, _number(guidance.get("suggested_risk_pct_max"), risk_low))
+    leverage_text = f"{lev_low:g}x" if lev_low == lev_high else f"{lev_low:g}–{lev_high:g}x"
+    risk_text = f"{risk_low:g}%" if risk_low == risk_high else f"{risk_low:g}–{risk_high:g}%"
+    reasons = list(guidance.get("reasons") or [])
+    lines = [
+        "🛡 <b>Prop-Firm Guidance</b>",
+        html.escape(label),
+        f"Suggested leverage: {leverage_text} · Suggested risk: {risk_text}",
+    ]
+    if reasons:
+        lines.append(f"Reason: {html.escape(str(reasons[0])[:105])}")
+    if status == "not_recommended_for_strict_prop":
+        lines.append(
+            "Valid for personal-capital use only with appropriate position sizing; "
+            "not automatically safe."
+        )
+    return lines
 
 
 def _telegram_rr_line(

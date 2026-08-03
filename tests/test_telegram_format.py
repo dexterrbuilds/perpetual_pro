@@ -218,9 +218,9 @@ def test_filter_high_confidence():
         },
     ]
     out = filter_high_confidence(rows, min_llm=65, min_rank=50, only_prop_safe=True)
-    assert len(out) == 1
-    assert out[0]["confidence"] == 80
-    assert out[0]["llm_confidence"] == 80
+    assert len(out) == 2
+    assert {row["direction"] for row in out} == {"long", "short"}
+    assert next(row for row in out if row["direction"] == "short")["prop_safe"] is False
 
 
 def test_filter_rejects_weak_execution_and_signal_gate():
@@ -1282,3 +1282,36 @@ def test_delivery_mode_does_not_change_scheduler_windows(monkeypatch):
     public_sessions = load_config(ROOT / "config.yaml").scheduler.sessions
     assert beta_sessions == public_sessions
     assert len(beta_sessions) == 4
+
+
+def test_signal_caption_displays_prop_guidance_within_limit():
+    row = {
+        "symbol": "BTC/USDT:USDT",
+        "direction": "long",
+        "confidence": 86,
+        "technical_confidence": 87,
+        "execution_quality": 81,
+        "entry_status": "wait_retest",
+        "entry_low": 100,
+        "entry_high": 101,
+        "stop_loss": 98,
+        "take_profits": [103, 105],
+        "gross_risk_reward": [1.0, 1.5],
+        "net_risk_reward": [0.9, 1.35],
+        "prop_safe": False,
+        "prop_guidance": {
+            "status": "not_recommended_for_strict_prop",
+            "suggested_risk_pct_min": 0.25,
+            "suggested_risk_pct_max": 0.25,
+            "suggested_leverage_min": 1,
+            "suggested_leverage_max": 1,
+            "reasons": ["Elevated volatility and wider stop geometry."],
+        },
+        "payload": {"execution": {}, "primary_setup": {}},
+    }
+    caption = format_signal_photo_caption(row)
+    assert "Prop-Firm Guidance" in caption
+    assert "Not recommended for strict prop accounts" in caption
+    assert "Suggested leverage: 1x · Suggested risk: 0.25%" in caption
+    assert "personal-capital" in caption
+    assert len(caption) <= 1024

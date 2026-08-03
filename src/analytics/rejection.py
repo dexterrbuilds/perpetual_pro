@@ -16,6 +16,18 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 GATE_POLICY_VERSION = "rejection_analytics_v1.0"
 ALERT_MIN_OVERALL_QUALITY = 80.0
 
+# These checks define Perpetual Pro's production selectivity, not universal
+# market/entry safety. They still block publication at their existing thresholds.
+_SELECTIVITY_CODES = frozenset(
+    {
+        "TECHNICAL_QUALITY_BELOW_MINIMUM",
+        "OVERALL_QUALITY_BELOW_MINIMUM",
+        "CONFLUENCE_BELOW_MINIMUM",
+        "EXECUTION_QUALITY_BELOW_MINIMUM",
+        "RANK_BELOW_MINIMUM",
+    }
+)
+
 # Stable public diagnostic vocabulary. Existing internal detail strings may be
 # retained separately, but persistence and aggregation use these codes.
 STABLE_REJECTION_CODES = frozenset(
@@ -91,6 +103,8 @@ class GateEvaluation:
     failed_soft_gates: int = 0
     would_still_fail_without_primary: bool = False
     proximity_label: str = "ELIGIBLE"
+    universal_eligible: bool = False
+    production_qualified: bool = False
 
     def finalize(self, *, prior_eligible: bool = True) -> "GateEvaluation":
         failed = [gate for gate in self.gates if not gate.passed]
@@ -114,6 +128,11 @@ class GateEvaluation:
             sum(max(0.0, gate.normalized_distance) for gate in blocking), 6
         )
         self.eligible = bool(prior_eligible and not blocking)
+        universal_blocking = [
+            gate for gate in blocking if gate.code not in _SELECTIVITY_CODES
+        ]
+        self.universal_eligible = not universal_blocking
+        self.production_qualified = self.eligible
         self.would_still_fail_without_primary = bool(
             len({gate.code for gate in blocking}) > 1
             or (not prior_eligible and not blocking)
@@ -152,6 +171,8 @@ class GateEvaluation:
             "failed_soft_gates": self.failed_soft_gates,
             "would_still_fail_without_primary": self.would_still_fail_without_primary,
             "proximity_label": self.proximity_label,
+            "universal_eligible": self.universal_eligible,
+            "production_qualified": self.production_qualified,
             "gates": [gate.to_dict() for gate in self.gates],
         }
 
@@ -366,6 +387,8 @@ def evaluate_analysis_gates(
     execution_floor: float,
     max_immediate_sl_risk: float,
     hard_failures: Sequence[str] = (),
+    net_rr: Any = None,
+    min_net_rr: float = 1.25,
 ) -> GateEvaluation:
     """Mirror the authoritative analysis eligibility expression exactly."""
     stage = "analysis"
@@ -414,6 +437,13 @@ def evaluate_analysis_gates(
             "PROP_COMPATIBILITY_FAILED", "Prop compatibility", prop_safe,
             bool(prop_safe), True, stage=stage,
             explanation="Plan is prop-compatible" if prop_safe else "Plan failed prop compatibility",
+            severity="advisory", authoritative=False,
+        ),
+        _minimum_gate(
+            "NET_RR_BELOW_MINIMUM", "TP2 net R:R", net_rr,
+            min_net_rr, stage=stage, missing_passes=True,
+            authoritative=net_rr is not None,
+            severity="hard" if net_rr is not None else "diagnostic",
         ),
     ]
     for failure in hard_failures:
@@ -446,6 +476,18 @@ def _tp2_rr(row: Mapping[str, Any]) -> Optional[float]:
     return _number(values[index])
 
 
+def _tp2_net_rr(row: Mapping[str, Any]) -> Optional[float]:
+    values = list(row.get("net_risk_reward") or [])
+    if not values:
+        payload = dict(row.get("payload") or {})
+        execution = dict(payload.get("execution") or {})
+        setup = dict(payload.get("primary_setup") or payload.get("trade_plan") or {})
+        values = list(execution.get("net_risk_reward") or setup.get("net_risk_reward") or [])
+    if not values:
+        return None
+    return _number(values[1 if len(values) > 1 else 0])
+
+
 def evaluate_alert_gates(
     row: Mapping[str, Any],
     *,
@@ -469,13 +511,14 @@ def evaluate_alert_gates(
     market_ok = row.get("market_quality_ok") is not False
     data_ok = row.get("data_quality_ok") is not False
     historical_ok = row.get("historical_edge_ok") is not False
-    prop_ok = not only_prop_safe or row.get("prop_safe") is not False
+    prop_ok = row.get("prop_safe") is not False
     progress_blocked = bool(
         str(row.get("entry_zone_relation") or "") == "favorable_beyond"
         and _number(row.get("tp1_progress_pct")) is not None
         and float(row.get("tp1_progress_pct")) >= max_pre_entry_tp1_progress_pct
     )
     rr = _tp2_rr(row)
+    net_rr = _tp2_net_rr(row)
     gates = [
         _condition_gate(
             "FLAT_DIRECTION", "Directional candidate", directional, direction,
@@ -551,6 +594,13 @@ def evaluate_alert_gates(
             severity="hard" if rr is not None else "diagnostic",
             missing_passes=True,
         ),
+        _minimum_gate(
+            "NET_RR_BELOW_MINIMUM", "TP2 net R:R", net_rr,
+            min_tp2_rr, stage=stage,
+            authoritative=net_rr is not None,
+            severity="hard" if net_rr is not None else "diagnostic",
+            missing_passes=True,
+        ),
         _entry_gate(
             row.get("entry_status"), stage=stage, missing_passes=True
         ),
@@ -558,6 +608,7 @@ def evaluate_alert_gates(
             "PROP_COMPATIBILITY_FAILED", "Prop compatibility", prop_ok,
             row.get("prop_safe"), True, stage=stage,
             explanation="Prop compatibility passed" if prop_ok else "Prop compatibility failed",
+            severity="advisory", authoritative=False,
         ),
     ]
     prior_eval = GateEvaluation.from_dict(prior) if prior else None
@@ -677,6 +728,19 @@ def candidate_analytics_snapshot(
         "ticker_age_seconds": _number(row.get("ticker_age_seconds")),
         "orderbook_age_seconds": _number(row.get("orderbook_age_seconds")),
         "prop_safe": bool(row.get("prop_safe")),
+        "prop_guidance": dict(row.get("prop_guidance") or {}),
+        "universal_eligible": bool(
+            row.get(
+                "universal_eligible",
+                evaluation.get("universal_eligible", False),
+            )
+        ),
+        "production_qualified": bool(
+            row.get(
+                "production_qualified",
+                evaluation.get("production_qualified", evaluation.get("eligible", False)),
+            )
+        ),
         "entry_state": row.get("entry_status"),
         "target_count": len(targets),
         "target_feasibility": target_feasibility,

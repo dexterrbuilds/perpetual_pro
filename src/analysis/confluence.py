@@ -114,6 +114,7 @@ def deterministic_narrative_eligible(
     score_floor: float,
     execution_floor: float,
     max_immediate_sl_risk: float,
+    min_net_rr: float = 1.25,
 ) -> bool:
     """Whether a deterministic signal merits optional narrative enrichment.
 
@@ -138,6 +139,12 @@ def deterministic_narrative_eligible(
         execution_floor=execution_floor,
         max_immediate_sl_risk=max_immediate_sl_risk,
         hard_failures=execution.hard_failures,
+        net_rr=(
+            execution.net_risk_reward[1]
+            if len(execution.net_risk_reward) > 1
+            else (execution.net_risk_reward[0] if execution.net_risk_reward else None)
+        ),
+        min_net_rr=min_net_rr,
     )
     return bool(
         use_llm
@@ -484,6 +491,12 @@ class ConfluenceEngine:
         plan_prop_safe_before_confidence_gate = bool(
             getattr(plan, "prop_safe", True)
         )
+        minimum_net_rr = float(getattr(self.config.risk, "min_rr", 1.25))
+        execution_net_rr = (
+            execution.net_risk_reward[1]
+            if len(execution.net_risk_reward) > 1
+            else (execution.net_risk_reward[0] if execution.net_risk_reward else None)
+        )
         analysis_gate_evaluation = evaluate_analysis_gates(
             direction=direction,
             technical_quality=result.technical_confidence,
@@ -500,6 +513,8 @@ class ConfluenceEngine:
             execution_floor=execution_floor,
             max_immediate_sl_risk=max_immediate_sl_risk,
             hard_failures=execution.hard_failures,
+            net_rr=execution_net_rr,
+            min_net_rr=minimum_net_rr,
         )
 
         # LLM narrative is optional and narrative-only. External providers are
@@ -518,6 +533,7 @@ class ConfluenceEngine:
             score_floor=score_floor,
             execution_floor=execution_floor,
             max_immediate_sl_risk=max_immediate_sl_risk,
+            min_net_rr=minimum_net_rr,
         )
         llm_invocation_status = (
             "eligible_not_requested"
@@ -652,7 +668,8 @@ class ConfluenceEngine:
             and execution.immediate_sl_risk <= max_immediate_sl_risk
             and execution.market_quality_ok
             and data_quality_ok
-            and plan_prop_safe_before_confidence_gate
+            and execution_net_rr is not None
+            and execution_net_rr >= minimum_net_rr
         )
         legacy_signal_eligible = bool(
             common_legacy_gate
@@ -668,6 +685,8 @@ class ConfluenceEngine:
             plan, result.confidence, minimum=confidence_floor
         )
         signal_eligible = bool(analysis_gate_evaluation.eligible)
+        universal_eligible = bool(analysis_gate_evaluation.universal_eligible)
+        production_qualified = bool(analysis_gate_evaluation.production_qualified)
         structured_rejections: List[Dict[str, Any]] = [
             {
                 "code": gate.code,
@@ -708,8 +727,6 @@ class ConfluenceEngine:
             plan.direction = "flat"
             plan.entry_status = "blocked"
             plan.entry_reason = "Signal blocked: " + ", ".join(gate_reasons)
-            plan.prop_safe = False
-            plan.prop_flags = list(dict.fromkeys([*plan.prop_flags, "SIGNAL_GATE"]))
             result.warnings.append(plan.entry_reason)
             result.trader_commentary = (
                 f"{result.bias.title()} bias only — no trade. {plan.entry_reason}. "
@@ -787,6 +804,9 @@ class ConfluenceEngine:
             "rank_breakdown": rank_breakdown,
             "prop_safe": bool(getattr(plan, "prop_safe", True)),
             "prop_flags": list(getattr(plan, "prop_flags", None) or []),
+            "prop_guidance": dict(getattr(plan, "prop_guidance", None) or {}),
+            "universal_eligible": universal_eligible,
+            "production_qualified": production_qualified,
             "signal_eligible": signal_eligible,
             "legacy_signal_eligible": legacy_signal_eligible,
             "legacy_v2_signal_eligible": legacy_v2_signal_eligible,
