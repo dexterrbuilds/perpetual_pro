@@ -49,7 +49,7 @@ def _row() -> dict:
     gates = [
         _gate("FLAT_DIRECTION", True, "long", ["long", "short"], stage="analysis"),
         _gate("OVERALL_QUALITY_BELOW_MINIMUM", True, 84, {"operator": ">=", "value": 68}, stage="analysis"),
-        _gate("OVERALL_QUALITY_BELOW_MINIMUM", True, 84, {"operator": ">=", "value": 80}),
+        _gate("OVERALL_QUALITY_BELOW_MINIMUM", True, 84, {"operator": ">=", "value": 78}),
         _gate("EXECUTION_QUALITY_BELOW_MINIMUM", True, 79, {"operator": ">=", "value": 72}, stage="analysis"),
         _gate("EXECUTION_QUALITY_BELOW_MINIMUM", True, 79, {"operator": ">=", "value": 72}),
         _gate("CONFLUENCE_BELOW_MINIMUM", True, 0.4, {"operator": ">=", "value": 0.2}, stage="analysis"),
@@ -145,7 +145,7 @@ def test_hard_and_mandatory_failures_always_reject():
     assert evaluate_private_beta_qualification(hard)["private_beta_qualified"] is False
 
     overall = _row()
-    _set_gate(overall, "OVERALL_QUALITY_BELOW_MINIMUM", False, 79.9)
+    _set_gate(overall, "OVERALL_QUALITY_BELOW_MINIMUM", False, 77.9)
     assert evaluate_private_beta_qualification(overall)["overall_quality_passed"] is False
     assert evaluate_private_beta_qualification(overall)["private_beta_qualified"] is False
 

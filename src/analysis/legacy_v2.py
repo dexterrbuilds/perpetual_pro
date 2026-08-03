@@ -101,7 +101,7 @@ def execution_aware_legacy_confidence(
 def compare_legacy_v2_outcomes(
     rows: Sequence[Mapping[str, Any]],
     *,
-    alert_confidence_floor: float = 80.0,
+    alert_confidence_floor: float = 78.0,
 ) -> Dict[str, Any]:
     """Compare stored Legacy and Legacy V2 selections on identical outcomes."""
     ordered = sorted(rows, key=lambda row: str(row.get("generated_at") or ""))

@@ -820,7 +820,7 @@ def quality_badge(score: Any) -> str:
         return "⭐ Excellent"
     if value >= 85:
         return "💚 Strong setup"
-    if value >= 80:
+    if value >= 78:
         return "🟡 Watch closely"
     return "⚪ Below quality floor"
 
@@ -1403,7 +1403,7 @@ def format_prop_scan_report(
     slot_label: str = "",
     timezone: str = "Africa/Lagos",
     max_rows: int = 6,
-    min_signal_confidence: float = 80.0,
+    min_signal_confidence: float = 78.0,
     scanned_count: Optional[int] = None,
     ranked_count: Optional[int] = None,
     rejection_summary: Optional[Dict[str, Any]] = None,

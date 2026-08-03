@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
 GATE_POLICY_VERSION = "rejection_analytics_v1.0"
-ALERT_MIN_OVERALL_QUALITY = 80.0
+ALERT_MIN_OVERALL_QUALITY = 78.0
 
 # These conditions are categorical execution/safety failures, not comparable
 # numeric shortfalls. A candidate carrying any of them may still be the
@@ -652,7 +652,7 @@ def evaluate_alert_gates(
     if prior_eval is not None:
         # Preserve the actual stage order while avoiding a second copy of the
         # same unchanged gate. A stricter downstream threshold (for example
-        # Overall Quality 80 after the analysis floor) remains a distinct gate.
+        # Overall Quality 78 after the analysis floor) remains a distinct gate.
         merged = list(prior_eval.gates)
         for current in gates:
             unchanged = any(

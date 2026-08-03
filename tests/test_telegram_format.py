@@ -107,8 +107,8 @@ def test_quality_badges_are_visual_only_and_cover_boundaries():
     assert quality_badge(89.9) == "💚 Strong setup"
     assert quality_badge(85) == "💚 Strong setup"
     assert quality_badge(84.9) == "🟡 Watch closely"
-    assert quality_badge(80) == "🟡 Watch closely"
-    assert quality_badge(79.9) == "⚪ Below quality floor"
+    assert quality_badge(78) == "🟡 Watch closely"
+    assert quality_badge(77.9) == "⚪ Below quality floor"
 
 
 def test_rejection_explanation_shows_actual_and_requirement():
@@ -226,14 +226,14 @@ def test_filter_high_confidence():
     rows = [
         {
             "direction": "long",
-            "confidence": 80,
+            "confidence": 78,
             "llm_confidence": 80,
             "rank_score": 70,
             "prop_safe": True,
         },
         {
             "direction": "long",
-            "confidence": 79.9,
+            "confidence": 77.9,
             "llm_confidence": 90,
             "rank_score": 90,
             "prop_safe": True,
