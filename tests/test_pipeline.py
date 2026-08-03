@@ -151,6 +151,13 @@ def test_full_confluence_pipeline(tmp_path):
     )
     assert analysis.trade_plan.is_simulation
     assert analysis.key_reasons is not None
+    evaluated_direction = analysis.meta.get("evaluated_direction")
+    if evaluated_direction in ("long", "short"):
+        assert analysis.meta["rank_available"] is True
+        assert analysis.meta["rank_score"] > 0
+        assert analysis.rank_score == analysis.meta["rank_score"]
+    else:
+        assert analysis.meta["rank_available"] is False
 
     # Report export
     cfg.output.output_dir = str(tmp_path)

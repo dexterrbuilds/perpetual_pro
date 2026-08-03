@@ -519,10 +519,19 @@ def _run_scheduled_scan_once_unlocked(
         result.get("qualification_candidates") or ranked
     )
     if private_beta_mode:
-        missing_gate_rows = [
-            row for row in qualification_candidates
-            if not (row.get("gate_evaluation") or {}).get("gates")
-        ]
+        required_alert_codes = {
+            "OVERALL_QUALITY_BELOW_MINIMUM",
+            "EXECUTION_QUALITY_BELOW_MINIMUM",
+            "RANK_BELOW_MINIMUM",
+        }
+        missing_gate_rows = []
+        for row in qualification_candidates:
+            existing_codes = {
+                str(gate.get("code") or "")
+                for gate in (row.get("gate_evaluation") or {}).get("gates") or []
+            }
+            if not required_alert_codes.issubset(existing_codes):
+                missing_gate_rows.append(row)
         if missing_gate_rows:
             # Compatibility for stored/tests/older API producers: use the
             # existing alert evaluator solely to materialize canonical checks.

@@ -13,6 +13,7 @@ from statistics import median
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
+
 GATE_POLICY_VERSION = "rejection_analytics_v1.0"
 ALERT_MIN_OVERALL_QUALITY = 78.0
 
@@ -736,6 +737,13 @@ def candidate_analytics_snapshot(
     targets = list(row.get("take_profits") or [])
     target_feasibility = list(row.get("target_feasibility") or [])
     direction = _canonical_candidate_direction(row)
+    authoritative_rank = _number(
+        row.get("authoritative_rank", row.get("rank_score"))
+    )
+    rank_available = bool(
+        row.get("rank_available", authoritative_rank is not None)
+        and authoritative_rank is not None
+    )
     return {
         "scan_id": scan_id,
         "candidate_id": candidate_id,
@@ -752,7 +760,8 @@ def candidate_analytics_snapshot(
         "technical_quality": _number(row.get("technical_confidence")),
         "execution_quality": _number(row.get("execution_quality", row.get("execution_score"))),
         "overall_quality": _number(row.get("confidence")),
-        "rank_score": _number(row.get("rank_score")),
+        "rank_score": authoritative_rank if rank_available else None,
+        "rank_available": rank_available,
         "immediate_sl_risk": _number(row.get("immediate_sl_risk")),
         "gross_rr": list(row.get("gross_risk_reward") or []),
         "net_rr": list(row.get("net_risk_reward") or []),
@@ -881,6 +890,10 @@ def aggregate_rejection_rows(
     *,
     suspicious_minimum_sample: int = 10,
 ) -> Dict[str, Any]:
+    # Local import avoids the analysis package's confluence/rejection import
+    # cycle during application startup.
+    from src.analysis.qualification import analyze_private_beta_net_rr_floors
+
     primary = Counter(str(row.get("primary_rejection_reason") or "ELIGIBLE") for row in candidates)
     all_reasons: Counter[str] = Counter()
     setup = Counter(str(row.get("setup_type") or "unknown") for row in candidates)
@@ -1013,6 +1026,9 @@ def aggregate_rejection_rows(
         "primary_rejections_by_timeframe": {key: dict(value) for key, value in primary_by_timeframe.items()},
         "failed_gates_by_stage": dict(failures_by_stage),
         "score_distributions": distributions,
+        "private_beta_net_rr_floor_impact": analyze_private_beta_net_rr_floors(
+            candidates
+        ),
         "freshness": {
             "max_ticker_age_seconds": max(ticker_ages) if ticker_ages else None,
             "max_orderbook_age_seconds": (

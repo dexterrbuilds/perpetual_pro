@@ -8,11 +8,18 @@ analysis, alert-filter, and pre-delivery revalidation paths.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
-QUALIFICATION_POLICY_VERSION = "deduplicated_checks_v1.0"
-PRIVATE_BETA_MIN_SOFT_PASS_PCT = 70.0
+QUALIFICATION_POLICY_VERSION = "private_beta_important_soft_v1"
+PRIVATE_BETA_MIN_IMPORTANT_SOFT_PASSES = 2
+PRIVATE_BETA_NET_RR_FLOOR = 0.75
+PRIVATE_BETA_PREFERRED_NET_RR = 1.25
+IMPORTANT_SOFT_CHECK_IDS = frozenset(
+    {"directional_confluence", "immediate_sl_risk", "net_rr"}
+)
+SUPPORTING_SOFT_CHECK_IDS = frozenset({"deterministic_rank", "gross_rr"})
 
 
 @dataclass(frozen=True)
@@ -26,6 +33,7 @@ class CheckPolicy:
     participates_private_beta: bool = True
     qualification_role: str = "standard"
     may_improve_before_entry: bool = False
+    soft_tier: Optional[str] = None
 
 
 def _policy(
@@ -39,6 +47,7 @@ def _policy(
     participates: bool = True,
     role: str = "standard",
     may_improve: bool = False,
+    soft_tier: Optional[str] = None,
 ) -> CheckPolicy:
     return CheckPolicy(
         canonical_id=canonical_id,
@@ -50,6 +59,7 @@ def _policy(
         participates_private_beta=participates,
         qualification_role=role,
         may_improve_before_entry=may_improve,
+        soft_tier=soft_tier,
     )
 
 
@@ -78,22 +88,23 @@ CHECK_REGISTRY: Dict[str, CheckPolicy] = {
     ),
     "CONFLUENCE_BELOW_MINIMUM": _policy(
         "directional_confluence", "Directional confluence", "soft", [_ANALYSIS],
-        may_improve=True,
+        may_improve=True, soft_tier="important",
     ),
     "RANK_BELOW_MINIMUM": _policy(
         "deterministic_rank", "Deterministic Rank", "soft", [_ALERT],
-        may_improve=True,
+        may_improve=True, soft_tier="supporting",
     ),
     "IMMEDIATE_SL_RISK_TOO_HIGH": _policy(
         "immediate_sl_risk", "Immediate-SL risk preference", "soft", [_ANALYSIS, _ALERT, _EXECUTION],
-        may_improve=True,
+        may_improve=True, soft_tier="important",
     ),
     "GROSS_RR_BELOW_MINIMUM": _policy(
         "gross_rr", "Gross R:R", "soft", [_ALERT], may_improve=True,
+        soft_tier="supporting",
     ),
     "NET_RR_BELOW_MINIMUM": _policy(
         "net_rr", "Net R:R after costs", "soft", [_ANALYSIS, _ALERT, _EXECUTION],
-        may_improve=True,
+        may_improve=True, soft_tier="important",
     ),
     "DATA_QUALITY_FAILED": _policy("data_quality", "Finite, complete, fresh candle data", "hard", [_ANALYSIS, _ALERT, _REVALIDATION]),
     "MARKET_QUALITY_FAILED": _policy("market_quality", "Usable market and liquidity quality", "hard", [_ANALYSIS, _ALERT, _EXECUTION]),
@@ -210,6 +221,7 @@ def _result_from_gate(
         "participates_private_beta": policy.participates_private_beta,
         "qualification_role": policy.qualification_role,
         "may_improve_before_entry": policy.may_improve_before_entry,
+        "soft_tier": policy.soft_tier,
     }
 
 
@@ -311,6 +323,56 @@ def build_deduplicated_check_registry(
     return sorted(deduplicated, key=lambda item: item["canonical_check_id"])
 
 
+def _authoritative_net_rr(
+    row: Mapping[str, Any],
+    important_checks: Sequence[Mapping[str, Any]],
+) -> Optional[float]:
+    values = list(row.get("net_risk_reward") or [])
+    if not values:
+        payload = dict(row.get("payload") or {})
+        execution = dict(payload.get("execution") or {})
+        setup = dict(payload.get("primary_setup") or payload.get("trade_plan") or {})
+        values = list(
+            execution.get("net_risk_reward")
+            or setup.get("net_risk_reward")
+            or []
+        )
+    if values:
+        value = _numeric(values[1 if len(values) > 1 else 0])
+        if value is not None:
+            return value
+    check = next(
+        (
+            item for item in important_checks
+            if item.get("canonical_check_id") == "net_rr"
+        ),
+        None,
+    )
+    return _numeric(check.get("actual_value")) if check else None
+
+
+def _authoritative_rank(
+    row: Mapping[str, Any],
+    supporting_checks: Sequence[Mapping[str, Any]],
+) -> Tuple[bool, Optional[float]]:
+    explicit_available = row.get("rank_available")
+    raw = row.get("authoritative_rank")
+    if raw is None and explicit_available is not False:
+        raw = row.get("rank_score")
+    value = _numeric(raw)
+    if value is None:
+        check = next(
+            (
+                item for item in supporting_checks
+                if item.get("canonical_check_id") == "deterministic_rank"
+            ),
+            None,
+        )
+        value = _numeric(check.get("actual_value")) if check else None
+    available = bool(value is not None and explicit_available is not False)
+    return available, value if available else None
+
+
 def evaluate_private_beta_qualification(
     row: Mapping[str, Any],
     gate_evaluation: Optional[Mapping[str, Any]] = None,
@@ -326,10 +388,53 @@ def evaluate_private_beta_qualification(
         item for item in participating
         if item["classification"] == "soft" and item["qualification_role"] == "standard"
     ]
+    important = [
+        item for item in soft
+        if item["canonical_check_id"] in IMPORTANT_SOFT_CHECK_IDS
+    ]
+    supporting = [
+        item for item in soft
+        if item["canonical_check_id"] in SUPPORTING_SOFT_CHECK_IDS
+    ]
+    rank_available, authoritative_rank = _authoritative_rank(row, supporting)
+    rank_check = next(
+        (
+            item for item in supporting
+            if item["canonical_check_id"] == "deterministic_rank"
+        ),
+        None,
+    )
+    if rank_check is not None:
+        required_raw = rank_check.get("required_value")
+        required_rank = _numeric(
+            required_raw.get("value")
+            if isinstance(required_raw, Mapping)
+            else required_raw
+        )
+        rank_check["actual_value"] = authoritative_rank
+        rank_check["passed"] = bool(
+            rank_available
+            and required_rank is not None
+            and authoritative_rank is not None
+            and authoritative_rank >= required_rank
+        )
+        rank_check["failure_reason"] = (
+            ""
+            if rank_check["passed"]
+            else (
+                "Deterministic Rank is unavailable"
+                if not rank_available
+                else "Deterministic Rank is below the existing minimum"
+            )
+        )
     passed_hard = [item for item in hard if item["passed"]]
     failed_hard = [item for item in hard if not item["passed"]]
     passed_soft = [item for item in soft if item["passed"]]
     failed_soft = [item for item in soft if not item["passed"]]
+    passed_important = [item for item in important if item["passed"]]
+    failed_important = [item for item in important if not item["passed"]]
+    passed_supporting = [item for item in supporting if item["passed"]]
+    failed_supporting = [item for item in supporting if not item["passed"]]
     soft_pct = (
         len(passed_soft) / len(soft) * 100.0
         if soft
@@ -351,13 +456,22 @@ def evaluate_private_beta_qualification(
     overall_passed = bool(overall and overall["passed"])
     execution_passed = bool(execution and execution["passed"])
     hard_passed = not failed_hard
+    net_rr = _authoritative_net_rr(row, important)
+    net_rr_floor_passed = bool(
+        net_rr is not None and net_rr + 1e-9 >= PRIVATE_BETA_NET_RR_FLOOR
+    )
     qualifies = private_beta_threshold_passes(
         hard_passed=hard_passed,
         overall_quality_passed=overall_passed,
         execution_quality_passed=execution_passed,
-        soft_pass_percentage=soft_pct,
+        important_soft_passed=len(passed_important),
+        net_rr_floor_passed=net_rr_floor_passed,
     )
-    if qualifies and soft_pct >= 100.0:
+    if (
+        qualifies
+        and len(important) >= 3
+        and len(passed_important) == len(important)
+    ):
         qualification_type = "fully_qualified"
     elif qualifies:
         qualification_type = "qualified_beta"
@@ -373,6 +487,16 @@ def evaluate_private_beta_qualification(
         "applicable_soft_checks": soft,
         "passed_soft_checks": passed_soft,
         "failed_soft_checks": failed_soft,
+        "applicable_important_soft_checks": important,
+        "passed_important_soft_checks": passed_important,
+        "failed_important_soft_checks": failed_important,
+        "important_soft_applicable_count": len(important),
+        "important_soft_pass_count": len(passed_important),
+        "important_soft_required_count": PRIVATE_BETA_MIN_IMPORTANT_SOFT_PASSES,
+        "passed_supporting_soft_checks": passed_supporting,
+        "failed_supporting_soft_checks": failed_supporting,
+        "supporting_soft_applicable_count": len(supporting),
+        "supporting_soft_pass_count": len(passed_supporting),
         "hard_pass_count": len(passed_hard),
         "hard_applicable_count": len(hard),
         "hard_pass_percentage": round(hard_pct, 1),
@@ -383,6 +507,17 @@ def evaluate_private_beta_qualification(
         "execution_quality_result": execution,
         "overall_quality_passed": overall_passed,
         "execution_quality_passed": execution_passed,
+        "authoritative_rank": authoritative_rank,
+        "rank_available": rank_available,
+        "net_rr": net_rr,
+        "preferred_net_rr": PRIVATE_BETA_PREFERRED_NET_RR,
+        "private_beta_net_rr_floor": PRIVATE_BETA_NET_RR_FLOOR,
+        "net_rr_floor_passed": net_rr_floor_passed,
+        "reduced_reward_efficiency": bool(
+            net_rr_floor_passed
+            and net_rr is not None
+            and net_rr < PRIVATE_BETA_PREFERRED_NET_RR
+        ),
         "deduplicated_checks": checks,
         "excluded_checks": list(EXCLUDED_QUALIFICATION_CHECKS),
     }
@@ -393,26 +528,28 @@ def private_beta_threshold_passes(
     hard_passed: bool,
     overall_quality_passed: bool,
     execution_quality_passed: bool,
-    soft_pass_percentage: float,
+    important_soft_passed: int,
+    net_rr_floor_passed: bool,
 ) -> bool:
-    """Inclusive 70% boundary; contains no score or market calculation."""
+    """Private-beta policy authority; public eligibility does not call this."""
     return bool(
         hard_passed
         and overall_quality_passed
         and execution_quality_passed
-        and float(soft_pass_percentage) + 1e-9
-        >= PRIVATE_BETA_MIN_SOFT_PASS_PCT
+        and int(important_soft_passed) >= PRIVATE_BETA_MIN_IMPORTANT_SOFT_PASSES
+        and net_rr_floor_passed
     )
 
 
 def private_beta_sort_key(row: Mapping[str, Any]) -> tuple:
     qualification = dict(row.get("qualification") or {})
+    rank = _numeric(qualification.get("authoritative_rank"))
     return (
-        bool(not qualification.get("failed_hard_checks")),
-        float(qualification.get("soft_pass_percentage") or 0.0),
+        int(qualification.get("important_soft_pass_count") or 0),
+        int(qualification.get("soft_pass_count") or 0),
         float(row.get("confidence") or row.get("overall_quality") or 0.0),
         float(row.get("execution_quality") or row.get("execution_score") or 0.0),
-        float(row.get("rank_score") or 0.0),
+        rank if rank is not None else float("-inf"),
     )
 
 
@@ -441,6 +578,58 @@ def qualify_private_beta_candidates(
             qualified.append(row)
     qualified.sort(key=private_beta_sort_key, reverse=True)
     return qualified[: max(0, int(limit))]
+
+
+def analyze_private_beta_net_rr_floors(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    floors: Sequence[float] = (0.50, 0.75, 1.00),
+) -> Dict[str, Any]:
+    """Diagnostic-only comparison using stored gates and no score mutation."""
+    normalized_floors = tuple(sorted({round(float(value), 2) for value in floors}))
+    counts = {f"{value:.2f}": 0 for value in normalized_floors}
+    rejections = {f"{value:.2f}": 0 for value in normalized_floors}
+    directional = 0
+    base_candidates = 0
+    net_values: List[float] = []
+    for source in rows:
+        row = dict(source)
+        direction = str(row.get("direction") or "").lower()
+        if direction not in {"long", "short"}:
+            continue
+        directional += 1
+        row.setdefault("confidence", row.get("overall_quality"))
+        row.setdefault("execution_quality", row.get("execution_score"))
+        qualification = evaluate_private_beta_qualification(
+            row, row.get("gate_evaluation")
+        )
+        base = bool(
+            not qualification.get("failed_hard_checks")
+            and qualification.get("overall_quality_passed")
+            and qualification.get("execution_quality_passed")
+            and int(qualification.get("important_soft_pass_count") or 0)
+            >= PRIVATE_BETA_MIN_IMPORTANT_SOFT_PASSES
+        )
+        if not base:
+            continue
+        base_candidates += 1
+        net_rr = _numeric(qualification.get("net_rr"))
+        if net_rr is not None:
+            net_values.append(net_rr)
+        for floor in normalized_floors:
+            key = f"{floor:.2f}"
+            if net_rr is not None and net_rr + 1e-9 >= floor:
+                counts[key] += 1
+            else:
+                rejections[key] += 1
+    return {
+        "directional_candidates": directional,
+        "base_candidates_before_absolute_net_rr_floor": base_candidates,
+        "qualifying_by_floor": counts,
+        "rejected_by_floor": rejections,
+        "observed_base_net_rr": [round(value, 4) for value in sorted(net_values)],
+        "diagnostic_only": True,
+    }
 
 
 def build_private_beta_rejection_summary(
@@ -506,8 +695,21 @@ def build_private_beta_rejection_summary(
                 gap += max(0.0, required - actual) / max(abs(required), 1.0)
         if not valid:
             continue
-        soft_pct = float(qualification.get("soft_pass_percentage") or 0.0)
-        gap += max(0.0, PRIVATE_BETA_MIN_SOFT_PASS_PCT - soft_pct) / 100.0
+        important_passed = int(
+            qualification.get("important_soft_pass_count") or 0
+        )
+        gap += max(
+            0,
+            PRIVATE_BETA_MIN_IMPORTANT_SOFT_PASSES - important_passed,
+        ) / max(1, len(IMPORTANT_SOFT_CHECK_IDS))
+        if not qualification.get("net_rr_floor_passed"):
+            net_rr = _numeric(qualification.get("net_rr"))
+            if net_rr is None:
+                continue
+            gap += max(0.0, PRIVATE_BETA_NET_RR_FLOOR - net_rr) / max(
+                PRIVATE_BETA_NET_RR_FLOOR,
+                1.0,
+            )
         comparable.append((gap, row))
     closest = None
     if comparable:
@@ -539,9 +741,10 @@ def build_private_beta_rejection_summary(
 
 def _numeric(value: Any) -> Optional[float]:
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    return number if isfinite(number) else None
 
 
 def _row_identity(row: Mapping[str, Any]) -> tuple:

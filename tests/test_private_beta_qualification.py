@@ -7,6 +7,7 @@ from copy import deepcopy
 from src.analysis.qualification import (
     EXCLUDED_QUALIFICATION_CHECKS,
     QUALIFICATION_POLICY_VERSION,
+    analyze_private_beta_net_rr_floors,
     build_deduplicated_check_registry,
     build_private_beta_rejection_summary,
     evaluate_private_beta_qualification,
@@ -76,6 +77,10 @@ def _row() -> dict:
         "execution_quality": 79,
         "execution_score": 79,
         "rank_score": 74,
+        "authoritative_rank": 74,
+        "rank_available": True,
+        "gross_risk_reward": [1.0, 1.5],
+        "net_risk_reward": [0.9, 1.35],
         "entry_status": "wait_retest",
         "entry_low": 100,
         "entry_high": 101,
@@ -174,24 +179,27 @@ def test_hard_and_mandatory_failures_always_reject():
     assert cost_result["private_beta_qualified"] is False
 
 
-def test_soft_threshold_is_inclusive_and_zero_denominator_is_safe():
+def test_two_important_checks_are_required_and_missing_evidence_rejects():
     assert private_beta_threshold_passes(
         hard_passed=True,
         overall_quality_passed=True,
         execution_quality_passed=True,
-        soft_pass_percentage=70.0,
+        important_soft_passed=2,
+        net_rr_floor_passed=True,
     ) is True
     assert private_beta_threshold_passes(
         hard_passed=True,
         overall_quality_passed=True,
         execution_quality_passed=True,
-        soft_pass_percentage=70.1,
+        important_soft_passed=3,
+        net_rr_floor_passed=True,
     ) is True
     assert private_beta_threshold_passes(
         hard_passed=True,
         overall_quality_passed=True,
         execution_quality_passed=True,
-        soft_pass_percentage=69.9,
+        important_soft_passed=1,
+        net_rr_floor_passed=True,
     ) is False
 
     row = _row()
@@ -209,15 +217,19 @@ def test_soft_threshold_is_inclusive_and_zero_denominator_is_safe():
     qualification = evaluate_private_beta_qualification(row)
     assert qualification["soft_applicable_count"] == 0
     assert qualification["soft_pass_percentage"] == 100.0
-    assert qualification["private_beta_qualified"] is True
+    assert qualification["important_soft_applicable_count"] == 0
+    assert qualification["private_beta_qualified"] is False
 
 
-def test_beta_can_accept_one_soft_failure_while_public_policy_is_unchanged():
+def test_two_important_checks_qualify_while_public_policy_is_unchanged():
     row = _row()
-    _set_gate(row, "RANK_BELOW_MINIMUM", False, 49)
+    _set_gate(row, "NET_RR_BELOW_MINIMUM", False, 1.10)
+    row["net_risk_reward"] = [0.8, 1.10]
     qualification = evaluate_private_beta_qualification(row)
     assert qualification["soft_pass_percentage"] == 80.0
+    assert qualification["important_soft_pass_count"] == 2
     assert qualification["qualification_type"] == "qualified_beta"
+    assert qualification["reduced_reward_efficiency"] is True
     assert qualify_private_beta_candidates([row])[0]["symbol"] == "BTC/USDT:USDT"
 
     public_row = {
@@ -228,7 +240,7 @@ def test_beta_can_accept_one_soft_failure_while_public_policy_is_unchanged():
         "chase_distance_atr": 0.2,
         "spread_bps": 2,
         "gross_risk_reward": [1.0, 1.5],
-        "net_risk_reward": [0.9, 1.35],
+        "net_risk_reward": [0.8, 1.10],
     }
     assert filter_high_confidence(
         [public_row], min_llm=65, min_rank=50, only_prop_safe=False,
@@ -236,11 +248,71 @@ def test_beta_can_accept_one_soft_failure_while_public_policy_is_unchanged():
     ) == []
 
 
+def test_supporting_checks_cannot_compensate_for_one_important_pass():
+    row = _row()
+    _set_gate(row, "CONFLUENCE_BELOW_MINIMUM", False, 0.1)
+    _set_gate(row, "IMMEDIATE_SL_RISK_TOO_HIGH", False, 40)
+    qualification = evaluate_private_beta_qualification(row)
+    assert qualification["important_soft_pass_count"] == 1
+    assert qualification["supporting_soft_pass_count"] == 2
+    assert qualification["private_beta_qualified"] is False
+
+
+def test_all_three_important_checks_are_fully_qualified():
+    qualification = evaluate_private_beta_qualification(_row())
+    assert qualification["important_soft_pass_count"] == 3
+    assert qualification["qualification_type"] == "fully_qualified"
+    assert qualification["private_beta_qualified"] is True
+
+
+def test_absolute_net_rr_floor_and_missing_rank_handling():
+    poor_rr = _row()
+    _set_gate(poor_rr, "NET_RR_BELOW_MINIMUM", False, 0.50)
+    poor_rr["net_risk_reward"] = [0.4, 0.50]
+    result = evaluate_private_beta_qualification(poor_rr)
+    assert result["important_soft_pass_count"] == 2
+    assert result["net_rr_floor_passed"] is False
+    assert result["private_beta_qualified"] is False
+
+    missing_rank = _row()
+    missing_rank["rank_score"] = None
+    missing_rank["authoritative_rank"] = None
+    missing_rank["rank_available"] = False
+    result = evaluate_private_beta_qualification(missing_rank)
+    assert result["rank_available"] is False
+    assert result["authoritative_rank"] is None
+    rank_check = next(
+        check for check in result["applicable_soft_checks"]
+        if check["canonical_check_id"] == "deterministic_rank"
+    )
+    assert rank_check["actual_value"] is None
+    assert rank_check["passed"] is False
+
+
+def test_net_rr_floor_impact_compares_requested_values_without_changing_rows():
+    low = _row()
+    low["net_risk_reward"] = [0.6, 0.80]
+    _set_gate(low, "NET_RR_BELOW_MINIMUM", False, 0.80)
+    high = _row()
+    high["candidate_id"] = "high-rr"
+    high["net_risk_reward"] = [0.9, 1.10]
+    _set_gate(high, "NET_RR_BELOW_MINIMUM", False, 1.10)
+    impact = analyze_private_beta_net_rr_floors([low, high])
+    assert impact["base_candidates_before_absolute_net_rr_floor"] == 2
+    assert impact["qualifying_by_floor"] == {
+        "0.50": 2,
+        "0.75": 2,
+        "1.00": 1,
+    }
+
+
 def test_private_beta_delivery_keeps_only_best_two_by_policy_order():
     lower = _row()
     lower["candidate_id"] = "lower"
     lower["symbol"] = "ETH"
-    lower["confidence"] = 82.0
+    lower["confidence"] = 95.0
+    lower["net_risk_reward"] = [0.8, 1.10]
+    _set_gate(lower, "NET_RR_BELOW_MINIMUM", False, 1.10)
 
     middle = _row()
     middle["candidate_id"] = "middle"
@@ -267,15 +339,16 @@ def test_private_summary_persistence_and_telegram_use_same_result():
     closest["candidate_id"] = "soft-close"
     closest["symbol"] = "SOL"
     closest["confidence"] = 82.0
-    _set_gate(closest, "RANK_BELOW_MINIMUM", False, 49)
-    _set_gate(closest, "GROSS_RR_BELOW_MINIMUM", False, 1.2)
-    # Two of five soft failures => 60%, below beta qualification.
+    _set_gate(closest, "CONFLUENCE_BELOW_MINIMUM", False, 0.1)
+    _set_gate(closest, "IMMEDIATE_SL_RISK_TOO_HIGH", False, 40)
+    # Supporting checks pass, but only one important check passes.
     summary = build_private_beta_rejection_summary({}, [highest, closest])
     assert summary["highest_quality_rejected_candidate"]["candidate_id"] == "hard-high"
     assert summary["closest_to_full_qualification"]["candidate_id"] == "soft-close"
 
     beta = _row()
-    _set_gate(beta, "RANK_BELOW_MINIMUM", False, 49)
+    beta["net_risk_reward"] = [0.7, 0.86]
+    _set_gate(beta, "NET_RR_BELOW_MINIMUM", False, 0.86)
     qualification = evaluate_private_beta_qualification(beta)
     beta["qualification"] = qualification
     beta["qualification_policy_version"] = QUALIFICATION_POLICY_VERSION
@@ -283,11 +356,17 @@ def test_private_summary_persistence_and_telegram_use_same_result():
     record = build_candidate_record(None, beta, source="beta-test")
     assert record["decision"]["qualification"] == qualification
     assert record["decision"]["qualification_policy_version"] == QUALIFICATION_POLICY_VERSION
+    assert record["decision"]["authoritative_rank"] == 74
+    assert record["decision"]["rank_available"] is True
+    assert record["production_scores"]["rank"] == 74
+    assert record["production_rank"] == 74
 
     caption = format_signal_photo_caption(beta)
     assert "QUALIFIED BETA SIGNAL" in caption
     assert "Hard checks:" in caption
-    assert "Soft checks: 4/5 passed · 80%" in caption
+    assert "Important soft checks: 2/3" in caption
+    assert "Reduced reward efficiency" in caption
+    assert "Private-beta floor: 0.75R" in caption
     assert "Deterministic Rank" in caption
     assert len(caption) <= 1024
 
@@ -297,4 +376,4 @@ def test_private_summary_persistence_and_telegram_use_same_result():
     assert "Highest-Quality Rejected Setup" in report
     assert "Closest to Qualification" in report
     assert "Hard checks:" in report
-    assert "Soft checks:" in report
+    assert "Important soft checks:" in report

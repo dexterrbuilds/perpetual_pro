@@ -10,6 +10,7 @@ import copy
 import json
 import time
 import inspect
+from math import isfinite
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
@@ -55,11 +56,14 @@ MAX_INTERNAL_SCAN_SYMBOLS = 50
 
 
 def apply_diagnostic_backtest_to_rank(
-    live_rank_score: float,
+    live_rank_score: Optional[float],
     backtest_summary: Optional[Dict[str, Any]] = None,
-) -> float:
+) -> Optional[float]:
     """Quick proxy backtests are diagnostics and never alter live rank."""
-    return float(live_rank_score)
+    if live_rank_score is None:
+        return None
+    value = float(live_rank_score)
+    return value if isfinite(value) else None
 
 
 @dataclass
@@ -801,7 +805,16 @@ def scan_symbols(
                     timeframe=primary_tf,
                     limit=100,
                 )
-                live_rank_score = float(analysis.rank_score)
+                rank_available = bool(
+                    analysis.meta.get("rank_available", False)
+                )
+                live_rank_score = (
+                    float(analysis.meta.get("rank_score"))
+                    if rank_available
+                    and analysis.meta.get("rank_score") is not None
+                    and isfinite(float(analysis.meta.get("rank_score")))
+                    else None
+                )
                 # This quick backtest uses a proxy strategy, not the production
                 # signal lifecycle. It is diagnostic only and has no live rank,
                 # approval, or rejection authority.
@@ -849,8 +862,22 @@ def scan_symbols(
                     "llm_rate_limit_events": int(
                         analysis.meta.get("llm_rate_limit_events") or 0
                     ),
-                    "rank_score": round(scan_rank_score, 2),
-                    "live_rank_score": round(live_rank_score, 2),
+                    "rank_score": (
+                        round(scan_rank_score, 2)
+                        if scan_rank_score is not None
+                        else None
+                    ),
+                    "authoritative_rank": (
+                        round(live_rank_score, 2)
+                        if live_rank_score is not None
+                        else None
+                    ),
+                    "rank_available": rank_available,
+                    "live_rank_score": (
+                        round(live_rank_score, 2)
+                        if live_rank_score is not None
+                        else None
+                    ),
                     "rank_policy_version": analysis.meta.get("rank_policy_version"),
                     "rank_breakdown": dict(analysis.meta.get("rank_breakdown") or {}),
                     "confluence_score": round(float(analysis.confluence_total), 3),
@@ -1036,6 +1063,8 @@ def scan_symbols(
                         "llm_confidence_reason": analysis.llm_confidence_reason,
                         "llm_confidence_detail": getattr(analysis, "llm_confidence_detail", {}) or {},
                         "rank_score": scan_rank_score,
+                        "authoritative_rank": live_rank_score,
+                        "rank_available": rank_available,
                         "live_rank_score": live_rank_score,
                         "backtest": backtest_summary,
                         "data_quality": analysis.meta.get("data_quality") or {},
@@ -1195,6 +1224,12 @@ def scan_symbols(
                     prior=row.get("gate_evaluation"),
                 )
                 row["gate_evaluation"] = alert_evaluation.to_dict()
+                row["gate_evaluation"]["authoritative_rank"] = row.get(
+                    "authoritative_rank"
+                )
+                row["gate_evaluation"]["rank_available"] = bool(
+                    row.get("rank_available")
+                )
                 row["universal_eligible"] = bool(
                     alert_evaluation.universal_eligible
                 )
@@ -1251,6 +1286,15 @@ def scan_symbols(
                     "qualification_type": qualification["qualification_type"],
                     "hard_pass_percentage": qualification["hard_pass_percentage"],
                     "soft_pass_percentage": qualification["soft_pass_percentage"],
+                    "important_soft_pass_count": qualification[
+                        "important_soft_pass_count"
+                    ],
+                    "authoritative_rank": qualification["authoritative_rank"],
+                    "rank_available": qualification["rank_available"],
+                    "net_rr": qualification["net_rr"],
+                    "private_beta_net_rr_floor": qualification[
+                        "private_beta_net_rr_floor"
+                    ],
                 }
                 evaluated_direction = str(
                     row.get("evaluated_direction") or ""

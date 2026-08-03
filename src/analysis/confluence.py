@@ -740,7 +740,12 @@ class ConfluenceEngine:
             if risk not in result.key_risks:
                 result.key_risks.append(risk)
 
-        if result.direction in ("long", "short"):
+        # Rank the evaluated directional thesis before publication gates rewrite
+        # a rejected signal to ``flat``.  The old post-gate condition produced
+        # a synthetic 0 for every rejected directional candidate, even though
+        # all deterministic rank inputs were available.
+        rank_available = direction in ("long", "short")
+        if rank_available:
             result.rank_score, rank_breakdown = deterministic_rank_score(
                 overall_quality=result.confidence,
                 execution_quality=execution.score,
@@ -800,6 +805,7 @@ class ConfluenceEngine:
                 else []
             ),
             "rank_score": result.rank_score,
+            "rank_available": rank_available,
             "rank_policy_version": RANK_POLICY_VERSION,
             "rank_breakdown": rank_breakdown,
             "prop_safe": bool(getattr(plan, "prop_safe", True)),

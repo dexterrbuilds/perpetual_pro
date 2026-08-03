@@ -509,6 +509,8 @@ def test_scheduler_revalidation_rejects_before_chart_or_signal_delivery(monkeypa
         "direction": "long",
         "confidence": 85,
         "rank_score": 75,
+        "authoritative_rank": 75,
+        "rank_available": True,
         "technical_confidence": 84,
         "execution_score": 78,
         "signal_eligible": True,
@@ -521,6 +523,26 @@ def test_scheduler_revalidation_rejects_before_chart_or_signal_delivery(monkeypa
         "chase_distance_atr": 0.2,
         "spread_bps": 2,
         "risk_reward": [1.0, 1.5],
+        "gross_risk_reward": [1.0, 1.5],
+        "net_risk_reward": [0.9, 1.35],
+        "gate_evaluation": {
+            "eligible": True,
+            "gates": [
+                {
+                    "code": "CONFLUENCE_BELOW_MINIMUM",
+                    "gate_name": "Confluence magnitude",
+                    "actual_value": 0.4,
+                    "required_value": {"operator": ">=", "value": 0.2},
+                    "passed": True,
+                    "distance": 0.0,
+                    "normalized_distance": 0.0,
+                    "severity": "hard",
+                    "stage": "analysis",
+                    "explanation": "Confluence passed",
+                    "authoritative": True,
+                }
+            ],
+        },
     }
     monkeypatch.setattr(
         scan_job,

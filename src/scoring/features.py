@@ -391,6 +391,8 @@ def build_candidate_record(
             "signal_eligible",
             "qualification_policy_version",
             "qualification",
+            "authoritative_rank",
+            "rank_available",
             "historical_edge_ok",
             "data_quality_ok",
             "market_quality_ok",
@@ -458,7 +460,8 @@ def build_candidate_record(
         "confidence": row.get("confidence"),
         "legacy_confidence": row.get("legacy_confidence"),
         "legacy_v2_confidence": row.get("legacy_v2_confidence"),
-        "rank": row.get("rank_score"),
+        "rank": row.get("authoritative_rank", row.get("rank_score")),
+        "rank_available": bool(row.get("rank_available")),
         "confluence": row.get("confluence_score"),
         "llm": row.get("llm_confidence"),
         "immediate_sl_risk": row.get("immediate_sl_risk"),
@@ -501,7 +504,9 @@ def build_candidate_record(
         "production_eligible": bool(
             row.get("production_qualified", row.get("signal_eligible", False))
         ),
-        "production_rank": _number(row.get("rank_score")),
+        "production_rank": _optional_number(
+            row.get("authoritative_rank", row.get("rank_score"))
+        ),
         "source": source,
     }
 
@@ -519,6 +524,15 @@ def _number(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return float(default)
     return number if math.isfinite(number) else float(default)
+
+
+def _optional_number(value: Any) -> Optional[float]:
+    """Preserve missing numeric values instead of manufacturing a zero."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _positive(value: Any) -> float:

@@ -1140,6 +1140,8 @@ def test_private_beta_scheduled_signal_routes_only_to_beta_dms(monkeypatch):
         "confidence": 86,
         "technical_confidence": 85,
         "rank_score": 82,
+        "authoritative_rank": 82,
+        "rank_available": True,
         "prop_safe": True,
         "signal_eligible": True,
         "entry_status": "wait_retest",
@@ -1148,6 +1150,26 @@ def test_private_beta_scheduled_signal_routes_only_to_beta_dms(monkeypatch):
         "entry_high": 101,
         "stop_loss": 98,
         "take_profits": [103, 105],
+        "gross_risk_reward": [1.0, 1.5],
+        "net_risk_reward": [0.9, 1.35],
+        "gate_evaluation": {
+            "eligible": True,
+            "gates": [
+                {
+                    "code": "CONFLUENCE_BELOW_MINIMUM",
+                    "gate_name": "Confluence magnitude",
+                    "actual_value": 0.4,
+                    "required_value": {"operator": ">=", "value": 0.2},
+                    "passed": True,
+                    "distance": 0.0,
+                    "normalized_distance": 0.0,
+                    "severity": "hard",
+                    "stage": "analysis",
+                    "explanation": "Confluence passed",
+                    "authoritative": True,
+                }
+            ],
+        },
         "payload": {"chart": {"candles": [{}] * 10}},
     }
     monkeypatch.setattr(
@@ -1250,6 +1272,8 @@ def test_private_beta_recipient_failure_does_not_block_other_dm(monkeypatch):
         "confidence": 87,
         "technical_confidence": 86,
         "rank_score": 83,
+        "authoritative_rank": 83,
+        "rank_available": True,
         "prop_safe": True,
         "signal_eligible": True,
         "entry_status": "wait_retest",
@@ -1258,6 +1282,26 @@ def test_private_beta_recipient_failure_does_not_block_other_dm(monkeypatch):
         "entry_high": 101,
         "stop_loss": 103,
         "take_profits": [98, 96],
+        "gross_risk_reward": [1.0, 1.5],
+        "net_risk_reward": [0.9, 1.35],
+        "gate_evaluation": {
+            "eligible": True,
+            "gates": [
+                {
+                    "code": "CONFLUENCE_BELOW_MINIMUM",
+                    "gate_name": "Confluence magnitude",
+                    "actual_value": 0.4,
+                    "required_value": {"operator": ">=", "value": 0.2},
+                    "passed": True,
+                    "distance": 0.0,
+                    "normalized_distance": 0.0,
+                    "severity": "hard",
+                    "stage": "analysis",
+                    "explanation": "Confluence passed",
+                    "authoritative": True,
+                }
+            ],
+        },
         "payload": {"chart": {"candles": [{}] * 10}},
     }
     monkeypatch.setattr(

@@ -737,11 +737,20 @@ def format_signal_photo_caption(
             "🛡 <b>Quality:</b>",
             "📍 <b>Price at scan:</b>",
             "🕒 <b>Hold after fill:</b>",
+            "📌 <b>Entry mode:</b>",
+            "🧠 <b>Primary strength:</b>",
+            "⚠️ <b>Primary weakness:</b>",
+            "Reason:",
         )
         lines = [
             line for line in lines
             if not line.startswith(optional_prefixes)
         ]
+        caption = "\n".join(lines).replace("\n\n\n", "\n\n")
+    if len(caption) > 1024:
+        # Actual/required values remain on each qualification line. Remove only
+        # its secondary prose when Telegram's photo-caption limit is tight.
+        lines = [line for line in lines if not line.startswith("  ")]
         caption = "\n".join(lines).replace("\n\n\n", "\n\n")
     return caption
 
@@ -1050,6 +1059,21 @@ def _qualification_failure_lines(qualification: Dict[str, Any]) -> List[str]:
         if isinstance(result, dict) and not result.get("passed"):
             failed.append(result)
     failed.extend(qualification.get("failed_soft_checks") or [])
+    if not qualification.get("net_rr_floor_passed", True):
+        failed.append(
+            {
+                "display_name": "Private-beta absolute Net R:R floor",
+                "actual_value": qualification.get("net_rr"),
+                "required_value": {
+                    "operator": ">=",
+                    "value": qualification.get("private_beta_net_rr_floor"),
+                },
+                "classification": "hard",
+                "failure_reason": (
+                    "Net reward after costs is below the private-beta absolute floor"
+                ),
+            }
+        )
     return [_qualification_check_line(dict(check)) for check in failed]
 
 
@@ -1059,27 +1083,64 @@ def _signal_qualification_lines(qualification: Dict[str, Any]) -> List[str]:
     qualification_type = str(qualification.get("qualification_type") or "")
     if qualification_type == "fully_qualified":
         title = "💎 <b>FULLY QUALIFIED SIGNAL</b>"
-        soft_icon = "✅"
     elif qualification_type == "qualified_beta":
-        title = "💎 <b>QUALIFIED BETA SIGNAL</b>"
-        soft_icon = "🟡"
+        title = "⚠️ <b>QUALIFIED BETA SIGNAL</b>"
     else:
         return []
     hard_passed = int(qualification.get("hard_pass_count") or 0)
     hard_total = int(qualification.get("hard_applicable_count") or 0)
-    soft_passed = int(qualification.get("soft_pass_count") or 0)
-    soft_total = int(qualification.get("soft_applicable_count") or 0)
-    soft_pct = _number(qualification.get("soft_pass_percentage"), 100.0)
+    important_passed = int(qualification.get("important_soft_pass_count") or 0)
+    important_total = int(
+        qualification.get("important_soft_applicable_count") or 0
+    )
+    supporting_passed = int(
+        qualification.get("supporting_soft_pass_count") or 0
+    )
+    supporting_total = int(
+        qualification.get("supporting_soft_applicable_count") or 0
+    )
     lines = [
         title,
         f"✅ Hard checks: {hard_passed}/{hard_total} passed · 100%",
-        f"{soft_icon} Soft checks: {soft_passed}/{soft_total} passed · {soft_pct:.0f}%",
+        f"✅ Important soft checks: {important_passed}/{important_total}",
+        f"📊 Supporting soft checks: {supporting_passed}/{supporting_total}",
     ]
-    failed_soft = list(qualification.get("failed_soft_checks") or [])
-    if failed_soft:
-        lines.append("⚠️ <b>Failed soft checks</b>")
+    rank = _optional_number(qualification.get("authoritative_rank"))
+    lines.append(
+        f"📐 Deterministic Rank: {rank:.1f}/100"
+        if qualification.get("rank_available") and rank is not None
+        else "📐 Deterministic Rank: unavailable"
+    )
+    failed_important = list(
+        qualification.get("failed_important_soft_checks") or []
+    )
+    if failed_important:
+        lines.append("⚠️ <b>Failed important soft checks</b>")
         lines.extend(
-            _qualification_check_line(dict(check)) for check in failed_soft
+            _qualification_check_line(dict(check)) for check in failed_important
+        )
+    failed_supporting = list(
+        qualification.get("failed_supporting_soft_checks") or []
+    )
+    if failed_supporting:
+        lines.append("📌 <b>Failed supporting checks</b>")
+        lines.extend(
+            _qualification_check_line(dict(check)) for check in failed_supporting
+        )
+    if qualification.get("reduced_reward_efficiency"):
+        lines.extend(
+            [
+                "⚠️ <b>Reduced reward efficiency</b>",
+                f"Net R:R: {_number(qualification.get('net_rr')):.2f}R",
+                (
+                    "Preferred: "
+                    f"{_number(qualification.get('preferred_net_rr'), 1.25):.2f}R"
+                ),
+                (
+                    "Private-beta floor: "
+                    f"{_number(qualification.get('private_beta_net_rr_floor'), 0.75):.2f}R"
+                ),
+            ]
         )
     return lines
 
@@ -1116,9 +1177,14 @@ def _rejected_setup_report_lines(
                     f"{int(qualification.get('hard_applicable_count') or 0)} passed"
                 ),
                 (
-                    f"Soft checks: {int(qualification.get('soft_pass_count') or 0)}/"
-                    f"{int(qualification.get('soft_applicable_count') or 0)} passed · "
-                    f"{_number(qualification.get('soft_pass_percentage'), 100.0):.0f}%"
+                    "Important soft checks: "
+                    f"{int(qualification.get('important_soft_pass_count') or 0)}/"
+                    f"{int(qualification.get('important_soft_applicable_count') or 0)} passed"
+                ),
+                (
+                    "Supporting soft checks: "
+                    f"{int(qualification.get('supporting_soft_pass_count') or 0)}/"
+                    f"{int(qualification.get('supporting_soft_applicable_count') or 0)} passed"
                 ),
                 "",
                 "🚫 <b>Failed qualification checks</b>",
