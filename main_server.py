@@ -284,6 +284,16 @@ def admin_status(
     }
 
 
+@app.get("/admin/scheduler/status")
+def admin_scheduler_status(
+    request: Request,
+    x_scan_api_key: Optional[str] = Header(None, alias="X-Scan-API-Key"),
+) -> Dict[str, Any]:
+    """Protected durable scheduler timing and misfire diagnostics."""
+    SCAN_ACCESS.authorize(request, x_scan_api_key)
+    return {"ok": True, "scheduler": get_scheduler_status()}
+
+
 @app.get("/admin/rejections/latest")
 def latest_rejection_analytics(
     request: Request,

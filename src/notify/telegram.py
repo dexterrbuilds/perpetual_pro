@@ -740,6 +740,8 @@ def format_signal_photo_caption(
             "📌 <b>Entry mode:</b>",
             "🧠 <b>Primary strength:</b>",
             "⚠️ <b>Primary weakness:</b>",
+            "✅ Important passed:",
+            "📌 Supporting passed:",
             "Reason:",
         )
         lines = [
@@ -1105,6 +1107,28 @@ def _signal_qualification_lines(qualification: Dict[str, Any]) -> List[str]:
         f"✅ Important soft checks: {important_passed}/{important_total}",
         f"📊 Supporting soft checks: {supporting_passed}/{supporting_total}",
     ]
+    passed_important = list(
+        qualification.get("passed_important_soft_checks") or []
+    )
+    if passed_important:
+        lines.append(
+            "✅ Important passed: "
+            + ", ".join(
+                html.escape(str(check.get("display_name") or "check"))
+                for check in passed_important
+            )
+        )
+    passed_supporting = list(
+        qualification.get("passed_supporting_soft_checks") or []
+    )
+    if passed_supporting:
+        lines.append(
+            "📌 Supporting passed: "
+            + ", ".join(
+                html.escape(str(check.get("display_name") or "check"))
+                for check in passed_supporting
+            )
+        )
     rank = _optional_number(qualification.get("authoritative_rank"))
     lines.append(
         f"📐 Deterministic Rank: {rank:.1f}/100"
@@ -1133,7 +1157,7 @@ def _signal_qualification_lines(qualification: Dict[str, Any]) -> List[str]:
                 "⚠️ <b>Reduced reward efficiency</b>",
                 f"Net R:R: {_number(qualification.get('net_rr')):.2f}R",
                 (
-                    "Preferred: "
+                    "Public preference: "
                     f"{_number(qualification.get('preferred_net_rr'), 1.25):.2f}R"
                 ),
                 (

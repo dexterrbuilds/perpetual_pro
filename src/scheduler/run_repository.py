@@ -163,6 +163,132 @@ class SchedulerRunRepository:
             )
             return False
 
+    def get(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Return one durable run without exposing delivery destinations."""
+        if not self.enabled:
+            return None
+        try:
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    select run_id, source, slot_label, scheduled_for, started_at,
+                           completed_at, status, symbols_requested,
+                           symbols_analyzed, symbol_failures,
+                           eligible_candidates, revalidated_candidates,
+                           rejected_candidates, scan_duration_seconds,
+                           result_code, result_summary
+                    from public.scheduler_runs where run_id=%s
+                    """,
+                    (str(run_id),),
+                )
+                row = cursor.fetchone()
+            return dict(row) if row else None
+        except Exception:
+            return None
+
+    def latest_scheduled(self) -> Optional[Dict[str, Any]]:
+        """Return the newest expected production window, excluding manual scans."""
+        if not self.enabled:
+            return None
+        try:
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    select run_id, source, slot_label, scheduled_for, started_at,
+                           completed_at, status, symbols_requested,
+                           symbols_analyzed, symbol_failures,
+                           eligible_candidates, revalidated_candidates,
+                           rejected_candidates, scan_duration_seconds,
+                           result_code, result_summary
+                    from public.scheduler_runs
+                    where source='scheduled'
+                    order by scheduled_for desc nulls last limit 1
+                    """
+                )
+                row = cursor.fetchone()
+            return dict(row) if row else None
+        except Exception:
+            return None
+
+    def delivery_succeeded(self, idempotency_key: str) -> bool:
+        """Whether this semantic signal already reached this destination."""
+        if not self.enabled or not idempotency_key:
+            return False
+        try:
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    select 1 from public.scheduler_run_deliveries
+                    where idempotency_key=%s and status='delivered' limit 1
+                    """,
+                    (str(idempotency_key),),
+                )
+                return cursor.fetchone() is not None
+        except Exception:
+            return False
+
+    def record_delivery(
+        self,
+        *,
+        run_id: str,
+        delivery: Mapping[str, Any],
+    ) -> bool:
+        """Persist one delivery immediately to narrow the restart retry window."""
+        if not self.enabled or not delivery.get("idempotency_key"):
+            return False
+        try:
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    insert into public.scheduler_run_deliveries (
+                      idempotency_key, run_id, destination_hash,
+                      delivery_type, status, telegram_message_id,
+                      attempted_at, delivered_at, error_category
+                    ) values (%s,%s,%s,%s,%s,%s,now(),%s,%s)
+                    on conflict (idempotency_key) do update set
+                      status=case
+                        when scheduler_run_deliveries.status='delivered'
+                          then scheduler_run_deliveries.status
+                        else excluded.status
+                      end,
+                      telegram_message_id=coalesce(
+                        scheduler_run_deliveries.telegram_message_id,
+                        excluded.telegram_message_id
+                      ),
+                      delivered_at=coalesce(
+                        scheduler_run_deliveries.delivered_at,
+                        excluded.delivered_at
+                      ),
+                      error_category=case
+                        when scheduler_run_deliveries.status='delivered'
+                          then scheduler_run_deliveries.error_category
+                        else excluded.error_category
+                      end,
+                      updated_at=now()
+                    """,
+                    (
+                        str(delivery.get("idempotency_key")),
+                        str(run_id),
+                        str(delivery.get("destination_hash") or ""),
+                        str(delivery.get("delivery_type") or "report"),
+                        "delivered" if delivery.get("ok") else "failed",
+                        delivery.get("message_id"),
+                        datetime.now(UTC) if delivery.get("ok") else None,
+                        None if delivery.get("ok") else str(
+                            delivery.get("error") or "unknown"
+                        )[:80],
+                    ),
+                )
+                connection.commit()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Immediate scheduler delivery persistence failed: run={} error_type={}",
+                str(run_id)[:20],
+                type(exc).__name__,
+            )
+            return False
+
     def latest(self) -> Optional[Dict[str, Any]]:
         if not self.enabled:
             return None

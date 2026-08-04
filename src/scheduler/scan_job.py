@@ -30,7 +30,9 @@ from src.notify.telegram import (
     format_signal_photo_caption,
     format_prop_scan_report,
     get_delivery_status,
+    get_private_beta_chat_ids,
     get_telegram_alert_chat_ids,
+    get_telegram_private_operator_chat_ids,
     get_telegram_report_chat_ids,
     is_telegram_ready,
     send_telegram_message_detailed,
@@ -49,6 +51,8 @@ from src.utils.config import (
 # Fallback watchlist when scheduler.watchlist is empty
 DEFAULT_WATCHLIST = list(DEFAULT_CRYPTO_WATCHLIST)
 MIN_TELEGRAM_SIGNAL_CONFIDENCE = ALERT_MIN_OVERALL_QUALITY
+SCHEDULER_MISFIRE_GRACE_SECONDS = 300
+SCHEDULER_RECOVERY_LOOKBACK_HOURS = 24
 
 _STATUS_LOCK = Lock()
 _SCHEDULER_STATUS: Dict[str, Any] = {
@@ -67,6 +71,12 @@ _SCHEDULER_STATUS: Dict[str, Any] = {
     "last_delivery_status": None,
     "last_alert_count": None,
     "last_run": None,
+    "previous_expected_run_at": None,
+    "previous_actual_run_at": None,
+    "previous_run_status": None,
+    "previous_misfire_status": None,
+    "previous_durable_run_id": None,
+    "misfire_grace_seconds": SCHEDULER_MISFIRE_GRACE_SECONDS,
 }
 _BACKGROUND_THREAD: Optional[Thread] = None
 _BACKGROUND_STOP: Optional[Event] = None
@@ -100,6 +110,185 @@ def _durable_run_id(slot_label: str, scheduled_for: Optional[str]) -> str:
     return "run_" + uuid4().hex
 
 
+def _parse_utc_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+    return parsed.astimezone(ZoneInfo("UTC"))
+
+
+def scheduled_session_windows_between(
+    sessions: List[Dict[str, str]],
+    *,
+    start: datetime,
+    end: datetime,
+) -> List[Tuple[datetime, str]]:
+    """Enumerate DST-aware expected windows in ``(start, end]``."""
+    start_utc = start.astimezone(ZoneInfo("UTC"))
+    end_utc = end.astimezone(ZoneInfo("UTC"))
+    windows: List[Tuple[datetime, str]] = []
+    for session in sessions or []:
+        try:
+            name = str(session.get("name") or "Trading session")
+            tz = ZoneInfo(str(session.get("timezone") or "UTC"))
+            hour, minute = _parse_hhmm(str(session.get("time") or "00:00"))
+        except (AttributeError, TypeError, ValueError, KeyError):
+            continue
+        local_start = start_utc.astimezone(tz)
+        local_end = end_utc.astimezone(tz)
+        cursor = local_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        last_day = local_end.replace(hour=0, minute=0, second=0, microsecond=0)
+        while cursor <= last_day:
+            candidate = cursor.replace(
+                hour=hour,
+                minute=minute,
+                second=0,
+                microsecond=0,
+            ).astimezone(ZoneInfo("UTC"))
+            if start_utc < candidate <= end_utc:
+                windows.append((candidate, name))
+            cursor += timedelta(days=1)
+    return sorted(windows, key=lambda item: item[0])
+
+
+def previous_session_datetime(
+    sessions: List[Dict[str, str]],
+    *,
+    now: Optional[datetime] = None,
+) -> Tuple[Optional[datetime], Optional[str]]:
+    """Return the most recent expected DST-aware production window."""
+    now_utc = (now or datetime.now(ZoneInfo("UTC"))).astimezone(ZoneInfo("UTC"))
+    windows = scheduled_session_windows_between(
+        sessions,
+        start=now_utc - timedelta(days=2),
+        end=now_utc,
+    )
+    return windows[-1] if windows else (None, None)
+
+
+def _scheduled_slot_label(
+    session_name: str,
+    scheduled_at: datetime,
+    status_timezone: str,
+    sessions: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    session_timezone = next(
+        (
+            str(item.get("timezone") or "UTC")
+            for item in sessions or []
+            if str(item.get("name") or "") == session_name
+        ),
+        "UTC",
+    )
+    local = scheduled_at.astimezone(ZoneInfo(session_timezone))
+    wat = scheduled_at.astimezone(ZoneInfo(status_timezone))
+    return (
+        f"{session_name} · {local.strftime('%H:%M %Z')} "
+        f"({wat.strftime('%H:%M %Z')})"
+    )
+
+
+def _safe_requester_hash(chat_id: Optional[str]) -> Optional[str]:
+    value = str(chat_id or "").strip()
+    return destination_hash(value) if value else None
+
+
+def _merge_destinations(*groups: Optional[List[str]]) -> List[str]:
+    merged: List[str] = []
+    for group in groups:
+        for destination in group or []:
+            value = str(destination or "").strip()
+            if value and value not in merged:
+                merged.append(value)
+    return merged
+
+
+def _signal_delivery_idempotency_key(
+    row: Dict[str, Any],
+    destination: str,
+) -> str:
+    """Stable same-day signal/destination key shared by manual and scheduled scans."""
+    generated = _parse_utc_datetime(row.get("signal_generated_at"))
+    date_bucket = (generated or datetime.now(ZoneInfo("UTC"))).date().isoformat()
+    levels = [
+        row.get("symbol"),
+        str(row.get("direction") or "").lower(),
+        row.get("execution_setup_type") or row.get("setup_name"),
+        row.get("entry_low"),
+        row.get("entry_high"),
+        row.get("stop_loss"),
+        (list(row.get("take_profits") or []) or [None])[0],
+        date_bucket,
+    ]
+    material = "|".join(str(value) for value in levels)
+    signal_digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+    return f"signal_initial:v1:{signal_digest}:{destination_hash(destination)}"
+
+
+def _recover_expected_scheduler_windows(
+    cfg: AppConfig,
+    repository: SchedulerRunRepository,
+    *,
+    now: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Persist/recover windows lost to restart without replaying stale data."""
+    sessions = list(getattr(cfg.scheduler, "sessions", None) or [])
+    if not sessions or not repository.enabled:
+        return []
+    now_utc = (now or datetime.now(ZoneInfo("UTC"))).astimezone(ZoneInfo("UTC"))
+    latest = repository.latest_scheduled()
+    latest_expected = _parse_utc_datetime(
+        (latest or {}).get("scheduled_for")
+    )
+    start = max(
+        now_utc - timedelta(hours=SCHEDULER_RECOVERY_LOOKBACK_HOURS),
+        latest_expected if latest_expected is not None else (
+            now_utc - timedelta(seconds=SCHEDULER_MISFIRE_GRACE_SECONDS)
+        ),
+    )
+    outcomes: List[Dict[str, Any]] = []
+    for expected_at, session_name in scheduled_session_windows_between(
+        sessions,
+        start=start,
+        end=now_utc,
+    ):
+        scheduled_for = expected_at.isoformat()
+        label = _scheduled_slot_label(
+            session_name,
+            expected_at,
+            cfg.scheduler.timezone or "Africa/Lagos",
+            sessions,
+        )
+        run_id = _durable_run_id(label, scheduled_for)
+        if repository.get(run_id) is not None:
+            continue
+        logger.warning(
+            "Recovering missing scheduler window: run={} slot={} age_seconds={:.0f}",
+            run_id,
+            session_name,
+            max(0.0, (now_utc - expected_at).total_seconds()),
+        )
+        outcomes.append(
+            run_scheduled_scan_once(
+                cfg,
+                slot_label=label,
+                send=True,
+                scheduled_for=scheduled_for,
+                run_id=run_id,
+            )
+        )
+    return outcomes
+
+
 def _scheduler_run_source(
     slot_label: str,
     telegram_chat_ids: Optional[List[str]],
@@ -128,6 +317,119 @@ def _compact_run_summary(outcome: Dict[str, Any]) -> Dict[str, Any]:
         "llm_invocation_counts": dict(outcome.get("llm_invocation_counts") or {}),
         "public_empty_suppressed": bool(outcome.get("public_empty_suppressed")),
     }
+
+
+def _send_missed_window_warning(
+    *,
+    run_id: str,
+    slot_label: str,
+    scheduled_for: str,
+    reason: str,
+) -> List[Dict[str, Any]]:
+    """Warn private operators only; never fall back to a public destination."""
+    deliveries: List[Dict[str, Any]] = []
+    text = (
+        "⚠️ <b>SCHEDULED WINDOW MISSED</b>\n\n"
+        f"Window: <b>{slot_label}</b>\n"
+        f"Expected: <code>{scheduled_for}</code>\n"
+        f"Reason: {reason}\n\n"
+        "The grace period expired, so no stale market scan was replayed."
+    )
+    for destination in get_telegram_private_operator_chat_ids():
+        result = send_telegram_message_detailed(
+            text,
+            chat_id=destination,
+            parse_mode="HTML",
+        )
+        digest = destination_hash(destination)
+        deliveries.append(
+            {
+                "idempotency_key": f"{run_id}:{digest}:misfire_warning",
+                "destination_hash": digest,
+                "delivery_type": "misfire_warning",
+                "ok": bool(result.get("ok")),
+                "message_id": result.get("message_id"),
+                "error": result.get("error"),
+            }
+        )
+    return deliveries
+
+
+def _missed_window_result(
+    *,
+    repository: SchedulerRunRepository,
+    run_id: str,
+    slot_label: str,
+    scheduled_for: str,
+    reason: str,
+) -> Dict[str, Any]:
+    now = datetime.now(ZoneInfo("UTC")).isoformat()
+    deliveries = _send_missed_window_warning(
+        run_id=run_id,
+        slot_label=slot_label,
+        scheduled_for=scheduled_for,
+        reason=reason,
+    )
+    summary = {
+        "result_code": "missed_beyond_grace",
+        "misfire_status": "missed_beyond_grace",
+        "misfire_reason": reason,
+        "symbols_analyzed": 0,
+        "symbol_failures": 0,
+        "eligible_candidates": 0,
+        "revalidated_candidates": 0,
+        "rejected_candidates": 0,
+        "telegram_delivery_status": (
+            "sent_misfire_warning"
+            if any(item.get("ok") for item in deliveries)
+            else "misfire_warning_not_delivered"
+        ),
+    }
+    persisted = repository.finish(
+        run_id=run_id,
+        status="skipped",
+        summary=summary,
+        deliveries=deliveries,
+    )
+    result = {
+        "ok": False,
+        "error": "scheduled_window_missed",
+        "run_id": run_id,
+        "started_at": now,
+        "completed_at": now,
+        "scanned": 0,
+        "analyzed_count": 0,
+        "ranked_count": 0,
+        "alert_count": 0,
+        "filtered": [],
+        "report": "",
+        "telegram_sent": any(item.get("ok") for item in deliveries),
+        "telegram_ready": bool(get_telegram_private_operator_chat_ids()),
+        "telegram_delivery_status": summary["telegram_delivery_status"],
+        "telegram_delivery": None,
+        "delivery_audit": deliveries,
+        "slot_label": slot_label,
+        "scheduled_for": scheduled_for,
+        "result_code": "missed_beyond_grace",
+        "misfire_status": "missed_beyond_grace",
+        "run_persisted": bool(persisted) if repository.enabled else None,
+    }
+    _status_update(
+        previous_expected_run_at=scheduled_for,
+        previous_actual_run_at=None,
+        previous_run_status="skipped",
+        previous_misfire_status="missed_beyond_grace",
+        previous_durable_run_id=run_id,
+        last_run={
+            "run_id": run_id,
+            "status": "skipped",
+            "result_code": "missed_beyond_grace",
+            "scheduled_for": scheduled_for,
+            "delivery_status": summary["telegram_delivery_status"],
+            "persisted": result["run_persisted"],
+        },
+    )
+    return result
 
 
 def _parse_hhmm(s: str) -> Tuple[int, int]:
@@ -502,6 +804,22 @@ def _run_scheduled_scan_once_unlocked(
             for marker in ("manual", "on-demand", "telegram")
         )
     )
+    routing_status = get_delivery_status()
+    private_beta_mode = routing_status["mode"] == "private_beta"
+    requester_chat_id = (
+        str((telegram_chat_ids or [""])[0]).strip()
+        if telegram_chat_ids else None
+    )
+    scan_origin = (
+        "manual_beta_scan"
+        if private_beta_mode and manual_delivery
+        else (
+            "scheduled_beta_scan"
+            if private_beta_mode and not manual_delivery
+            else ("manual_scan" if manual_delivery else "scheduled_scan")
+        )
+    )
+    requester_identity_hash = _safe_requester_hash(requester_chat_id)
     trigger_type = "telegram" if telegram_chat_ids is not None else (
         "manual" if manual_delivery else "scheduled"
     )
@@ -513,11 +831,18 @@ def _run_scheduled_scan_once_unlocked(
         trigger_type=trigger_type,
     )
     ranked = result.get("ranked_results") or []
-    routing_status = get_delivery_status()
-    private_beta_mode = routing_status["mode"] == "private_beta"
     qualification_candidates = list(
         result.get("qualification_candidates") or ranked
     )
+    for row in [*qualification_candidates, *ranked]:
+        row["scan_origin"] = scan_origin
+        row["requester_identity_hash"] = requester_identity_hash
+        evaluation = dict(row.get("gate_evaluation") or {})
+        evaluation["delivery_context"] = {
+            "scan_origin": scan_origin,
+            "requester_identity_hash": requester_identity_hash,
+        }
+        row["gate_evaluation"] = evaluation
     if private_beta_mode:
         required_alert_codes = {
             "OVERALL_QUALITY_BELOW_MINIMUM",
@@ -702,13 +1027,32 @@ def _run_scheduled_scan_once_unlocked(
     delivery_audit: List[Dict[str, Any]] = []
     tracking: Optional[Dict[str, Any]] = None
     delivery_status = "not_requested"
-    # Manual commands keep their exclusive per-request destination. Recurring
-    # scans use the configured delivery mode; this routing layer does not alter
-    # signal generation, eligibility, or lifecycle rules.
-    destinations = get_telegram_alert_chat_ids(telegram_chat_ids)
-    report_destinations = get_telegram_report_chat_ids(
-        telegram_chat_ids if manual_delivery else None
-    )
+    # In private beta, a qualified signal found by either beta user is shared
+    # with the complete configured beta cohort. Empty reports remain exclusive
+    # to the requester; failures add only the private operator diagnostics
+    # destinations. Public-mode routing is intentionally unchanged.
+    if private_beta_mode and manual_delivery:
+        destinations = _merge_destinations(
+            get_private_beta_chat_ids(),
+            list(telegram_chat_ids or []),
+        )
+        report_destinations = _merge_destinations(
+            list(telegram_chat_ids or [])
+        )
+        failure_report_destinations = _merge_destinations(
+            list(telegram_chat_ids or []),
+            get_telegram_private_operator_chat_ids(),
+        )
+    else:
+        destinations = get_telegram_alert_chat_ids(telegram_chat_ids)
+        report_destinations = get_telegram_report_chat_ids(
+            telegram_chat_ids if manual_delivery else None
+        )
+        failure_report_destinations = (
+            get_telegram_private_operator_chat_ids()
+            if not manual_delivery
+            else report_destinations
+        )
     logger.info(
         "Delivery Mode: {} recipients_attempted={} report_recipients={} "
         "public_enabled={}",
@@ -723,6 +1067,9 @@ def _run_scheduled_scan_once_unlocked(
     )
     if send and tg_ready:
         if filtered:
+            delivery_repository = SchedulerRunRepository(
+                cfg.outcome_scoring.database_url
+            )
             rendered: List[Dict[str, Any]] = []
             tracking_destinations: List[List[str]] = [
                 [] for _ in range(len(filtered[:6]))
@@ -764,6 +1111,11 @@ def _run_scheduled_scan_once_unlocked(
                 destination_items: List[Dict[str, Any]] = []
                 for signal_index, signal in enumerate(rendered):
                     symbol = str(signal.get("symbol") or "signal")
+                    signal_row = filtered[signal_index]
+                    signal_delivery_key = _signal_delivery_idempotency_key(
+                        signal_row,
+                        destination,
+                    )
                     if not signal.get("ok"):
                         item = {
                             "ok": False,
@@ -771,6 +1123,19 @@ def _run_scheduled_scan_once_unlocked(
                             "mode": "photo",
                             "error": signal.get("error"),
                             "description": signal.get("description"),
+                        }
+                    elif (
+                        callable(getattr(delivery_repository, "delivery_succeeded", None))
+                        and delivery_repository.delivery_succeeded(
+                            signal_delivery_key
+                        )
+                    ):
+                        item = {
+                            "ok": True,
+                            "symbol": symbol,
+                            "mode": "photo",
+                            "skipped_duplicate": True,
+                            "description": "already delivered to this destination",
                         }
                     else:
                         item = send_telegram_photo_detailed(
@@ -785,7 +1150,7 @@ def _run_scheduled_scan_once_unlocked(
                         digest = destination_hash(destination)
                         delivery_audit.append(
                             {
-                                "idempotency_key": f"{run_id}:{digest}:signal_photo:{symbol}",
+                                "idempotency_key": signal_delivery_key,
                                 "destination_hash": digest,
                                 "delivery_type": f"signal_photo:{symbol}",
                                 "ok": bool(item.get("ok")),
@@ -793,9 +1158,16 @@ def _run_scheduled_scan_once_unlocked(
                                 "error": item.get("error"),
                             }
                         )
+                        if callable(
+                            getattr(delivery_repository, "record_delivery", None)
+                        ):
+                            delivery_repository.record_delivery(
+                                run_id=run_id,
+                                delivery=delivery_audit[-1],
+                            )
                     destination_items.append(item)
                     chart_items.append(item)
-                    if item.get("ok"):
+                    if item.get("ok") and not item.get("skipped_duplicate"):
                         tracking_destinations[signal_index].append(destination)
 
                 destination_photo_ok = bool(destination_items) and all(
@@ -821,9 +1193,39 @@ def _run_scheduled_scan_once_unlocked(
                         }
                     )
                     if fallback.get("ok"):
-                        for signal_destinations in tracking_destinations:
+                        for signal_index, signal_destinations in enumerate(
+                            tracking_destinations
+                        ):
                             if destination not in signal_destinations:
                                 signal_destinations.append(destination)
+                            signal_row = filtered[signal_index]
+                            stable_key = _signal_delivery_idempotency_key(
+                                signal_row,
+                                destination,
+                            )
+                            stable_delivery = {
+                                "idempotency_key": stable_key,
+                                "destination_hash": digest,
+                                "delivery_type": (
+                                    "signal_text_fallback:"
+                                    + str(signal_row.get("symbol") or signal_index)
+                                ),
+                                "ok": True,
+                                "message_id": fallback.get("message_id"),
+                                "error": None,
+                            }
+                            delivery_audit.append(stable_delivery)
+                            if callable(
+                                getattr(
+                                    delivery_repository,
+                                    "record_delivery",
+                                    None,
+                                )
+                            ):
+                                delivery_repository.record_delivery(
+                                    run_id=run_id,
+                                    delivery=stable_delivery,
+                                )
                 destination_ok = destination_photo_ok or bool(
                     fallback and fallback.get("ok")
                 )
@@ -836,8 +1238,14 @@ def _run_scheduled_scan_once_unlocked(
                     }
                 )
 
-            chart_sent = sum(1 for item in chart_items if item.get("ok"))
-            chart_failed = len(chart_items) - chart_sent
+            chart_sent = sum(
+                1 for item in chart_items
+                if item.get("ok") and not item.get("skipped_duplicate")
+            )
+            duplicate_skipped = sum(
+                1 for item in chart_items if item.get("skipped_duplicate")
+            )
+            chart_failed = len(chart_items) - chart_sent - duplicate_skipped
             all_destinations_ok = bool(destination_results) and all(
                 item.get("ok") for item in destination_results
             )
@@ -856,7 +1264,7 @@ def _run_scheduled_scan_once_unlocked(
             }
             if len(fallback_items) == 1:
                 delivery["text_fallback"] = fallback_items[0]
-            if photo_ok:
+            if photo_ok and chart_sent:
                 sent = True
                 delivery_status = "sent_chart_alerts"
                 logger.info(
@@ -865,6 +1273,14 @@ def _run_scheduled_scan_once_unlocked(
                     slot_label or "scan",
                     chart_sent,
                     len(destinations),
+                )
+            elif photo_ok and duplicate_skipped == len(chart_items):
+                sent = False
+                delivery_status = "skipped_duplicate_signals"
+                logger.info(
+                    "Telegram signal delivery skipped: all {} per-destination "
+                    "deliveries were already confirmed",
+                    duplicate_skipped,
                 )
             else:
                 sent = any(item.get("ok") for item in destination_results)
@@ -895,9 +1311,13 @@ def _run_scheduled_scan_once_unlocked(
                     filtered[:6],
                     tracking_destinations,
                     source=(
-                        "telegram_manual"
-                        if manual_delivery
-                        else "telegram_scheduled"
+                        scan_origin
+                        if private_beta_mode
+                        else (
+                            "telegram_manual"
+                            if manual_delivery
+                            else "telegram_scheduled"
+                        )
                     ),
                     config=cfg,
                 )
@@ -933,7 +1353,10 @@ def _run_scheduled_scan_once_unlocked(
         ):
             destination_results = []
             report_type = "scan_failure" if scan_failed else "no_quality_report"
-            for destination in report_destinations:
+            effective_report_destinations = (
+                failure_report_destinations if scan_failed else report_destinations
+            )
+            for destination in effective_report_destinations:
                 item = send_telegram_message_detailed(
                     report,
                     chat_id=destination,
@@ -976,7 +1399,7 @@ def _run_scheduled_scan_once_unlocked(
                     sent_count,
                     len(destination_results),
                 )
-            elif report_destinations:
+            elif effective_report_destinations:
                 delivery_status = "failed"
                 logger.error(
                     "Scheduled empty Telegram report failed: slot={} error={} description={}",
@@ -1001,9 +1424,9 @@ def _run_scheduled_scan_once_unlocked(
                 "Telegram report delivery summary: mode={} attempted={} "
                 "successful={} failed={}",
                 routing_status["mode_label"],
-                len(report_destinations),
+                len(effective_report_destinations),
                 sent_count,
-                max(0, len(report_destinations) - sent_count),
+                max(0, len(effective_report_destinations) - sent_count),
             )
         else:
             delivery_status = "skipped_no_actionable_signals"
@@ -1090,6 +1513,35 @@ def _run_scheduled_scan_once_unlocked(
             "delivery_status": delivery_status,
             "pre_delivery_rejected_count": len(pre_delivery_rejected),
             "public_empty_suppressed": public_empty_suppressed,
+            "scan_origin": scan_origin,
+            "requester_identity_hash": requester_identity_hash,
+            "delivery_destination_hashes": sorted(
+                {
+                    str(item.get("destination_hash"))
+                    for item in delivery_audit
+                    if item.get("destination_hash")
+                }
+            ),
+            "delivery_results": [
+                {
+                    "destination_hash": item.get("destination_hash"),
+                    "delivery_type": item.get("delivery_type"),
+                    "ok": bool(item.get("ok")),
+                }
+                for item in delivery_audit
+            ],
+            "fully_qualified_signals": sum(
+                1
+                for row in filtered
+                if (row.get("qualification") or {}).get("qualification_type")
+                == "fully_qualified"
+            ),
+            "relaxed_private_beta_signals": sum(
+                1
+                for row in filtered
+                if (row.get("qualification") or {}).get("qualification_type")
+                == "qualified_beta"
+            ),
         },
         candidate_updates=candidate_updates,
     )
@@ -1143,6 +1595,8 @@ def _run_scheduled_scan_once_unlocked(
         "public_empty_suppressed": public_empty_suppressed,
         "delivery_mode": routing_status["mode"],
         "delivery_recipient_count": len(destinations),
+        "scan_origin": scan_origin,
+        "requester_identity_hash": requester_identity_hash,
         "rejection_analytics": result.get("rejection_analytics") or {},
         "rejection_analytics_finalized": analytics_finalized,
         "slot_label": slot_label,
@@ -1169,37 +1623,19 @@ def run_scheduled_scan_once(
     """Run one scan without overlapping another scheduler, API, or bot request."""
     cfg = config or load_config()
     started_at = datetime.now(ZoneInfo("UTC")).isoformat()
-    if not _SCAN_RUN_LOCK.acquire(blocking=False):
-        logger.warning("Scan request skipped because another scan is already running")
-        return {
-            "ok": False,
-            "error": "scan_in_progress",
-            "started_at": started_at,
-            "completed_at": started_at,
-            "scanned": 0,
-            "ranked_count": 0,
-            "alert_count": 0,
-            "filtered": [],
-            "report": "",
-            "telegram_sent": False,
-            "telegram_ready": is_telegram_ready(config),
-            "telegram_delivery_status": "scan_in_progress",
-            "telegram_delivery": None,
-            "slot_label": slot_label,
-        }
-    try:
-        resolved_run_id = str(
-            run_id or _durable_run_id(slot_label, scheduled_for)
-        )
-        source = _scheduler_run_source(
-            slot_label,
-            telegram_chat_ids,
-            scheduled_for,
-        )
-        watchlist = list(symbols or cfg.scheduler.watchlist or []) or list(
-            DEFAULT_WATCHLIST
-        )
-        repository = SchedulerRunRepository(cfg.outcome_scoring.database_url)
+    resolved_run_id = str(run_id or _durable_run_id(slot_label, scheduled_for))
+    source = _scheduler_run_source(slot_label, telegram_chat_ids, scheduled_for)
+    watchlist = list(symbols or cfg.scheduler.watchlist or []) or list(
+        DEFAULT_WATCHLIST
+    )
+    repository = SchedulerRunRepository(cfg.outcome_scoring.database_url)
+    claimed: Optional[bool] = None
+    lock_acquired = False
+
+    if source == "scheduled":
+        # Claim the expected window before process-lock arbitration. Previously
+        # an overlapping manual scan returned before this claim, leaving no
+        # durable evidence that the production window had been missed.
         claimed = repository.claim(
             run_id=resolved_run_id,
             source=source,
@@ -1230,7 +1666,7 @@ def run_scheduled_scan_once(
                 "telegram_delivery": None,
                 "slot_label": slot_label,
             }
-        if source == "scheduled" and repository.enabled and claimed is None:
+        if repository.enabled and claimed is None:
             logger.error(
                 "Scheduled run aborted because durable run claim is unavailable: run={}",
                 resolved_run_id,
@@ -1249,6 +1685,91 @@ def run_scheduled_scan_once(
                 "telegram_sent": False,
                 "telegram_ready": is_telegram_ready(cfg),
                 "telegram_delivery_status": "persistence_unavailable",
+                "telegram_delivery": None,
+                "slot_label": slot_label,
+            }
+        expected_at = _parse_utc_datetime(scheduled_for)
+        grace_deadline = (
+            expected_at + timedelta(seconds=SCHEDULER_MISFIRE_GRACE_SECONDS)
+            if expected_at is not None else None
+        )
+        remaining_grace = (
+            (grace_deadline - datetime.now(ZoneInfo("UTC"))).total_seconds()
+            if grace_deadline is not None else float(SCHEDULER_MISFIRE_GRACE_SECONDS)
+        )
+        if remaining_grace <= 0:
+            return _missed_window_result(
+                repository=repository,
+                run_id=resolved_run_id,
+                slot_label=slot_label,
+                scheduled_for=str(scheduled_for or ""),
+                reason=(
+                    f"misfire grace of {SCHEDULER_MISFIRE_GRACE_SECONDS}s expired"
+                ),
+            )
+        lock_acquired = _SCAN_RUN_LOCK.acquire(
+            timeout=max(0.0, remaining_grace)
+        )
+        if not lock_acquired:
+            return _missed_window_result(
+                repository=repository,
+                run_id=resolved_run_id,
+                slot_label=slot_label,
+                scheduled_for=str(scheduled_for or ""),
+                reason=(
+                    "another scan occupied the worker through the documented "
+                    f"{SCHEDULER_MISFIRE_GRACE_SECONDS}s grace period"
+                ),
+            )
+    else:
+        lock_acquired = _SCAN_RUN_LOCK.acquire(blocking=False)
+        if not lock_acquired:
+            logger.warning("Scan request skipped because another scan is already running")
+            return {
+                "ok": False,
+                "error": "scan_in_progress",
+                "started_at": started_at,
+                "completed_at": started_at,
+                "scanned": 0,
+                "ranked_count": 0,
+                "alert_count": 0,
+                "filtered": [],
+                "report": "",
+                "telegram_sent": False,
+                "telegram_ready": is_telegram_ready(config),
+                "telegram_delivery_status": "scan_in_progress",
+                "telegram_delivery": None,
+                "slot_label": slot_label,
+            }
+    try:
+        if source != "scheduled":
+            claimed = repository.claim(
+                run_id=resolved_run_id,
+                source=source,
+                slot_label=slot_label or "scan",
+                scheduled_for=scheduled_for,
+                symbols_requested=len(watchlist),
+            )
+        if claimed is False:
+            logger.warning(
+                "Duplicate durable scheduler run suppressed: run={} slot={}",
+                resolved_run_id,
+                slot_label or "scan",
+            )
+            return {
+                "ok": False,
+                "error": "duplicate_scheduler_run",
+                "run_id": resolved_run_id,
+                "started_at": started_at,
+                "completed_at": started_at,
+                "scanned": 0,
+                "ranked_count": 0,
+                "alert_count": 0,
+                "filtered": [],
+                "report": "",
+                "telegram_sent": False,
+                "telegram_ready": is_telegram_ready(cfg),
+                "telegram_delivery_status": "duplicate_run_suppressed",
                 "telegram_delivery": None,
                 "slot_label": slot_label,
             }
@@ -1290,9 +1811,28 @@ def run_scheduled_scan_once(
             "persisted": outcome.get("run_persisted"),
         }
         _status_update(last_run=last_run)
+        if source == "scheduled":
+            actual_at = _parse_utc_datetime(outcome.get("started_at"))
+            expected_at = _parse_utc_datetime(scheduled_for)
+            delay_seconds = (
+                max(0.0, (actual_at - expected_at).total_seconds())
+                if actual_at is not None and expected_at is not None else 0.0
+            )
+            _status_update(
+                previous_expected_run_at=scheduled_for,
+                previous_actual_run_at=outcome.get("started_at"),
+                previous_run_status=last_run["status"],
+                previous_misfire_status=(
+                    "recovered_within_grace"
+                    if delay_seconds > 1.0
+                    else "on_time"
+                ),
+                previous_durable_run_id=resolved_run_id,
+            )
         return outcome
     finally:
-        _SCAN_RUN_LOCK.release()
+        if lock_acquired:
+            _SCAN_RUN_LOCK.release()
 
 
 def run_scheduler_loop(
@@ -1360,6 +1900,16 @@ def run_scheduler_loop(
         tz_name,
     )
     try:
+        if sessions:
+            repository = SchedulerRunRepository(
+                cfg.outcome_scoring.database_url
+            )
+            recovered = _recover_expected_scheduler_windows(cfg, repository)
+            if recovered:
+                logger.info(
+                    "Scheduler startup recovery processed {} missing window(s)",
+                    len(recovered),
+                )
         while not stop.is_set():
             if sessions:
                 nxt, session_name = next_session_datetime(sessions)
@@ -1380,19 +1930,25 @@ def run_scheduler_loop(
             )
             if stop.wait(timeout=sleep_s):
                 break
-            wat = nxt.astimezone(ZoneInfo(tz_name))
-            label = (
-                f"{session_name} · {nxt.strftime('%H:%M %Z')} "
-                f"({wat.strftime('%H:%M %Z')})"
+            label = _scheduled_slot_label(
+                session_name,
+                nxt,
+                tz_name,
+                sessions,
             )
             triggered_at = datetime.now(ZoneInfo("UTC")).isoformat()
-            _status_update(last_triggered_at=triggered_at, last_error=None)
+            scheduled_for = nxt.astimezone(ZoneInfo("UTC")).isoformat()
+            _status_update(
+                last_triggered_at=triggered_at,
+                last_error=None,
+                previous_expected_run_at=scheduled_for,
+            )
             try:
                 outcome = run_scheduled_scan_once(
                     cfg,
                     slot_label=label,
                     send=True,
-                    scheduled_for=nxt.astimezone(ZoneInfo("UTC")).isoformat(),
+                    scheduled_for=scheduled_for,
                 )
                 _status_update(
                     last_completed_at=outcome.get("completed_at"),
@@ -1418,11 +1974,28 @@ def start_scheduler_background(config: Optional[AppConfig] = None) -> bool:
     """Start one daemon scheduler thread for the API process."""
     global _BACKGROUND_THREAD, _BACKGROUND_STOP
     cfg = config or load_config()
-    latest_run = SchedulerRunRepository(
-        cfg.outcome_scoring.database_url
-    ).latest()
+    repository = SchedulerRunRepository(cfg.outcome_scoring.database_url)
+    latest_run = repository.latest()
     if latest_run:
         _status_update(last_run=latest_run)
+    latest_scheduled = repository.latest_scheduled()
+    if latest_scheduled:
+        summary = dict(latest_scheduled.get("result_summary") or {})
+        _status_update(
+            previous_expected_run_at=(
+                _parse_utc_datetime(latest_scheduled.get("scheduled_for")).isoformat()
+                if _parse_utc_datetime(latest_scheduled.get("scheduled_for"))
+                else latest_scheduled.get("scheduled_for")
+            ),
+            previous_actual_run_at=(
+                _parse_utc_datetime(latest_scheduled.get("started_at")).isoformat()
+                if _parse_utc_datetime(latest_scheduled.get("started_at"))
+                else latest_scheduled.get("started_at")
+            ),
+            previous_run_status=latest_scheduled.get("status"),
+            previous_misfire_status=summary.get("misfire_status") or "on_time",
+            previous_durable_run_id=latest_scheduled.get("run_id"),
+        )
     if not cfg.scheduler.enabled:
         _status_update(
             enabled=False,

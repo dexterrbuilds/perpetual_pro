@@ -304,6 +304,10 @@ def test_net_rr_floor_impact_compares_requested_values_without_changing_rows():
         "0.75": 2,
         "1.00": 1,
     }
+    assert impact["floor_comparison"]["0.75"]["newly_qualifying_setups"] == 2
+    assert impact["floor_comparison"]["0.75"]["setups_still_rejected"] == 0
+    assert impact["floor_comparison"]["0.75"]["all_qualifiers_pass_hard_checks"] is True
+    assert impact["floor_comparison"]["1.00"]["average_overall_quality"] == 84.0
 
 
 def test_private_beta_delivery_keeps_only_best_two_by_policy_order():
@@ -326,6 +330,27 @@ def test_private_beta_delivery_keeps_only_best_two_by_policy_order():
 
     selected = qualify_private_beta_candidates([lower, best, middle], limit=2)
     assert [row["candidate_id"] for row in selected] == ["best", "middle"]
+
+
+def test_private_beta_sort_prioritizes_net_rr_after_important_passes():
+    higher_quality = _row()
+    higher_quality["candidate_id"] = "higher-quality"
+    higher_quality["confidence"] = 92.0
+    higher_quality["net_risk_reward"] = [0.8, 1.30]
+
+    balanced = _row()
+    balanced["candidate_id"] = "balanced"
+    balanced["confidence"] = 84.0
+    balanced["net_risk_reward"] = [1.0, 1.70]
+
+    selected = qualify_private_beta_candidates(
+        [higher_quality, balanced],
+        limit=2,
+    )
+    assert [row["candidate_id"] for row in selected] == [
+        "balanced",
+        "higher-quality",
+    ]
 
 
 def test_private_summary_persistence_and_telegram_use_same_result():

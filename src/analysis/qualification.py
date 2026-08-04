@@ -544,11 +544,13 @@ def private_beta_threshold_passes(
 def private_beta_sort_key(row: Mapping[str, Any]) -> tuple:
     qualification = dict(row.get("qualification") or {})
     rank = _numeric(qualification.get("authoritative_rank"))
+    net_rr = _numeric(qualification.get("net_rr"))
     return (
         int(qualification.get("important_soft_pass_count") or 0),
-        int(qualification.get("soft_pass_count") or 0),
+        net_rr if net_rr is not None else float("-inf"),
         float(row.get("confidence") or row.get("overall_quality") or 0.0),
         float(row.get("execution_quality") or row.get("execution_score") or 0.0),
+        int(qualification.get("soft_pass_count") or 0),
         rank if rank is not None else float("-inf"),
     )
 
@@ -587,8 +589,12 @@ def analyze_private_beta_net_rr_floors(
 ) -> Dict[str, Any]:
     """Diagnostic-only comparison using stored gates and no score mutation."""
     normalized_floors = tuple(sorted({round(float(value), 2) for value in floors}))
-    counts = {f"{value:.2f}": 0 for value in normalized_floors}
-    rejections = {f"{value:.2f}": 0 for value in normalized_floors}
+    qualifying_rows: Dict[str, List[Dict[str, Any]]] = {
+        f"{value:.2f}": [] for value in normalized_floors
+    }
+    rejected_rows: Dict[str, List[Dict[str, Any]]] = {
+        f"{value:.2f}": [] for value in normalized_floors
+    }
     directional = 0
     base_candidates = 0
     net_values: List[float] = []
@@ -619,14 +625,76 @@ def analyze_private_beta_net_rr_floors(
         for floor in normalized_floors:
             key = f"{floor:.2f}"
             if net_rr is not None and net_rr + 1e-9 >= floor:
-                counts[key] += 1
+                qualifying_rows[key].append(
+                    {
+                        "candidate_id": row.get("candidate_id"),
+                        "symbol": row.get("symbol"),
+                        "direction": row.get("direction"),
+                        "overall_quality": _numeric(
+                            row.get("confidence", row.get("overall_quality"))
+                        ),
+                        "execution_quality": _numeric(
+                            row.get("execution_quality", row.get("execution_score"))
+                        ),
+                        "net_rr": net_rr,
+                        "hard_checks_passed": True,
+                    }
+                )
             else:
-                rejections[key] += 1
+                rejected_rows[key].append(
+                    {
+                        "candidate_id": row.get("candidate_id"),
+                        "symbol": row.get("symbol"),
+                        "direction": row.get("direction"),
+                        "net_rr": net_rr,
+                        "hard_checks_passed": True,
+                    }
+                )
+
+    floor_comparison: Dict[str, Dict[str, Any]] = {}
+    for key in (f"{value:.2f}" for value in normalized_floors):
+        qualified = qualifying_rows[key]
+        rejected = rejected_rows[key]
+        overall_values = [
+            float(item["overall_quality"])
+            for item in qualified
+            if item.get("overall_quality") is not None
+        ]
+        execution_values = [
+            float(item["execution_quality"])
+            for item in qualified
+            if item.get("execution_quality") is not None
+        ]
+        floor_comparison[key] = {
+            "newly_qualifying_setups": len(qualified),
+            "setups_still_rejected": len(rejected),
+            "average_overall_quality": (
+                round(sum(overall_values) / len(overall_values), 2)
+                if overall_values else None
+            ),
+            "average_execution_quality": (
+                round(sum(execution_values) / len(execution_values), 2)
+                if execution_values else None
+            ),
+            "all_qualifiers_pass_hard_checks": all(
+                bool(item.get("hard_checks_passed")) for item in qualified
+            ),
+            "expected_private_beta_signal_frequency_per_100_directional": round(
+                (len(qualified) / directional * 100.0) if directional else 0.0,
+                2,
+            ),
+            "examples": qualified[:3],
+        }
     return {
         "directional_candidates": directional,
         "base_candidates_before_absolute_net_rr_floor": base_candidates,
-        "qualifying_by_floor": counts,
-        "rejected_by_floor": rejections,
+        "qualifying_by_floor": {
+            key: len(rows) for key, rows in qualifying_rows.items()
+        },
+        "rejected_by_floor": {
+            key: len(rows) for key, rows in rejected_rows.items()
+        },
+        "floor_comparison": floor_comparison,
         "observed_base_net_rr": [round(value, 4) for value in sorted(net_values)],
         "diagnostic_only": True,
     }

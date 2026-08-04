@@ -17,6 +17,7 @@ from src.analytics.runtime import get_rejection_repository
 from src.notify.telegram import (
     TELEGRAM_API_ROOT,
     get_telegram_credentials,
+    get_telegram_private_operator_chat_ids,
     is_telegram_ready,
     send_telegram_message_detailed,
 )
@@ -461,12 +462,20 @@ def process_telegram_update(update: Dict[str, Any], config: AppConfig) -> Dict[s
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Telegram on-demand scan failed: {}", type(exc).__name__)
-        send_telegram_message_detailed(
+        failure_text = (
             "❌ <b>Scan failed</b>\nThe market data request did not complete. "
-            "Please try again shortly.",
-            chat_id=incoming_chat_id,
-            parse_mode="HTML",
+            "Please try again shortly."
         )
+        failure_destinations = [incoming_chat_id]
+        for destination in get_telegram_private_operator_chat_ids():
+            if destination not in failure_destinations:
+                failure_destinations.append(destination)
+        for destination in failure_destinations:
+            send_telegram_message_detailed(
+                failure_text,
+                chat_id=destination,
+                parse_mode="HTML",
+            )
         return {
             "ok": False,
             "handled": True,
