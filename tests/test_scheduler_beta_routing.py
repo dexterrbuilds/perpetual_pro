@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import main_server
@@ -387,3 +388,36 @@ def test_scheduler_status_endpoint_is_protected(monkeypatch):
     payload = main_server.admin_scheduler_status(Request(), "test-key")
     assert payload["ok"] is True
     assert len(payload["scheduler"].get("active_windows") or []) in {0, 4}
+
+
+def test_restart_status_does_not_report_claim_time_as_missed_run_time(
+    monkeypatch,
+):
+    cfg = load_config()
+    cfg.scheduler.enabled = False
+    missed = {
+        "run_id": "sched-missed",
+        "source": "scheduled",
+        "slot_label": "London confirmation",
+        "scheduled_for": "2026-08-04T07:20:00+00:00",
+        "started_at": "2026-08-04T09:00:00+00:00",
+        "status": "skipped",
+        "result_summary": {
+            "result_code": "missed_beyond_grace",
+            "misfire_status": "missed_beyond_grace",
+        },
+    }
+    monkeypatch.setattr(
+        scan_job,
+        "SchedulerRunRepository",
+        lambda *a, **k: SimpleNamespace(
+            latest=lambda: missed,
+            latest_scheduled=lambda: missed,
+        ),
+    )
+    assert scan_job.start_scheduler_background(cfg) is False
+    status = scan_job.get_scheduler_status()
+    assert status["previous_expected_run_at"] == "2026-08-04T07:20:00+00:00"
+    assert status["previous_actual_run_at"] is None
+    assert status["previous_run_status"] == "skipped"
+    assert status["previous_misfire_status"] == "missed_beyond_grace"

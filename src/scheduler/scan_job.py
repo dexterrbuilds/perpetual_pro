@@ -1981,6 +1981,11 @@ def start_scheduler_background(config: Optional[AppConfig] = None) -> bool:
     latest_scheduled = repository.latest_scheduled()
     if latest_scheduled:
         summary = dict(latest_scheduled.get("result_summary") or {})
+        missed_window = bool(
+            latest_scheduled.get("status") == "skipped"
+            or summary.get("misfire_status") == "missed_beyond_grace"
+            or summary.get("result_code") == "missed_beyond_grace"
+        )
         _status_update(
             previous_expected_run_at=(
                 _parse_utc_datetime(latest_scheduled.get("scheduled_for")).isoformat()
@@ -1988,9 +1993,15 @@ def start_scheduler_background(config: Optional[AppConfig] = None) -> bool:
                 else latest_scheduled.get("scheduled_for")
             ),
             previous_actual_run_at=(
-                _parse_utc_datetime(latest_scheduled.get("started_at")).isoformat()
-                if _parse_utc_datetime(latest_scheduled.get("started_at"))
-                else latest_scheduled.get("started_at")
+                None
+                if missed_window
+                else (
+                    _parse_utc_datetime(
+                        latest_scheduled.get("started_at")
+                    ).isoformat()
+                    if _parse_utc_datetime(latest_scheduled.get("started_at"))
+                    else latest_scheduled.get("started_at")
+                )
             ),
             previous_run_status=latest_scheduled.get("status"),
             previous_misfire_status=summary.get("misfire_status") or "on_time",
