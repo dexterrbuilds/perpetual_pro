@@ -143,10 +143,20 @@ def get_telegram_private_operator_chat_ids() -> List[str]:
 
     Scheduled empty and operational reports must not fall back to
     ``TELEGRAM_CHAT_ID`` because that variable is the public signal channel in
-    production. Private operator routing is intentionally opt-in through
-    ``TELEGRAM_COMMAND_CHAT_IDS``.
+    production. ``TELEGRAM_OPERATOR_CHAT_IDS`` is the explicit operator route.
+    For backward compatibility, the first authorized command chat is the sole
+    operator when that variable is absent; additional beta command users must
+    not receive operational failures merely because they can invoke ``/scan``.
     """
-    return _split_chat_ids([os.getenv("TELEGRAM_COMMAND_CHAT_IDS") or ""])
+    explicit = _split_chat_ids(
+        [os.getenv("TELEGRAM_OPERATOR_CHAT_IDS") or ""]
+    )
+    if explicit:
+        return explicit
+    authorized = _split_chat_ids(
+        [os.getenv("TELEGRAM_COMMAND_CHAT_IDS") or ""]
+    )
+    return authorized[:1]
 
 
 def get_telegram_report_chat_ids(

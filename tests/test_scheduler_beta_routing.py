@@ -367,6 +367,18 @@ def test_manual_beta_failure_is_requester_and_operator_only(monkeypatch):
     assert "111111" not in chats
 
 
+def test_beta_command_users_are_not_implicitly_all_operators(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_OPERATOR_CHAT_IDS", raising=False)
+    monkeypatch.setenv("TELEGRAM_COMMAND_CHAT_IDS", "111111,222222")
+    assert scan_job.get_telegram_private_operator_chat_ids() == ["111111"]
+
+    monkeypatch.setenv("TELEGRAM_OPERATOR_CHAT_IDS", "333333,444444")
+    assert scan_job.get_telegram_private_operator_chat_ids() == [
+        "333333",
+        "444444",
+    ]
+
+
 def test_scheduler_status_endpoint_is_protected(monkeypatch):
     class Request:
         client = None
