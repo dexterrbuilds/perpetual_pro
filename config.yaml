@@ -59,6 +59,9 @@ telegram:
 # Session-aware scans. IANA timezones automatically follow UK/US daylight saving.
 scheduler:
   enabled: true
+  # Additional private-beta scan at the top of every UTC hour. It is inactive
+  # automatically when DELIVERY_MODE=public.
+  private_beta_hourly_enabled: true
   timezone: "Africa/Lagos"   # Report timestamps remain in WAT
   sessions:
     - name: "London confirmation"

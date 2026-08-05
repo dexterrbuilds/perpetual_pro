@@ -53,6 +53,7 @@ DEFAULT_WATCHLIST = list(DEFAULT_CRYPTO_WATCHLIST)
 MIN_TELEGRAM_SIGNAL_CONFIDENCE = ALERT_MIN_OVERALL_QUALITY
 SCHEDULER_MISFIRE_GRACE_SECONDS = 300
 SCHEDULER_RECOVERY_LOOKBACK_HOURS = 24
+PRIVATE_BETA_HOURLY_SESSION_NAME = "Private beta hourly scan"
 
 _STATUS_LOCK = Lock()
 _SCHEDULER_STATUS: Dict[str, Any] = {
@@ -77,6 +78,7 @@ _SCHEDULER_STATUS: Dict[str, Any] = {
     "previous_misfire_status": None,
     "previous_durable_run_id": None,
     "misfire_grace_seconds": SCHEDULER_MISFIRE_GRACE_SECONDS,
+    "private_beta_hourly_enabled": False,
 }
 _BACKGROUND_THREAD: Optional[Thread] = None
 _BACKGROUND_STOP: Optional[Event] = None
@@ -158,6 +160,69 @@ def scheduled_session_windows_between(
                 windows.append((candidate, name))
             cursor += timedelta(days=1)
     return sorted(windows, key=lambda item: item[0])
+
+
+def next_hourly_datetime(
+    now: Optional[datetime] = None,
+) -> datetime:
+    """Return the next top-of-hour UTC boundary, strictly in the future."""
+    now_utc = (
+        now.astimezone(ZoneInfo("UTC"))
+        if now is not None and now.tzinfo is not None
+        else (
+            now.replace(tzinfo=ZoneInfo("UTC"))
+            if now is not None
+            else datetime.now(ZoneInfo("UTC"))
+        )
+    )
+    return now_utc.replace(minute=0, second=0, microsecond=0) + timedelta(
+        hours=1
+    )
+
+
+def scheduled_hourly_windows_between(
+    *,
+    start: datetime,
+    end: datetime,
+) -> List[Tuple[datetime, str]]:
+    """Enumerate private-beta top-of-hour windows in ``(start, end]``."""
+    start_utc = start.astimezone(ZoneInfo("UTC"))
+    end_utc = end.astimezone(ZoneInfo("UTC"))
+    cursor = start_utc.replace(minute=0, second=0, microsecond=0)
+    if cursor <= start_utc:
+        cursor += timedelta(hours=1)
+    windows: List[Tuple[datetime, str]] = []
+    while cursor <= end_utc:
+        windows.append((cursor, PRIVATE_BETA_HOURLY_SESSION_NAME))
+        cursor += timedelta(hours=1)
+    return windows
+
+
+def _private_beta_hourly_enabled(cfg: AppConfig) -> bool:
+    return bool(
+        getattr(cfg.scheduler, "private_beta_hourly_enabled", True)
+        and get_delivery_status().get("mode") == "private_beta"
+    )
+
+
+def _active_scheduler_windows(
+    cfg: AppConfig,
+    sessions: List[Dict[str, str]],
+    times: List[str],
+) -> List[Any]:
+    windows: List[Any] = list(sessions if sessions else times)
+    if _private_beta_hourly_enabled(cfg):
+        windows.append(
+            {
+                "name": PRIVATE_BETA_HOURLY_SESSION_NAME,
+                "schedule": "hourly",
+                "minute": 0,
+                "timezone": "UTC",
+                "delivery_mode": "private_beta",
+                "notify_on_empty": False,
+            }
+        )
+    return windows
 
 
 def previous_session_datetime(
@@ -242,7 +307,8 @@ def _recover_expected_scheduler_windows(
 ) -> List[Dict[str, Any]]:
     """Persist/recover windows lost to restart without replaying stale data."""
     sessions = list(getattr(cfg.scheduler, "sessions", None) or [])
-    if not sessions or not repository.enabled:
+    hourly_enabled = _private_beta_hourly_enabled(cfg)
+    if (not sessions and not hourly_enabled) or not repository.enabled:
         return []
     now_utc = (now or datetime.now(ZoneInfo("UTC"))).astimezone(ZoneInfo("UTC"))
     latest = repository.latest_scheduled()
@@ -255,12 +321,37 @@ def _recover_expected_scheduler_windows(
             now_utc - timedelta(seconds=SCHEDULER_MISFIRE_GRACE_SECONDS)
         ),
     )
+    latest_hourly_reader = getattr(repository, "latest_hourly", None)
+    latest_hourly = (
+        latest_hourly_reader() if callable(latest_hourly_reader) else None
+    )
+    latest_hourly_expected = _parse_utc_datetime(
+        (latest_hourly or {}).get("scheduled_for")
+    )
+    # A newly introduced hourly schedule has no historical obligations before
+    # deployment. Once its first durable row exists, normal 24-hour restart
+    # recovery resumes from that independent cursor.
+    hourly_start = max(
+        now_utc - timedelta(hours=SCHEDULER_RECOVERY_LOOKBACK_HOURS),
+        latest_hourly_expected if latest_hourly_expected is not None else (
+            now_utc - timedelta(seconds=SCHEDULER_MISFIRE_GRACE_SECONDS)
+        ),
+    )
     outcomes: List[Dict[str, Any]] = []
-    for expected_at, session_name in scheduled_session_windows_between(
-        sessions,
-        start=start,
-        end=now_utc,
+    expected_windows = scheduled_session_windows_between(
+        sessions, start=start, end=now_utc
+    )
+    if hourly_enabled:
+        expected_windows.extend(
+            scheduled_hourly_windows_between(
+                start=hourly_start,
+                end=now_utc,
+            )
+        )
+    for expected_at, session_name in sorted(
+        expected_windows, key=lambda item: item[0]
     ):
+        hourly_window = session_name == PRIVATE_BETA_HOURLY_SESSION_NAME
         scheduled_for = expected_at.isoformat()
         label = _scheduled_slot_label(
             session_name,
@@ -284,6 +375,9 @@ def _recover_expected_scheduler_windows(
                 send=True,
                 scheduled_for=scheduled_for,
                 run_id=run_id,
+                notify_on_empty=False if hourly_window else None,
+                skip_if_busy=hourly_window,
+                warn_on_misfire=not hourly_window,
             )
         )
     return outcomes
@@ -362,13 +456,18 @@ def _missed_window_result(
     slot_label: str,
     scheduled_for: str,
     reason: str,
+    warn_operator: bool = True,
 ) -> Dict[str, Any]:
     now = datetime.now(ZoneInfo("UTC")).isoformat()
-    deliveries = _send_missed_window_warning(
-        run_id=run_id,
-        slot_label=slot_label,
-        scheduled_for=scheduled_for,
-        reason=reason,
+    deliveries = (
+        _send_missed_window_warning(
+            run_id=run_id,
+            slot_label=slot_label,
+            scheduled_for=scheduled_for,
+            reason=reason,
+        )
+        if warn_operator
+        else []
     )
     summary = {
         "result_code": "missed_beyond_grace",
@@ -382,7 +481,11 @@ def _missed_window_result(
         "telegram_delivery_status": (
             "sent_misfire_warning"
             if any(item.get("ok") for item in deliveries)
-            else "misfire_warning_not_delivered"
+            else (
+                "misfire_warning_not_delivered"
+                if warn_operator
+                else "skipped_misfire_silent"
+            )
         ),
     }
     persisted = repository.finish(
@@ -428,6 +531,78 @@ def _missed_window_result(
             "delivery_status": summary["telegram_delivery_status"],
             "persisted": result["run_persisted"],
         },
+    )
+    return result
+
+
+def _overlap_skipped_result(
+    *,
+    repository: SchedulerRunRepository,
+    run_id: str,
+    slot_label: str,
+    scheduled_for: str,
+) -> Dict[str, Any]:
+    """Durably skip a busy hourly window without waiting or sending Telegram."""
+    now = datetime.now(ZoneInfo("UTC")).isoformat()
+    summary = {
+        "result_code": "hourly_overlap_skipped",
+        "misfire_status": "overlap_skipped",
+        "symbols_analyzed": 0,
+        "symbol_failures": 0,
+        "eligible_candidates": 0,
+        "revalidated_candidates": 0,
+        "rejected_candidates": 0,
+        "telegram_delivery_status": "skipped_scan_in_progress",
+    }
+    persisted = repository.finish(
+        run_id=run_id,
+        status="skipped",
+        summary=summary,
+        deliveries=[],
+    )
+    result = {
+        "ok": False,
+        "error": "hourly_scan_overlap",
+        "run_id": run_id,
+        "started_at": now,
+        "completed_at": now,
+        "scanned": 0,
+        "analyzed_count": 0,
+        "ranked_count": 0,
+        "alert_count": 0,
+        "filtered": [],
+        "report": "",
+        "telegram_sent": False,
+        "telegram_ready": is_telegram_ready(),
+        "telegram_delivery_status": "skipped_scan_in_progress",
+        "telegram_delivery": None,
+        "delivery_audit": [],
+        "slot_label": slot_label,
+        "scheduled_for": scheduled_for,
+        "result_code": "hourly_overlap_skipped",
+        "misfire_status": "overlap_skipped",
+        "run_persisted": bool(persisted) if repository.enabled else None,
+    }
+    _status_update(
+        previous_expected_run_at=scheduled_for,
+        previous_actual_run_at=None,
+        previous_run_status="skipped",
+        previous_misfire_status="overlap_skipped",
+        previous_durable_run_id=run_id,
+        last_run={
+            "run_id": run_id,
+            "status": "skipped",
+            "result_code": "hourly_overlap_skipped",
+            "scheduled_for": scheduled_for,
+            "delivery_status": "skipped_scan_in_progress",
+            "persisted": result["run_persisted"],
+        },
+    )
+    logger.info(
+        "Private-beta hourly scan skipped because another scan is running: "
+        "run={} scheduled_for={}",
+        run_id,
+        scheduled_for,
     )
     return result
 
@@ -499,6 +674,41 @@ def next_session_datetime(
         fallback = now_utc + timedelta(hours=1)
         return fallback, "Fallback scan"
     return min(candidates, key=lambda item: item[0].astimezone(ZoneInfo("UTC")))
+
+
+def next_scheduler_datetime(
+    cfg: AppConfig,
+    sessions: List[Dict[str, str]],
+    times: List[str],
+    *,
+    now: Optional[datetime] = None,
+) -> Tuple[datetime, str]:
+    """Select the next named session or private-beta hourly window."""
+    candidates: List[Tuple[datetime, str, int]] = []
+    if sessions:
+        session_at, session_name = next_session_datetime(sessions, now=now)
+        candidates.append((session_at, session_name, 0))
+    elif times:
+        slot_at = next_slot_datetime(
+            times,
+            cfg.scheduler.timezone or "Africa/Lagos",
+            now=now,
+        )
+        candidates.append((slot_at, "Scheduled scan", 0))
+    if _private_beta_hourly_enabled(cfg):
+        candidates.append(
+            (next_hourly_datetime(now), PRIVATE_BETA_HOURLY_SESSION_NAME, 1)
+        )
+    if not candidates:
+        raise ValueError("No scheduler windows are configured")
+    selected = min(
+        candidates,
+        key=lambda item: (
+            item[0].astimezone(ZoneInfo("UTC")),
+            item[2],
+        ),
+    )
+    return selected[0], selected[1]
 
 
 def filter_high_confidence(
@@ -1344,11 +1554,13 @@ def _run_scheduled_scan_once_unlocked(
             )
         elif (
             scan_failed
-            or routing_status["mode"] == "private_beta"
             or (
                 bool(notify_on_empty)
                 if notify_on_empty is not None
-                else cfg.telegram.notify_on_empty
+                else (
+                    routing_status["mode"] == "private_beta"
+                    or cfg.telegram.notify_on_empty
+                )
             )
         ):
             destination_results = []
@@ -1619,6 +1831,8 @@ def run_scheduled_scan_once(
     telegram_chat_ids: Optional[List[str]] = None,
     scheduled_for: Optional[str] = None,
     run_id: Optional[str] = None,
+    skip_if_busy: bool = False,
+    warn_on_misfire: bool = True,
 ) -> Dict[str, Any]:
     """Run one scan without overlapping another scheduler, API, or bot request."""
     cfg = config or load_config()
@@ -1706,11 +1920,21 @@ def run_scheduled_scan_once(
                 reason=(
                     f"misfire grace of {SCHEDULER_MISFIRE_GRACE_SECONDS}s expired"
                 ),
+                warn_operator=warn_on_misfire,
             )
         lock_acquired = _SCAN_RUN_LOCK.acquire(
+            blocking=False
+        ) if skip_if_busy else _SCAN_RUN_LOCK.acquire(
             timeout=max(0.0, remaining_grace)
         )
         if not lock_acquired:
+            if skip_if_busy:
+                return _overlap_skipped_result(
+                    repository=repository,
+                    run_id=resolved_run_id,
+                    slot_label=slot_label,
+                    scheduled_for=str(scheduled_for or ""),
+                )
             return _missed_window_result(
                 repository=repository,
                 run_id=resolved_run_id,
@@ -1720,6 +1944,7 @@ def run_scheduled_scan_once(
                     "another scan occupied the worker through the documented "
                     f"{SCHEDULER_MISFIRE_GRACE_SECONDS}s grace period"
                 ),
+                warn_operator=warn_on_misfire,
             )
     else:
         lock_acquired = _SCAN_RUN_LOCK.acquire(blocking=False)
@@ -1858,7 +2083,8 @@ def run_scheduler_loop(
         timezone=tz_name,
         times=times,
         sessions=sessions,
-        active_windows=(sessions if sessions else times),
+        active_windows=_active_scheduler_windows(cfg, sessions, times),
+        private_beta_hourly_enabled=_private_beta_hourly_enabled(cfg),
         started_at=datetime.now(ZoneInfo("UTC")).isoformat(),
         last_error=None,
     )
@@ -1888,7 +2114,8 @@ def run_scheduler_loop(
     else:
         logger.info("Telegram credentials loaded from environment (token redacted)")
     logger.info(
-        "Scheduler loop started: times={} timezone={} high-confidence-only=true",
+        "Scheduler loop started: times={} timezone={} hourly_private_beta={} "
+        "high-confidence-only=true",
         (
             [
                 f"{session.get('name')} {session.get('time')} {session.get('timezone')}"
@@ -1898,9 +2125,10 @@ def run_scheduler_loop(
             else times
         ),
         tz_name,
+        _private_beta_hourly_enabled(cfg),
     )
     try:
-        if sessions:
+        if sessions or _private_beta_hourly_enabled(cfg):
             repository = SchedulerRunRepository(
                 cfg.outcome_scoring.database_url
             )
@@ -1911,11 +2139,9 @@ def run_scheduler_loop(
                     len(recovered),
                 )
         while not stop.is_set():
-            if sessions:
-                nxt, session_name = next_session_datetime(sessions)
-            else:
-                nxt = next_slot_datetime(times, tz_name)
-                session_name = "Scheduled scan"
+            nxt, session_name = next_scheduler_datetime(
+                cfg, sessions, times
+            )
             _status_update(
                 next_run_at=nxt.isoformat(),
                 next_session=session_name,
@@ -1938,6 +2164,7 @@ def run_scheduler_loop(
             )
             triggered_at = datetime.now(ZoneInfo("UTC")).isoformat()
             scheduled_for = nxt.astimezone(ZoneInfo("UTC")).isoformat()
+            hourly_window = session_name == PRIVATE_BETA_HOURLY_SESSION_NAME
             _status_update(
                 last_triggered_at=triggered_at,
                 last_error=None,
@@ -1949,6 +2176,9 @@ def run_scheduler_loop(
                     slot_label=label,
                     send=True,
                     scheduled_for=scheduled_for,
+                    notify_on_empty=False if hourly_window else None,
+                    skip_if_busy=hourly_window,
+                    warn_on_misfire=not hourly_window,
                 )
                 _status_update(
                     last_completed_at=outcome.get("completed_at"),
@@ -2008,16 +2238,16 @@ def start_scheduler_background(config: Optional[AppConfig] = None) -> bool:
             previous_durable_run_id=latest_scheduled.get("run_id"),
         )
     if not cfg.scheduler.enabled:
+        sessions = list(getattr(cfg.scheduler, "sessions", None) or [])
+        times = list(cfg.scheduler.times or [])
         _status_update(
             enabled=False,
             running=False,
             timezone=cfg.scheduler.timezone,
             times=list(cfg.scheduler.times),
             sessions=list(getattr(cfg.scheduler, "sessions", None) or []),
-            active_windows=(
-                list(getattr(cfg.scheduler, "sessions", None) or [])
-                or list(cfg.scheduler.times)
-            ),
+            active_windows=_active_scheduler_windows(cfg, sessions, times),
+            private_beta_hourly_enabled=_private_beta_hourly_enabled(cfg),
             guarded_mode=True,
         )
         logger.warning("Scheduler disabled by configuration (scheduler.enabled=false)")
@@ -2033,16 +2263,16 @@ def start_scheduler_background(config: Optional[AppConfig] = None) -> bool:
         daemon=True,
     )
     _BACKGROUND_THREAD.start()
+    sessions = list(getattr(cfg.scheduler, "sessions", None) or [])
+    times = list(cfg.scheduler.times or [])
     _status_update(
         enabled=True,
         thread_alive=True,
         timezone=cfg.scheduler.timezone,
         times=list(cfg.scheduler.times),
         sessions=list(getattr(cfg.scheduler, "sessions", None) or []),
-        active_windows=(
-            list(getattr(cfg.scheduler, "sessions", None) or [])
-            or list(cfg.scheduler.times)
-        ),
+        active_windows=_active_scheduler_windows(cfg, sessions, times),
+        private_beta_hourly_enabled=_private_beta_hourly_enabled(cfg),
         guarded_mode=False,
     )
     logger.info("Scheduler background thread started")

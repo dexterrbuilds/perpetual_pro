@@ -265,6 +265,9 @@ class TelegramConfig:
 @dataclass
 class SchedulerConfig:
     enabled: bool = False
+    # Extra top-of-hour scan used only while Telegram delivery is private beta.
+    # The four named DST-aware session windows remain independent and unchanged.
+    private_beta_hourly_enabled: bool = True
     timezone: str = "Africa/Lagos"  # WAT
     # Empty when DST-aware sessions are configured; no hidden legacy fallback.
     times: List[str] = field(default_factory=list)
@@ -587,6 +590,9 @@ def _dict_to_config(data: Dict[str, Any], config_path: Optional[Path] = None) ->
         ),
         scheduler=SchedulerConfig(
             enabled=bool(sched.get("enabled", True)),
+            private_beta_hourly_enabled=bool(
+                sched.get("private_beta_hourly_enabled", True)
+            ),
             timezone=str(sched.get("timezone", "Africa/Lagos") or "Africa/Lagos"),
             times=list(sched.get("times") or []),
             sessions=[

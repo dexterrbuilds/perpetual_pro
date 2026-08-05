@@ -156,6 +156,42 @@ def test_all_four_dst_windows_register_and_london_night_conversion():
     assert london.astimezone(ZoneInfo("Africa/Lagos")).strftime("%H:%M") == "08:20"
 
 
+def test_private_beta_hourly_window_is_added_without_replacing_sessions(
+    monkeypatch,
+):
+    monkeypatch.setenv("DELIVERY_MODE", "private_beta")
+    cfg = load_config(ROOT / "config.yaml")
+    original_names = [item["name"] for item in cfg.scheduler.sessions]
+    assert original_names == [
+        "London confirmation",
+        "New York macro follow-through",
+        "New York open confirmation",
+        "New York liquidity window",
+    ]
+    now = datetime(2026, 8, 4, 13, 55, tzinfo=ZoneInfo("UTC"))
+    next_run, name = scan_job.next_scheduler_datetime(
+        cfg,
+        cfg.scheduler.sessions,
+        cfg.scheduler.times,
+        now=now,
+    )
+    assert name == scan_job.PRIVATE_BETA_HOURLY_SESSION_NAME
+    assert next_run == datetime(2026, 8, 4, 14, 0, tzinfo=ZoneInfo("UTC"))
+    active = scan_job._active_scheduler_windows(
+        cfg, cfg.scheduler.sessions, cfg.scheduler.times
+    )
+    assert [item["name"] for item in active[:4]] == original_names
+    assert active[4]["schedule"] == "hourly"
+    assert active[4]["notify_on_empty"] is False
+
+    monkeypatch.setenv("DELIVERY_MODE", "public")
+    assert len(
+        scan_job._active_scheduler_windows(
+            cfg, cfg.scheduler.sessions, cfg.scheduler.times
+        )
+    ) == 4
+
+
 def test_scheduled_overlap_inside_grace_runs_once(monkeypatch):
     cfg = load_config(ROOT / "config.yaml")
     _RunRepository.reset()
@@ -187,6 +223,7 @@ def test_scheduled_overlap_inside_grace_runs_once(monkeypatch):
 
 
 def test_restart_recovery_runs_due_window_once_then_keeps_next_future(monkeypatch):
+    monkeypatch.setenv("DELIVERY_MODE", "public")
     cfg = load_config(ROOT / "config.yaml")
     now = datetime(2026, 8, 4, 7, 21, tzinfo=ZoneInfo("UTC"))
 
@@ -235,6 +272,49 @@ def test_restart_recovery_runs_due_window_once_then_keeps_next_future(monkeypatc
     assert next_run.astimezone(ZoneInfo("UTC")).strftime("%H:%M") == "12:50"
 
 
+def test_new_hourly_schedule_recovers_only_current_grace_window(monkeypatch):
+    monkeypatch.setenv("DELIVERY_MODE", "private_beta")
+    cfg = load_config(ROOT / "config.yaml")
+    now = datetime(2026, 8, 4, 14, 1, tzinfo=ZoneInfo("UTC"))
+
+    class RecoveryRepository:
+        enabled = True
+
+        def __init__(self):
+            self.records = set()
+
+        def latest_scheduled(self):
+            return {"scheduled_for": "2026-08-04T12:50:00+00:00"}
+
+        def latest_hourly(self):
+            return None
+
+        def get(self, run_id):
+            return {"run_id": run_id} if run_id in self.records else None
+
+    repository = RecoveryRepository()
+    calls = []
+
+    def run_once(*args, **kwargs):
+        repository.records.add(kwargs["run_id"])
+        calls.append(kwargs)
+        return {"ok": True, "run_id": kwargs["run_id"]}
+
+    monkeypatch.setattr(scan_job, "run_scheduled_scan_once", run_once)
+    scan_job._recover_expected_scheduler_windows(cfg, repository, now=now)
+    hourly = [
+        call for call in calls
+        if call["slot_label"].startswith(
+            scan_job.PRIVATE_BETA_HOURLY_SESSION_NAME
+        )
+    ]
+    assert len(hourly) == 1
+    assert hourly[0]["scheduled_for"] == "2026-08-04T14:00:00+00:00"
+    assert hourly[0]["notify_on_empty"] is False
+    assert hourly[0]["skip_if_busy"] is True
+    assert hourly[0]["warn_on_misfire"] is False
+
+
 def test_scheduled_window_outside_grace_records_miss_and_warns_operator(monkeypatch):
     cfg = _configure_private_beta(monkeypatch)
     monkeypatch.setattr(scan_job, "_SCAN_RUN_LOCK", Lock())
@@ -258,6 +338,132 @@ def test_scheduled_window_outside_grace_records_miss_and_warns_operator(monkeypa
     assert result["misfire_status"] == "missed_beyond_grace"
     assert _RunRepository.finishes[-1]["status"] == "skipped"
     assert warnings and warnings[0][1] == "111111"
+
+
+def test_hourly_overlap_is_durably_skipped_and_not_run_twice(monkeypatch):
+    cfg = _configure_private_beta(monkeypatch)
+    busy_lock = Lock()
+    busy_lock.acquire()
+    monkeypatch.setattr(scan_job, "_SCAN_RUN_LOCK", busy_lock)
+    scan_calls = []
+    monkeypatch.setattr(
+        scan_job,
+        "_run_scheduled_scan_once_unlocked",
+        lambda *a, **k: scan_calls.append(True) or {"ok": True},
+    )
+    scheduled_for = (
+        datetime.now(ZoneInfo("UTC")) - timedelta(seconds=5)
+    ).isoformat()
+    first = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label=scan_job.PRIVATE_BETA_HOURLY_SESSION_NAME,
+        scheduled_for=scheduled_for,
+        notify_on_empty=False,
+        skip_if_busy=True,
+        warn_on_misfire=False,
+    )
+    second = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label=scan_job.PRIVATE_BETA_HOURLY_SESSION_NAME,
+        scheduled_for=scheduled_for,
+        notify_on_empty=False,
+        skip_if_busy=True,
+        warn_on_misfire=False,
+    )
+    busy_lock.release()
+
+    assert first["error"] == "hourly_scan_overlap"
+    assert first["telegram_sent"] is False
+    assert _RunRepository.finishes[0]["status"] == "skipped"
+    assert second["error"] == "duplicate_scheduler_run"
+    assert len(_RunRepository.finishes) == 1
+    assert scan_calls == []
+
+
+def test_hourly_no_setup_is_silent_in_private_beta(monkeypatch):
+    cfg = _configure_private_beta(monkeypatch)
+    monkeypatch.setattr(scan_job, "_SCAN_RUN_LOCK", Lock())
+    monkeypatch.setattr(
+        scan_job,
+        "scan_symbols",
+        lambda *a, **k: {
+            "ok": True,
+            "ranked_results": [],
+            "qualification_candidates": [],
+            "analyzed_count": 1,
+        },
+    )
+    messages = []
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_message_detailed",
+        lambda *a, **k: messages.append(True) or {"ok": True},
+    )
+    result = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label=scan_job.PRIVATE_BETA_HOURLY_SESSION_NAME,
+        scheduled_for=(
+            datetime.now(ZoneInfo("UTC")) - timedelta(seconds=5)
+        ).isoformat(),
+        notify_on_empty=False,
+        skip_if_busy=True,
+        warn_on_misfire=False,
+    )
+    assert result["ok"] is True
+    assert result["alert_count"] == 0
+    assert result["telegram_sent"] is False
+    assert result["telegram_delivery_status"] == "skipped_no_actionable_signals"
+    assert messages == []
+
+
+def test_hourly_qualified_signal_uses_beta_routing_and_idempotency(monkeypatch):
+    cfg = _configure_private_beta(monkeypatch)
+    monkeypatch.setattr(scan_job, "_SCAN_RUN_LOCK", Lock())
+    with scan_job._RECENT_SIGNAL_LOCK:
+        scan_job._RECENT_SIGNAL_ALERTS.clear()
+    _mock_signal_scan(monkeypatch)
+    photo_chats = []
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_photo_detailed",
+        lambda *a, **kwargs: photo_chats.append(kwargs["chat_id"])
+        or {"ok": True, "message_id": len(photo_chats)},
+    )
+    monkeypatch.setattr(
+        scan_job,
+        "send_telegram_message_detailed",
+        lambda *a, **k: {"ok": False, "error": "fallback_not_expected"},
+    )
+    registrations = []
+    monkeypatch.setattr(
+        scan_job,
+        "register_delivered_signals",
+        lambda rows, destinations, **kwargs: registrations.append(
+            (destinations, kwargs.get("source"))
+        ) or {"ok": True, "registered": 1},
+    )
+    now = datetime.now(ZoneInfo("UTC"))
+    first = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label=scan_job.PRIVATE_BETA_HOURLY_SESSION_NAME,
+        scheduled_for=(now - timedelta(seconds=5)).isoformat(),
+        notify_on_empty=False,
+        skip_if_busy=True,
+        warn_on_misfire=False,
+    )
+    second = scan_job.run_scheduled_scan_once(
+        cfg,
+        slot_label=scan_job.PRIVATE_BETA_HOURLY_SESSION_NAME,
+        scheduled_for=(now - timedelta(seconds=4)).isoformat(),
+        notify_on_empty=False,
+        skip_if_busy=True,
+        warn_on_misfire=False,
+    )
+    assert photo_chats == ["111111", "222222"]
+    assert first["scan_origin"] == "scheduled_beta_scan"
+    assert first["delivery_recipient_count"] == 2
+    assert second["telegram_delivery_status"] == "skipped_duplicate_signals"
+    assert len(registrations) == 1
 
 
 def test_manual_beta_signal_fans_out_and_deduplicates_per_destination(monkeypatch):
@@ -387,7 +593,7 @@ def test_scheduler_status_endpoint_is_protected(monkeypatch):
     monkeypatch.setattr(main_server.SCAN_ACCESS, "authorize", lambda *a, **k: None)
     payload = main_server.admin_scheduler_status(Request(), "test-key")
     assert payload["ok"] is True
-    assert len(payload["scheduler"].get("active_windows") or []) in {0, 4}
+    assert len(payload["scheduler"].get("active_windows") or []) in {0, 4, 5}
 
 
 def test_restart_status_does_not_report_claim_time_as_missed_run_time(

@@ -253,7 +253,11 @@ def readiness() -> JSONResponse:
         "scheduler": {
             "enabled": bool(cfg.scheduler.enabled),
             "state": "disabled_intentionally" if not cfg.scheduler.enabled else "enabled",
-            "active_windows": cfg.scheduler.sessions or cfg.scheduler.times,
+            "active_windows": (
+                scheduler.get("active_windows")
+                or cfg.scheduler.sessions
+                or cfg.scheduler.times
+            ),
         },
         "checks": checks,
         "build": identity,

@@ -210,6 +210,31 @@ class SchedulerRunRepository:
         except Exception:
             return None
 
+    def latest_hourly(self) -> Optional[Dict[str, Any]]:
+        """Return the newest durable private-beta hourly window."""
+        if not self.enabled:
+            return None
+        try:
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    select run_id, source, slot_label, scheduled_for, started_at,
+                           completed_at, status, symbols_requested,
+                           symbols_analyzed, symbol_failures,
+                           eligible_candidates, revalidated_candidates,
+                           rejected_candidates, scan_duration_seconds,
+                           result_code, result_summary
+                    from public.scheduler_runs
+                    where source='scheduled'
+                      and slot_label like 'Private beta hourly scan%'
+                    order by scheduled_for desc nulls last limit 1
+                    """
+                )
+                row = cursor.fetchone()
+            return dict(row) if row else None
+        except Exception:
+            return None
+
     def delivery_succeeded(self, idempotency_key: str) -> bool:
         """Whether this semantic signal already reached this destination."""
         if not self.enabled or not idempotency_key:
