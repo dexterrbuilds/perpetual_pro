@@ -119,6 +119,83 @@ def test_duplicate_checks_count_once_and_revalidation_does_not_inflate_count():
     assert sum(check["duplicate_group"] == "final_revalidation" for check in checks) == 1
 
 
+def test_derived_blocked_entry_is_not_counted_beside_original_hard_failure():
+    row = _row()
+    _set_gate(row, "ENTRY_BLOCKED", False, "blocked")
+    original = _gate(
+        "TP1_BLOCKED",
+        False,
+        "tp1_blocked_by_nearby_structure",
+        "absent",
+        stage="analysis",
+        authoritative=False,
+        severity="diagnostic",
+    )
+    original["gate_name"] = "Execution hard-failure detail"
+    row["gate_evaluation"]["gates"].append(original)
+
+    qualification = evaluate_private_beta_qualification(row)
+    failed_ids = {
+        check["canonical_check_id"]
+        for check in qualification["failed_hard_checks"]
+    }
+    assert failed_ids == {"target_validity"}
+    assert qualification["private_beta_qualified"] is False
+
+    standalone = _row()
+    _set_gate(standalone, "ENTRY_BLOCKED", False, "blocked")
+    standalone_result = evaluate_private_beta_qualification(standalone)
+    assert {
+        check["canonical_check_id"]
+        for check in standalone_result["failed_hard_checks"]
+    } == {"entry_state"}
+
+
+def test_private_beta_overall_floor_can_be_77_without_changing_public(monkeypatch):
+    row = _row()
+    row["confidence"] = 77.5
+    row["overall_quality"] = 77.5
+    _set_gate(row, "OVERALL_QUALITY_BELOW_MINIMUM", False, 77.5)
+
+    monkeypatch.delenv("PRIVATE_BETA_MIN_OVERALL_QUALITY", raising=False)
+    default_result = evaluate_private_beta_qualification(row)
+    assert default_result["private_beta_min_overall_quality"] == 78.0
+    assert default_result["overall_quality_passed"] is False
+
+    monkeypatch.setenv("PRIVATE_BETA_MIN_OVERALL_QUALITY", "77")
+    trial_result = evaluate_private_beta_qualification(row)
+    assert trial_result["private_beta_min_overall_quality"] == 77.0
+    assert trial_result["qualification_policy_variant"].endswith("overall_77")
+    assert trial_result["overall_quality_passed"] is True
+    assert trial_result["private_beta_qualified"] is True
+
+    public_row = {
+        **row,
+        "signal_eligible": True,
+        "prop_safe": True,
+        "immediate_sl_risk": 20,
+        "chase_distance_atr": 0.2,
+        "spread_bps": 2,
+    }
+    assert filter_high_confidence(
+        [public_row],
+        min_llm=65,
+        min_rank=50,
+        only_prop_safe=False,
+        min_execution_score=72,
+    ) == []
+
+
+def test_invalid_private_beta_overall_override_fails_safe_to_78(monkeypatch):
+    row = _row()
+    row["confidence"] = 77.5
+    _set_gate(row, "OVERALL_QUALITY_BELOW_MINIMUM", False, 77.5)
+    monkeypatch.setenv("PRIVATE_BETA_MIN_OVERALL_QUALITY", "60")
+    result = evaluate_private_beta_qualification(row)
+    assert result["private_beta_min_overall_quality"] == 78.0
+    assert result["private_beta_qualified"] is False
+
+
 def test_nonapplicable_and_excluded_checks_do_not_enter_denominators():
     row = _row()
     row["gate_evaluation"]["gates"].extend(
@@ -150,6 +227,7 @@ def test_hard_and_mandatory_failures_always_reject():
     assert evaluate_private_beta_qualification(hard)["private_beta_qualified"] is False
 
     overall = _row()
+    overall["confidence"] = 77.9
     _set_gate(overall, "OVERALL_QUALITY_BELOW_MINIMUM", False, 77.9)
     assert evaluate_private_beta_qualification(overall)["overall_quality_passed"] is False
     assert evaluate_private_beta_qualification(overall)["private_beta_qualified"] is False

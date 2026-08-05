@@ -7,6 +7,7 @@ analysis, alert-filter, and pre-delivery revalidation paths.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from math import isfinite
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -16,10 +17,35 @@ QUALIFICATION_POLICY_VERSION = "private_beta_important_soft_v1"
 PRIVATE_BETA_MIN_IMPORTANT_SOFT_PASSES = 2
 PRIVATE_BETA_NET_RR_FLOOR = 0.75
 PRIVATE_BETA_PREFERRED_NET_RR = 1.25
+PRIVATE_BETA_MIN_OVERALL_QUALITY_DEFAULT = 78.0
+PRIVATE_BETA_MIN_OVERALL_QUALITY_ENV = "PRIVATE_BETA_MIN_OVERALL_QUALITY"
 IMPORTANT_SOFT_CHECK_IDS = frozenset(
     {"directional_confluence", "immediate_sl_risk", "net_rr"}
 )
 SUPPORTING_SOFT_CHECK_IDS = frozenset({"deterministic_rank", "gross_rr"})
+
+
+def private_beta_min_overall_quality() -> float:
+    """Return the guarded private-beta Overall floor.
+
+    Public qualification continues to use ``ALERT_MIN_OVERALL_QUALITY``.  The
+    private-beta override deliberately accepts only the current 78-point floor
+    or the approved 77-point trial value, preventing an accidental broader
+    relaxation through a malformed deployment variable.
+    """
+    raw = str(
+        os.getenv(
+            PRIVATE_BETA_MIN_OVERALL_QUALITY_ENV,
+            PRIVATE_BETA_MIN_OVERALL_QUALITY_DEFAULT,
+        )
+    ).strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return PRIVATE_BETA_MIN_OVERALL_QUALITY_DEFAULT
+    if value not in {77.0, PRIVATE_BETA_MIN_OVERALL_QUALITY_DEFAULT}:
+        return PRIVATE_BETA_MIN_OVERALL_QUALITY_DEFAULT
+    return value
 
 
 @dataclass(frozen=True)
@@ -231,10 +257,28 @@ def build_deduplicated_check_registry(
 ) -> List[Dict[str, Any]]:
     """Return applicable canonical check results, merged by underlying risk."""
     evaluation = dict(gate_evaluation or row.get("gate_evaluation") or {})
+    raw_gates = [dict(item) for item in evaluation.get("gates") or []]
+    has_execution_hard_failure_detail = any(
+        not bool(gate.get("passed"))
+        and str(gate.get("stage") or "") == "analysis"
+        and str(gate.get("gate_name") or "") == "Execution hard-failure detail"
+        for gate in raw_gates
+    )
     observations: Dict[str, List[Dict[str, Any]]] = {}
-    for raw_gate in evaluation.get("gates") or []:
-        gate = dict(raw_gate)
+    for gate in raw_gates:
         code = str(gate.get("code") or "")
+        # The execution planner sets entry_status=blocked whenever it has
+        # already emitted an original hard-failure detail.  Counting that
+        # derived status as another independent hard check inflates rejection
+        # analytics without adding safety.  A standalone blocked entry remains
+        # authoritative and is still counted normally.
+        if (
+            code == "ENTRY_BLOCKED"
+            and not bool(gate.get("passed"))
+            and str(gate.get("actual_value") or "").lower() == "blocked"
+            and has_execution_hard_failure_detail
+        ):
+            continue
         policy = CHECK_REGISTRY.get(code)
         # The existing execution planner records this specific TP1 cost-buffer
         # condition in ``hard_failures`` and the rejection vocabulary aliases
@@ -453,6 +497,26 @@ def evaluate_private_beta_qualification(
         (item for item in mandatory if item["canonical_check_id"] == "execution_quality_floor"),
         None,
     )
+    overall_floor = private_beta_min_overall_quality()
+    if overall is not None:
+        overall_actual = _numeric(
+            row.get("confidence", row.get("overall_quality"))
+        )
+        if overall_actual is None:
+            overall_actual = _numeric(overall.get("actual_value"))
+        overall["actual_value"] = overall_actual
+        overall["required_value"] = {
+            "operator": ">=",
+            "value": overall_floor,
+        }
+        overall["passed"] = bool(
+            overall_actual is not None and overall_actual >= overall_floor
+        )
+        overall["failure_reason"] = (
+            ""
+            if overall["passed"]
+            else f"Overall Quality is below the private-beta minimum {overall_floor:g}"
+        )
     overall_passed = bool(overall and overall["passed"])
     execution_passed = bool(execution and execution["passed"])
     hard_passed = not failed_hard
@@ -479,6 +543,9 @@ def evaluate_private_beta_qualification(
         qualification_type = "rejected"
     return {
         "qualification_policy_version": QUALIFICATION_POLICY_VERSION,
+        "qualification_policy_variant": (
+            f"{QUALIFICATION_POLICY_VERSION}:overall_{overall_floor:g}"
+        ),
         "qualification_type": qualification_type,
         "private_beta_qualified": qualifies,
         "applicable_hard_checks": hard,
@@ -504,6 +571,7 @@ def evaluate_private_beta_qualification(
         "soft_applicable_count": len(soft),
         "soft_pass_percentage": round(soft_pct, 1),
         "overall_quality_result": overall,
+        "private_beta_min_overall_quality": overall_floor,
         "execution_quality_result": execution,
         "overall_quality_passed": overall_passed,
         "execution_quality_passed": execution_passed,
