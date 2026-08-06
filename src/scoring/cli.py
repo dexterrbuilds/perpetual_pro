@@ -10,6 +10,7 @@ from typing import List, Optional
 from src.analysis.legacy_v2 import compare_legacy_v2_outcomes
 from src.data.multi_tf import fetch_multi_timeframe_with_fallback
 from src.scoring.replay import replay_historical_candidates
+from src.scoring.readiness import assess_shadow_readiness
 from src.scoring.repository import OutcomeRepository
 from src.scoring.training import train_outcome_model
 from src.utils.config import DEFAULT_CRYPTO_WATCHLIST, load_config
@@ -19,6 +20,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Perpetual Pro outcome scorer")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("status", help="Check Supabase schema and model state")
+    subparsers.add_parser(
+        "readiness",
+        help=(
+            "Run read-only chronological shadow replacement gates; never saves "
+            "or promotes a model"
+        ),
+    )
     compare_parser = subparsers.add_parser(
         "compare-legacy-v2",
         help="Compare execution-aware Legacy V2 against stored legacy outcomes",
@@ -67,6 +75,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         print(json.dumps(comparison, indent=2))
         return 0 if comparison["labeled_candidates"] else 6
+    if args.command == "readiness":
+        rows = repository.load_training_rows()
+        readiness = assess_shadow_readiness(rows, config)
+        print(json.dumps(readiness, indent=2))
+        return 0 if readiness.get("ready_to_replace_current") else 7
     if args.command == "backfill-replay":
         symbols = [
             value.strip()

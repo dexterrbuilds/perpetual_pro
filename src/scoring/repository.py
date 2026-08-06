@@ -170,7 +170,9 @@ class OutcomeRepository:
                 timeframe, source, status, generated_at, valid_until,
                 entered_at, terminal_at, entry_low, entry_high, entry_mid,
                 entry_price, stop_loss, take_profits, highest_tp, realized_r,
-                mfe_r, mae_r, slippage_bps, terminal_reason, signal_payload,
+                mfe_r, mae_r, slippage_bps, terminal_reason,
+                outcome_classification, profitable, profitable_at, level_hits,
+                signal_payload,
                 updated_at
             ) values (
                 %(signal_id)s, %(candidate_id)s, %(symbol)s, %(exchange_id)s,
@@ -179,7 +181,9 @@ class OutcomeRepository:
                 %(terminal_at)s, %(entry_low)s, %(entry_high)s, %(entry_mid)s,
                 %(entry_price)s, %(stop_loss)s, %(take_profits)s,
                 %(highest_tp)s, %(realized_r)s, %(mfe_r)s, %(mae_r)s,
-                %(slippage_bps)s, %(terminal_reason)s, %(signal_payload)s,
+                %(slippage_bps)s, %(terminal_reason)s,
+                %(outcome_classification)s, %(profitable)s, %(profitable_at)s,
+                %(level_hits)s, %(signal_payload)s,
                 now()
             )
             on conflict (signal_id) do update set
@@ -194,6 +198,10 @@ class OutcomeRepository:
                 mae_r = excluded.mae_r,
                 slippage_bps = excluded.slippage_bps,
                 terminal_reason = excluded.terminal_reason,
+                outcome_classification = excluded.outcome_classification,
+                profitable = excluded.profitable,
+                profitable_at = excluded.profitable_at,
+                level_hits = excluded.level_hits,
                 signal_payload = excluded.signal_payload,
                 updated_at = now()
         """
@@ -222,6 +230,28 @@ class OutcomeRepository:
             "mae_r": float(signal.get("mae_r") or 0),
             "slippage_bps": signal.get("slippage_bps"),
             "terminal_reason": signal.get("terminal_reason"),
+            "outcome_classification": str(
+                signal.get("outcome_classification")
+                or (
+                    "profitable"
+                    if int(signal.get("highest_tp") or 0) >= 1
+                    else "active"
+                    if str(signal.get("status") or "") == "entered"
+                    else "pending_entry"
+                    if str(signal.get("status") or "") == "pending"
+                    else "ambiguous"
+                    if str(signal.get("status") or "") == "ambiguous_gap"
+                    else "not_entered"
+                    if not signal.get("entered_at")
+                    else "not_profitable"
+                )
+            ),
+            "profitable": bool(
+                signal.get("profitable")
+                or int(signal.get("highest_tp") or 0) >= 1
+            ),
+            "profitable_at": signal.get("profitable_at"),
+            "level_hits": Jsonb(dict(signal.get("level_hits") or {})),
             "signal_payload": Jsonb(row_payload),
         }
         try:
@@ -258,6 +288,18 @@ class OutcomeRepository:
             return False
         valid_fill = bool(signal.get("entered_at"))
         tp1_hit = int(signal.get("highest_tp") or 0) >= 1
+        outcome_classification = str(
+            signal.get("outcome_classification")
+            or (
+                "profitable"
+                if valid_fill and tp1_hit
+                else "ambiguous"
+                if status == "ambiguous_gap"
+                else "not_entered"
+                if not valid_fill
+                else "not_profitable"
+            )
+        )
         terminal_at = signal.get("terminal_at") or _now_iso()
         generated_at = _parse_datetime(signal.get("generated_at"))
         entered_at = _parse_datetime(signal.get("entered_at"))
@@ -284,6 +326,9 @@ class OutcomeRepository:
             "alert_success": bool(valid_fill and tp1_hit),
             "tp1_hit": tp1_hit,
             "tp2_hit": int(signal.get("highest_tp") or 0) >= 2,
+            "tp3_hit": int(signal.get("highest_tp") or 0) >= 3,
+            "tp4_hit": int(signal.get("highest_tp") or 0) >= 4,
+            "outcome_classification": outcome_classification,
             "invalidated_before_fill": status == "invalidated" and not valid_fill,
             "missed_before_fill": status == "missed" and not valid_fill,
             "expired_before_fill": status == "expired" and not valid_fill,
@@ -304,13 +349,16 @@ class OutcomeRepository:
                 {
                     "terminal_reason": signal.get("terminal_reason"),
                     "highest_tp": int(signal.get("highest_tp") or 0),
+                    "profitable_at": signal.get("profitable_at"),
+                    "level_hits": dict(signal.get("level_hits") or {}),
                 }
             ),
         }
         sql = """
             insert into public.signal_outcomes (
                 candidate_id, signal_id, label_source, valid_fill,
-                technical_success, alert_success, tp1_hit, tp2_hit,
+                technical_success, alert_success, tp1_hit, tp2_hit, tp3_hit,
+                tp4_hit, outcome_classification,
                 invalidated_before_fill, missed_before_fill,
                 expired_before_fill, entry_delay_minutes,
                 trade_duration_minutes, realized_r, mfe_r, mae_r,
@@ -319,7 +367,8 @@ class OutcomeRepository:
             ) values (
                 %(candidate_id)s, %(signal_id)s, 'forward_tracker',
                 %(valid_fill)s, %(technical_success)s, %(alert_success)s,
-                %(tp1_hit)s, %(tp2_hit)s, %(invalidated_before_fill)s,
+                %(tp1_hit)s, %(tp2_hit)s, %(tp3_hit)s, %(tp4_hit)s,
+                %(outcome_classification)s, %(invalidated_before_fill)s,
                 %(missed_before_fill)s, %(expired_before_fill)s,
                 %(entry_delay_minutes)s, %(trade_duration_minutes)s,
                 %(realized_r)s, %(mfe_r)s, %(mae_r)s, %(slippage_bps)s,
@@ -334,6 +383,9 @@ class OutcomeRepository:
                 alert_success = excluded.alert_success,
                 tp1_hit = excluded.tp1_hit,
                 tp2_hit = excluded.tp2_hit,
+                tp3_hit = excluded.tp3_hit,
+                tp4_hit = excluded.tp4_hit,
+                outcome_classification = excluded.outcome_classification,
                 invalidated_before_fill = excluded.invalidated_before_fill,
                 missed_before_fill = excluded.missed_before_fill,
                 expired_before_fill = excluded.expired_before_fill,

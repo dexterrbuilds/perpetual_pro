@@ -52,6 +52,13 @@ TERMINAL_STATUSES = (
     "ambiguous_gap",
 )
 
+OUTCOME_PENDING_ENTRY = "pending_entry"
+OUTCOME_ACTIVE = "active"
+OUTCOME_PROFITABLE = "profitable"
+OUTCOME_NOT_PROFITABLE = "not_profitable"
+OUTCOME_NOT_ENTERED = "not_entered"
+OUTCOME_AMBIGUOUS = "ambiguous"
+
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
@@ -86,6 +93,42 @@ def _json_loads(value: Any, fallback: Any) -> Any:
     except (TypeError, ValueError):
         return fallback
     return parsed
+
+
+def _outcome_classification(
+    *,
+    status: str,
+    entered: bool,
+    highest_tp: int,
+) -> str:
+    """Return the explicit trade outcome without changing lifecycle policy."""
+    if highest_tp >= 1 and entered:
+        return OUTCOME_PROFITABLE
+    if status == "ambiguous_gap":
+        return OUTCOME_AMBIGUOUS
+    if status == "pending":
+        return OUTCOME_PENDING_ENTRY
+    if status == "entered":
+        return OUTCOME_ACTIVE
+    if not entered:
+        return OUTCOME_NOT_ENTERED
+    return OUTCOME_NOT_PROFITABLE
+
+
+def _level_hit(
+    *,
+    level: float,
+    observed_price: float,
+    occurred_at: datetime,
+    source: str,
+) -> Dict[str, Any]:
+    """Canonical exact-level observation stored in both cache and Supabase."""
+    return {
+        "level": float(level),
+        "observed_price": float(observed_price),
+        "hit_at": _iso(occurred_at),
+        "source": str(source or "market_observation"),
+    }
 
 
 def _unique_strings(values: Iterable[Any]) -> List[str]:
@@ -253,6 +296,10 @@ class SignalStore:
                     terminal_at TEXT,
                     terminal_reason TEXT,
                     technical_success INTEGER,
+                    outcome_classification TEXT NOT NULL DEFAULT 'pending_entry',
+                    profitable INTEGER NOT NULL DEFAULT 0,
+                    profitable_at TEXT,
+                    level_hits_json TEXT NOT NULL DEFAULT '{}',
                     previous_price REAL,
                     previous_price_at TEXT,
                     last_processed_candle_at TEXT,
@@ -306,6 +353,10 @@ class SignalStore:
                 "last_processed_candle_at": "TEXT",
                 "lifecycle_version": "INTEGER NOT NULL DEFAULT 0",
                 "ordering_policy": "TEXT NOT NULL DEFAULT 'observed_segment_v1'",
+                "outcome_classification": "TEXT NOT NULL DEFAULT 'pending_entry'",
+                "profitable": "INTEGER NOT NULL DEFAULT 0",
+                "profitable_at": "TEXT",
+                "level_hits_json": "TEXT NOT NULL DEFAULT '{}'",
             }
             for name, declaration in additive_signal_columns.items():
                 if name not in columns:
@@ -349,6 +400,11 @@ class SignalStore:
             [],
         )
         signal["row"] = _json_loads(signal.pop("row_json", "{}"), {})
+        signal["level_hits"] = _json_loads(
+            signal.pop("level_hits_json", "{}"),
+            {},
+        )
+        signal["profitable"] = bool(signal.get("profitable"))
         return signal
 
     @staticmethod
@@ -431,9 +487,10 @@ class SignalStore:
                   entered_at,entry_price,hold_until,highest_tp,realized_r,mfe_r,
                   mae_r,slippage_bps,last_price,last_price_at,terminal_at,
                   terminal_reason,technical_success,previous_price,previous_price_at,
-                  last_processed_candle_at,lifecycle_version,ordering_policy,row_json,
-                  created_at,updated_at
-                ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  last_processed_candle_at,lifecycle_version,ordering_policy,
+                  outcome_classification,profitable,profitable_at,level_hits_json,
+                  row_json,created_at,updated_at
+                ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                   status=excluded.status, entered_at=excluded.entered_at,
                   entry_price=excluded.entry_price, hold_until=excluded.hold_until,
@@ -445,6 +502,10 @@ class SignalStore:
                   last_processed_candle_at=excluded.last_processed_candle_at,
                   lifecycle_version=excluded.lifecycle_version,
                   ordering_policy=excluded.ordering_policy,
+                  outcome_classification=excluded.outcome_classification,
+                  profitable=excluded.profitable,
+                  profitable_at=excluded.profitable_at,
+                  level_hits_json=excluded.level_hits_json,
                   destinations_json=excluded.destinations_json,
                   row_json=excluded.row_json, updated_at=excluded.updated_at
                 """,
@@ -468,6 +529,18 @@ class SignalStore:
                     signal.get("previous_price_at"), signal.get("last_processed_candle_at"),
                     int(signal.get("lifecycle_version") or 0),
                     signal.get("ordering_policy") or "observed_segment_v1",
+                    signal.get("outcome_classification") or _outcome_classification(
+                        status=str(signal.get("status") or "pending"),
+                        entered=bool(signal.get("entered_at")),
+                        highest_tp=int(signal.get("highest_tp") or 0),
+                    ),
+                    1 if bool(signal.get("profitable")) else 0,
+                    signal.get("profitable_at"),
+                    json.dumps(
+                        dict(signal.get("level_hits") or {}),
+                        separators=(",", ":"),
+                        default=str,
+                    ),
                     json.dumps(row, separators=(",", ":"), default=str),
                     signal.get("created_at") or signal.get("generated_at"),
                     signal.get("updated_at") or _iso(_utc_now()),
@@ -491,16 +564,23 @@ class SignalStore:
             rows = self._connection.execute(
                 """
                 SELECT confidence, status, realized_r, generated_at, entered_at,
-                       terminal_at, slippage_bps, mfe_r, mae_r, highest_tp
+                       terminal_at, slippage_bps, mfe_r, mae_r, highest_tp,
+                       outcome_classification, profitable
                 FROM signals
                 WHERE status IN (
                     'completed', 'stopped', 'time_exit',
-                    'missed', 'expired', 'invalidated'
+                    'missed', 'expired', 'invalidated', 'ambiguous_gap'
                 )
                   AND terminal_at IS NOT NULL
                 ORDER BY terminal_at
                 """
             ).fetchall()
+        ambiguous_count = sum(
+            1 for row in rows if str(row["status"]) == "ambiguous_gap"
+        )
+        evaluable_rows = [
+            row for row in rows if str(row["status"]) != "ambiguous_gap"
+        ]
         bands = [
             ("80–84%", 80.0, 85.0),
             ("85–89%", 85.0, 90.0),
@@ -511,7 +591,7 @@ class SignalStore:
         for label, lower, upper in bands:
             selected = [
                 row
-                for row in rows
+                for row in evaluable_rows
                 if lower <= safe_float(row["confidence"]) < upper
             ]
             sample = len(selected)
@@ -610,7 +690,26 @@ class SignalStore:
                     "calibration_ready": sample >= 50,
                 }
             )
-        total = len(rows)
+        total = len(evaluable_rows)
+        target_hits = {
+            f"tp{target}_hit": sum(
+                1 for row in evaluable_rows if int(row["highest_tp"] or 0) >= target
+            )
+            for target in range(1, 5)
+        }
+        classification_counts: Dict[str, int] = {}
+        for row in rows:
+            classification = str(
+                row["outcome_classification"]
+                or _outcome_classification(
+                    status=str(row["status"]),
+                    entered=bool(row["entered_at"]),
+                    highest_tp=int(row["highest_tp"] or 0),
+                )
+            )
+            classification_counts[classification] = (
+                classification_counts.get(classification, 0) + 1
+            )
         return {
             "status": (
                 "enough_data_for_initial_calibration"
@@ -618,6 +717,9 @@ class SignalStore:
                 else "collecting_forward_outcomes"
             ),
             "completed_outcomes": total,
+            "ambiguous_outcomes": ambiguous_count,
+            "outcome_classifications": classification_counts,
+            "target_hits": target_hits,
             "minimum_samples_per_band": 50,
             "brier_score_diagnostic": (
                 round(sum(brier_terms) / len(brier_terms), 4)
@@ -787,10 +889,11 @@ class SignalStore:
                     stop_loss, take_profits_json, destinations_json, generated_at,
                     valid_until, entered_at, entry_price, hold_until, highest_tp,
                     realized_r, mfe_r, mae_r, slippage_bps, last_price,
-                    last_price_at, row_json, created_at, updated_at
+                    last_price_at, outcome_classification, profitable,
+                    profitable_at, level_hits_json, row_json, created_at, updated_at
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    0, 0, 0, 0, ?, ?, ?, ?, ?, ?
+                    0, 0, 0, 0, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -817,6 +920,8 @@ class SignalStore:
                     slippage_bps,
                     initial_price if initial_price > 0 else None,
                     now_iso if initial_price > 0 else None,
+                    OUTCOME_PENDING_ENTRY,
+                    json.dumps({}, separators=(",", ":")),
                     json.dumps(row, separators=(",", ":"), default=str),
                     now_iso,
                     now_iso,
@@ -919,12 +1024,59 @@ class SignalStore:
     ) -> None:
         details = dict(payload or {})
         details.setdefault("reason", reason)
+        highest_tp = int(details.get("highest_tp") or signal.get("highest_tp") or 0)
+        entered = bool(signal.get("entered_at"))
+        classification = _outcome_classification(
+            status=status,
+            entered=entered,
+            highest_tp=highest_tp,
+        )
+        profitable = classification == OUTCOME_PROFITABLE
+        profitable_at = signal.get("profitable_at")
+        if profitable and not profitable_at:
+            profitable_at = _iso(timestamp)
+        level_hits = dict(signal.get("level_hits") or {})
+        if event_type == "stopped" and price is not None:
+            level_hits.setdefault(
+                "SL",
+                _level_hit(
+                    level=safe_float(signal.get("stop_loss")),
+                    observed_price=price,
+                    occurred_at=timestamp,
+                    source="market_observation",
+                ),
+            )
+            details.setdefault("stop_level", safe_float(signal.get("stop_loss")))
+        elif event_type == "protected_exit" and price is not None:
+            level_hits.setdefault(
+                "PROTECTED_EXIT",
+                _level_hit(
+                    level=safe_float(signal.get("entry_price")),
+                    observed_price=price,
+                    occurred_at=timestamp,
+                    source="market_observation",
+                ),
+            )
+        elif event_type == "invalidated" and price is not None:
+            level_hits.setdefault(
+                "PRE_ENTRY_INVALIDATION",
+                _level_hit(
+                    level=safe_float(signal.get("stop_loss")),
+                    observed_price=price,
+                    occurred_at=timestamp,
+                    source="closed_candle",
+                ),
+            )
+        details.setdefault("outcome_classification", classification)
+        details.setdefault("profitable", profitable)
         self._connection.execute(
             """
             UPDATE signals
             SET status = ?, terminal_at = ?, terminal_reason = ?,
                 last_price = COALESCE(?, last_price),
                 last_price_at = COALESCE(?, last_price_at),
+                outcome_classification = ?, profitable = ?, profitable_at = ?,
+                level_hits_json = ?,
                 updated_at = ?
             WHERE id = ?
             """,
@@ -934,6 +1086,10 @@ class SignalStore:
                 reason,
                 price,
                 _iso(timestamp) if price is not None else None,
+                classification,
+                1 if profitable else 0,
+                profitable_at,
+                json.dumps(level_hits, separators=(",", ":"), default=str),
                 _iso(timestamp),
                 signal["id"],
             ),
@@ -969,12 +1125,21 @@ class SignalStore:
             * 10_000.0
             * direction_sign
         )
+        level_hits = dict(signal.get("level_hits") or {})
+        level_hits["ENTRY"] = _level_hit(
+            level=price,
+            observed_price=price,
+            occurred_at=timestamp,
+            source=source,
+        )
         self._connection.execute(
             """
             UPDATE signals
             SET status = 'entered', entered_at = ?, entry_price = ?,
                 hold_until = ?, slippage_bps = ?, mfe_r = 0, mae_r = 0,
-                last_price = ?, last_price_at = ?, updated_at = ?
+                last_price = ?, last_price_at = ?,
+                outcome_classification = ?, profitable = 0,
+                level_hits_json = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -984,6 +1149,8 @@ class SignalStore:
                 slippage_bps,
                 price,
                 _iso(timestamp),
+                OUTCOME_ACTIVE,
+                json.dumps(level_hits, separators=(",", ":"), default=str),
                 _iso(timestamp),
                 signal["id"],
             ),
@@ -1012,6 +1179,9 @@ class SignalStore:
                 "slippage_bps": slippage_bps,
                 "mfe_r": 0.0,
                 "mae_r": 0.0,
+                "outcome_classification": OUTCOME_ACTIVE,
+                "profitable": False,
+                "level_hits": level_hits,
             }
         )
         return signal
@@ -1287,11 +1457,26 @@ class SignalStore:
                         )
                     completed = new_highest >= len(signal["take_profits"])
                     status = "completed" if completed else "entered"
+                    level_hits = dict(signal.get("level_hits") or {})
+                    newly_hit_records: List[Dict[str, Any]] = []
+                    for index in range(old_highest + 1, new_highest + 1):
+                        target_level = safe_float(signal["take_profits"][index - 1])
+                        record = _level_hit(
+                            level=target_level,
+                            observed_price=price,
+                            occurred_at=timestamp,
+                            source=source,
+                        )
+                        level_hits[f"TP{index}"] = record
+                        newly_hit_records.append({"tp_number": index, **record})
+                    profitable_at = signal.get("profitable_at") or _iso(timestamp)
                     self._connection.execute(
                         """
                         UPDATE signals
                         SET highest_tp = ?, realized_r = ?, status = ?,
-                            terminal_at = ?, terminal_reason = ?, updated_at = ?
+                            terminal_at = ?, terminal_reason = ?,
+                            outcome_classification = ?, profitable = 1,
+                            profitable_at = ?, level_hits_json = ?, updated_at = ?
                         WHERE id = ?
                         """,
                         (
@@ -1300,6 +1485,13 @@ class SignalStore:
                             status,
                             _iso(timestamp) if completed else None,
                             "Final target traded" if completed else None,
+                            OUTCOME_PROFITABLE,
+                            profitable_at,
+                            json.dumps(
+                                level_hits,
+                                separators=(",", ":"),
+                                default=str,
+                            ),
                             _iso(timestamp),
                             signal["id"],
                         ),
@@ -1314,12 +1506,16 @@ class SignalStore:
                             "newly_hit": list(
                                 range(old_highest + 1, new_highest + 1)
                             ),
+                            "target_hits": newly_hit_records,
                             "target_price": safe_float(
                                 signal["take_profits"][new_highest - 1]
                             ),
                             "realized_r": realized_r,
                             "mfe_r": mfe_r,
                             "mae_r": mae_r,
+                            "outcome_classification": OUTCOME_PROFITABLE,
+                            "profitable": True,
+                            "profitable_at": profitable_at,
                         },
                         signal["destinations"],
                     )

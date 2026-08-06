@@ -180,6 +180,15 @@ class LifecycleRepository:
         lifecycle_state = self._state_payload(signal)
         lifecycle_state["remaining_size"] = remaining_size
         lifecycle_state["protected"] = protected
+        profitable = bool(signal.get("profitable") or highest_tp >= 1)
+        outcome_classification = str(
+            signal.get("outcome_classification")
+            or ("profitable" if profitable else "pending_entry")
+        )
+        level_hits = dict(signal.get("level_hits") or {})
+        lifecycle_state["profitable"] = profitable
+        lifecycle_state["outcome_classification"] = outcome_classification
+        lifecycle_state["level_hits"] = level_hits
         params = {
             "signal_id": signal.get("id"),
             "candidate_id": row.get("candidate_id"),
@@ -220,6 +229,10 @@ class LifecycleRepository:
             "ordering_policy": signal.get("ordering_policy") or "observed_segment_v1",
             "ambiguous_gap": str(signal.get("status")) == "ambiguous_gap",
             "technical_success": signal.get("technical_success"),
+            "outcome_classification": outcome_classification,
+            "profitable": profitable,
+            "profitable_at": signal.get("profitable_at"),
+            "level_hits": Jsonb(level_hits),
             "terminal_reason": signal.get("terminal_reason"),
             "lifecycle_version": int(signal.get("lifecycle_version") or 0),
             "lifecycle_schema_version": LIFECYCLE_SCHEMA_VERSION,
@@ -240,6 +253,7 @@ class LifecycleRepository:
               last_price, last_price_at, previous_price, previous_price_at,
               last_processed_candle_at, ordering_policy, ambiguous_gap,
               technical_success, terminal_reason, lifecycle_version,
+              outcome_classification, profitable, profitable_at, level_hits,
               lifecycle_schema_version, feature_schema_version,
               execution_policy_version, rank_policy_version, signal_payload,
               lifecycle_state, updated_at
@@ -256,6 +270,8 @@ class LifecycleRepository:
               %(previous_price)s, %(previous_price_at)s,
               %(last_processed_candle_at)s, %(ordering_policy)s, %(ambiguous_gap)s,
               %(technical_success)s, %(terminal_reason)s, %(lifecycle_version)s,
+              %(outcome_classification)s, %(profitable)s, %(profitable_at)s,
+              %(level_hits)s,
               %(lifecycle_schema_version)s, %(feature_schema_version)s,
               %(execution_policy_version)s, %(rank_policy_version)s,
               %(signal_payload)s, %(lifecycle_state)s, now()
@@ -275,6 +291,10 @@ class LifecycleRepository:
               last_processed_candle_at=excluded.last_processed_candle_at,
               ambiguous_gap=excluded.ambiguous_gap,
               technical_success=excluded.technical_success,
+              outcome_classification=excluded.outcome_classification,
+              profitable=excluded.profitable,
+              profitable_at=excluded.profitable_at,
+              level_hits=excluded.level_hits,
               terminal_reason=excluded.terminal_reason,
               lifecycle_version=excluded.lifecycle_version,
               lifecycle_schema_version=excluded.lifecycle_schema_version,
