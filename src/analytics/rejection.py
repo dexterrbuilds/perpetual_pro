@@ -361,6 +361,7 @@ _HARD_FAILURE_CODES = {
     "reversal_confirmation_insufficient": "REVERSAL_CONFIRMATION_INSUFFICIENT",
     "cmp_position_excessively_extended_inside_zone": "PRICE_TOO_EXTENDED",
     "adverse_structure_change_before_confirmation": "STRUCTURE_CONFLICT",
+    "setup_confirmation_insufficient": "STRUCTURE_CONFLICT",
 }
 
 

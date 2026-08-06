@@ -47,6 +47,33 @@ class ExecutionQualityPolicy:
                 "stop_quality": 0.12, "target_feasibility": 0.12,
                 "liquidity_cost_quality": 0.08, "data_market_quality": 0.06,
             },
+            # New setup families reuse the same eight independent components;
+            # only their emphasis changes. Global quality floors and hard
+            # gates remain unchanged.
+            "trend_pullback": {
+                "entry_accessibility": 0.20, "entry_zone_quality": 0.12,
+                "pre_entry_survival": 0.18, "confirmation_quality": 0.10,
+                "stop_quality": 0.13, "target_feasibility": 0.13,
+                "liquidity_cost_quality": 0.08, "data_market_quality": 0.06,
+            },
+            "breakout_retest": {
+                "entry_accessibility": 0.19, "entry_zone_quality": 0.12,
+                "pre_entry_survival": 0.17, "confirmation_quality": 0.13,
+                "stop_quality": 0.12, "target_feasibility": 0.13,
+                "liquidity_cost_quality": 0.08, "data_market_quality": 0.06,
+            },
+            "ob_fvg_retest": {
+                "entry_accessibility": 0.20, "entry_zone_quality": 0.16,
+                "pre_entry_survival": 0.18, "confirmation_quality": 0.09,
+                "stop_quality": 0.12, "target_feasibility": 0.11,
+                "liquidity_cost_quality": 0.08, "data_market_quality": 0.06,
+            },
+            "liquidity_sweep": {
+                "entry_accessibility": 0.12, "entry_zone_quality": 0.12,
+                "pre_entry_survival": 0.17, "confirmation_quality": 0.22,
+                "stop_quality": 0.15, "target_feasibility": 0.11,
+                "liquidity_cost_quality": 0.06, "data_market_quality": 0.05,
+            },
             "breakout_continuation": {
                 "entry_accessibility": 0.14, "entry_zone_quality": 0.08,
                 "pre_entry_survival": 0.12, "confirmation_quality": 0.18,

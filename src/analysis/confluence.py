@@ -26,6 +26,7 @@ from src.analysis.llm import (
 from src.analysis.market_structure import MarketStructureAnalyzer, StructureReport
 from src.analysis.patterns import PatternDetector, PatternReport
 from src.analysis.risk import RiskManager, ScenarioSet, TradePlan
+from src.analysis.setups import detect_strict_setup
 from src.data.exchange import MarketSnapshot
 from src.data.multi_tf import MultiTimeframeData
 from src.data.news import NewsBundle
@@ -324,9 +325,26 @@ class ConfluenceEngine:
         result.technical_confidence = conf
         result.confidence = conf
 
-        # Strategy tags (prop-style playbook)
+        # Strategy tags and strict closed-candle setup recognition. Detection
+        # classifies an already-directional thesis; it cannot create direction
+        # or bypass any downstream quality/safety gate.
         result.strategy_tags = self._strategy_tags(ind, struct, pat, mtf, direction, conf)
-        result.setup_name = self._setup_name(result.strategy_tags, direction, struct)
+        strict_setup = detect_strict_setup(
+            primary,
+            ind,
+            struct,
+            direction=direction,
+            price=closed_price,
+            atr=atr,
+        )
+        if strict_setup is not None:
+            result.strategy_tags.extend(
+                [strict_setup.setup_type, "strict_setup_confirmed"]
+            )
+            result.strategy_tags = list(dict.fromkeys(result.strategy_tags))
+            result.setup_name = strict_setup.label
+        else:
+            result.setup_name = self._setup_name(result.strategy_tags, direction, struct)
 
         # Key levels for plan
         support, resistance = self._nearest_levels(struct, price)
@@ -828,6 +846,9 @@ class ConfluenceEngine:
             "live_move_pct": round(live_move_pct, 3),
             "holding_window": "30m–24h",
             "indicator_timeframes_computed": sorted(indicator_suites),
+            "strict_setup_detection": (
+                strict_setup.to_dict() if strict_setup is not None else None
+            ),
         }
         logger.info(
             "Analysis {} {} bias={} tech={:.1f}% llm={:.1f}% rank={:.1f} score={:.3f} lev={:.1f}x",
@@ -1060,7 +1081,6 @@ class ConfluenceEngine:
         )
         if bos_agrees:
             tags.append("breakout" if struct.last_bos == "bullish" else "breakdown")
-            tags.append("breakout_retest")
         if abs(mom) > 0.25:
             tags.append("momentum")
         if vol_ratio >= 1.25:
@@ -1068,7 +1088,7 @@ class ConfluenceEngine:
         if any(p.bias in ("bullish", "bearish") and p.kind == "candlestick" for p in pat.hits[:3]):
             names = " ".join(p.name.lower() for p in pat.hits[:3])
             if any(x in names for x in ("engulf", "star", "hammer", "shooting", "marubozu")):
-                tags.append("reversal")
+                tags.append("reversal_pattern")
 
         # Horizon — prefer intraday horizons: 15m, 1h, 4h
         if mins <= 5:
@@ -1101,7 +1121,7 @@ class ConfluenceEngine:
             return "No Trade / Stand Aside"
         side = "Long" if direction == "long" else "Short"
         wanted = "bullish" if direction == "long" else "bearish"
-        if "reversal" in tags and struct.last_choch == wanted:
+        if "confirmed_reversal" in tags and struct.last_choch == wanted:
             return f"{side} Confirmed Reversal"
         if "mean_reversion" in tags and struct.trend == "range":
             return f"{side} Range Mean Reversion"

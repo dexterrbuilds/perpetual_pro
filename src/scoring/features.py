@@ -94,6 +94,15 @@ def canonical_setup_type(
         ]
     ).lower()
     status = str(entry_status or "").lower()
+    # New deterministic setup labels map into the existing schema-3.0 feature
+    # families. This preserves training compatibility while the exact live
+    # setup name/type remains persisted separately.
+    if "liquidity sweep" in blob or "liquidity_sweep" in blob:
+        return "structure_reversal"
+    if "order block / fvg" in blob or "ob_fvg_retest" in blob:
+        return "trend_pullback"
+    if "counter-trend reversal" in blob:
+        return "structure_reversal"
     if "mean reversion" in blob or "mean_reversion" in blob:
         return "mean_reversion"
     if "range" in blob or "rejection" in blob:

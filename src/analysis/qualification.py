@@ -140,7 +140,10 @@ CHECK_REGISTRY: Dict[str, CheckPolicy] = {
     "ENTRY_BLOCKED": _policy("entry_state", "Valid live entry state", "hard", [_ANALYSIS, _ALERT, _EXECUTION, _REVALIDATION]),
     "CONFIRMATION_PENDING": _policy(
         "entry_state", "Valid live entry state", "hard", [_ANALYSIS, _ALERT, _EXECUTION],
-        duplicate_group="entry_state", setup_types=("cmp_confirmation", "breakout_continuation"),
+        duplicate_group="entry_state", setup_types=(
+            "cmp_confirmation", "breakout_continuation", "trend_pullback",
+            "breakout_retest", "ob_fvg_retest", "liquidity_sweep", "reversal",
+        ),
     ),
     "ENTRY_EXPIRED": _policy("entry_expiry", "Entry not expired", "hard", [_ALERT, _REVALIDATION]),
     "INVALIDATED_BEFORE_ENTRY": _policy("entry_invalidation", "Entry thesis not invalidated", "hard", [_ALERT, _EXECUTION, _REVALIDATION]),

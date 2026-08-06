@@ -19,6 +19,7 @@ from src.analysis.execution_policy import (
     weighted_execution_quality,
 )
 from src.analysis.market_structure import StructureLevel, StructureReport
+from src.analysis.setups import SETUP_POLICY_VERSION, detect_strict_setup
 from src.utils.helpers import clamp, safe_float
 
 
@@ -54,6 +55,8 @@ class ExecutionProfile:
     legacy_targets: List[float] = field(default_factory=list)
     policy_version: str = DEFAULT_EXECUTION_POLICY.version
     setup_type: str = "retest_continuation"
+    setup_policy_version: str = SETUP_POLICY_VERSION
+    setup_evidence: Dict[str, Any] = field(default_factory=dict)
     entry_mode: str = "retest"
     components: Dict[str, float] = field(default_factory=dict)
     component_contributions: Dict[str, float] = field(default_factory=dict)
@@ -227,6 +230,30 @@ def build_execution_profile(
 
     candle = analyze_candles(df, atr, direction)
     setup_type = _canonical_setup_type(setup_name, strategy_tags or [], structure)
+    strict_setup_tagged = "strict_setup_confirmed" in (strategy_tags or [])
+    strict_detection = (
+        detect_strict_setup(
+            df,
+            indicators,
+            structure,
+            direction=direction,
+            price=safe_float(
+                (indicators.summary or {}).get("close"),
+                safe_float(df["close"].iloc[-1], price),
+            ),
+            atr=atr,
+            candle=candle,
+        )
+        if strict_setup_tagged
+        else None
+    )
+    strict_setup_confirmed = bool(
+        not strict_setup_tagged
+        or (
+            strict_detection is not None
+            and strict_detection.setup_type == setup_type
+        )
+    )
     wanted_structure = "bullish" if direction == "long" else "bearish"
     if (
         setup_type == "retest_continuation"
@@ -237,6 +264,42 @@ def build_execution_profile(
     ):
         setup_type = "breakout_continuation"
     anchors = _entry_anchors(indicators, structure, direction, price, atr, policy)
+    if setup_type == "trend_pullback":
+        pullback_anchors = [
+            anchor for anchor in anchors
+            if anchor.source in {"EMA 21", "session VWAP", "EMA fast"}
+        ]
+        if pullback_anchors:
+            anchors = pullback_anchors
+    elif setup_type == "ob_fvg_retest":
+        structural_anchors = [
+            anchor for anchor in anchors
+            if anchor.source in {"order_block", "fvg"}
+        ]
+        if structural_anchors:
+            anchors = structural_anchors
+    if strict_detection is not None:
+        evidence = strict_detection.evidence
+        derived_level = safe_float(
+            evidence.get("breakout_level") or evidence.get("swept_level")
+        )
+        if derived_level > 0 and abs(derived_level - price) <= atr * 2.2:
+            derived_anchor = EntryAnchor(
+                derived_level,
+                derived_level,
+                derived_level,
+                (
+                    "confirmed breakout retest"
+                    if setup_type == "breakout_retest"
+                    else "swept liquidity reclaim"
+                ),
+                0.92,
+            )
+            nearby = [
+                item for item in anchors
+                if abs(item.mid - derived_level) <= atr * 0.28
+            ]
+            anchors = [derived_anchor, *nearby]
     anchor, anchor_sources, anchor_bounds, cluster_strength, anchor_health = _select_anchor(
         anchors, direction, price, atr, policy
     )
@@ -515,6 +578,8 @@ def build_execution_profile(
         hard_failures.append("range_setup_during_trend_expansion")
     if setup_type == "reversal" and not _reversal_confirmed(direction, structure, candle):
         hard_failures.append("reversal_confirmation_insufficient")
+    if not strict_setup_confirmed:
+        hard_failures.append("setup_confirmation_insufficient")
     zone_position = (price - entry_low) / max(entry_high - entry_low, 1e-12)
     if inside and setup_type in ("cmp_confirmation", "breakout_continuation"):
         acceptable = zone_position <= 0.80 if direction == "long" else zone_position >= 0.20
@@ -542,6 +607,8 @@ def build_execution_profile(
         f"Order-flow approximation {candle.order_flow_score:+.2f}",
         f"Execution Quality {score:.0f}/100 ({policy.version})",
     ]
+    if strict_detection is not None:
+        reasons.extend(strict_detection.reasons[:1])
     if spread_bps is not None:
         reasons.append(
             f"L2 spread {spread_bps:.2f} bps; book alignment {book_alignment:+.2f}"
@@ -606,6 +673,10 @@ def build_execution_profile(
         legacy_targets=[float(x) for x in legacy_targets],
         policy_version=policy.version,
         setup_type=setup_type,
+        setup_policy_version=SETUP_POLICY_VERSION,
+        setup_evidence=(
+            dict(strict_detection.evidence) if strict_detection is not None else {}
+        ),
         entry_mode=("cmp_confirmation" if (inside or breakout_cmp) else "retest"),
         components=components,
         component_contributions=contributions,
@@ -848,6 +919,14 @@ def _canonical_setup_type(
     structure: StructureReport,
 ) -> str:
     text = " ".join([setup_name.lower(), *(str(tag).lower() for tag in tags)])
+    if "trend_pullback" in text or "trend continuation" in text:
+        return "trend_pullback"
+    if "liquidity_sweep" in text or "liquidity sweep" in text:
+        return "liquidity_sweep"
+    if "ob_fvg_retest" in text or "order block / fvg" in text:
+        return "ob_fvg_retest"
+    if "breakout_retest" in text or "breakout + retest" in text:
+        return "breakout_retest"
     if "reversal" in text:
         return "reversal"
     if "mean_reversion" in text or "mean reversion" in text or "range" in text:
