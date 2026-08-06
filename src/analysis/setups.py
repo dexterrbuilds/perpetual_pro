@@ -9,7 +9,9 @@ risk, qualification, and pre-delivery revalidation pipeline.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -19,7 +21,8 @@ from src.analysis.market_structure import StructureLevel, StructureReport
 from src.utils.helpers import clamp, safe_float
 
 
-SETUP_POLICY_VERSION = "strict_intraday_setups_v1"
+SETUP_POLICY_VERSION = "strict_intraday_setups_v2"
+UTC = timezone.utc
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,24 @@ class StrictSetupPolicy:
     zone_max_mitigation: float = 0.75
     zone_touch_buffer_atr: float = 0.08
     zone_min_candle_score: float = 0.10
+
+    opening_range_minutes: int = 30
+    opening_range_window_minutes: int = 120
+    opening_range_min_width_atr: float = 0.35
+    opening_range_max_width_atr: float = 2.50
+    opening_range_min_breakout_atr: float = 0.06
+    opening_range_min_volume_ratio: float = 1.20
+    opening_range_max_retest_distance_atr: float = 0.15
+    opening_range_min_reclaim_atr: float = 0.02
+    opening_range_min_bias_score: float = 0.15
+    opening_range_min_momentum: float = 0.10
+
+    session_rejection_min_wick: float = 0.35
+    session_rejection_min_volume_ratio: float = 1.10
+    session_rejection_min_breach_atr: float = 0.02
+    session_rejection_min_reclaim_atr: float = 0.02
+    session_rejection_min_candle_score: float = 0.15
+    session_rejection_min_bias_score: float = 0.12
 
 
 DEFAULT_STRICT_SETUP_POLICY = StrictSetupPolicy()
@@ -160,6 +181,13 @@ def detect_strict_setup(
         trend.label = f"{side} Trend Continuation (Pullback)"
         return trend
 
+    opening_range = _opening_range_breakout(
+        df, indicators, structure, direction, atr, candle, policy
+    )
+    if opening_range is not None:
+        opening_range.label = f"{side} Opening Range Breakout"
+        return opening_range
+
     breakout = _breakout_retest(df, direction, atr, candle, policy)
     if breakout is not None:
         breakout.label = f"{side} Breakout + Retest"
@@ -169,6 +197,13 @@ def detect_strict_setup(
     if zone is not None:
         zone.label = f"{side} Order Block / FVG Retest"
         return zone
+
+    session_rejection = _session_high_low_rejection(
+        df, indicators, structure, direction, atr, candle, policy
+    )
+    if session_rejection is not None:
+        session_rejection.label = f"{side} Session High/Low Rejection"
+        return session_rejection
 
     sweep = _liquidity_sweep(df, direction, atr, candle, policy)
     if sweep is not None:
@@ -230,6 +265,315 @@ def _trend_pullback(
             "pullback_distance_atr": round(pullback_distance, 3),
             "candle_score": round(candle.score, 3),
             "directional_momentum": round(momentum, 3),
+        },
+    )
+
+
+@dataclass(frozen=True)
+class _SessionInterval:
+    name: str
+    start: datetime
+    end: datetime
+
+
+def _closed_candle_timing(df: pd.DataFrame) -> Optional[tuple[datetime, timedelta]]:
+    if df is None or len(df) < 3 or not isinstance(df.index, pd.DatetimeIndex):
+        return None
+    index = pd.DatetimeIndex(df.index)
+    if index.tz is None:
+        index = index.tz_localize(UTC)
+    else:
+        index = index.tz_convert(UTC)
+    differences = index.to_series().diff().dropna()
+    if differences.empty:
+        return None
+    candle_delta = differences.median().to_pytimedelta()
+    if candle_delta <= timedelta(0) or candle_delta > timedelta(minutes=30):
+        return None
+    last_open = index[-1].to_pydatetime().astimezone(UTC)
+    return last_open + candle_delta, candle_delta
+
+
+def _local_datetime(day: date, zone: str, hour: int, minute: int = 0) -> datetime:
+    return datetime.combine(
+        day,
+        time(hour=hour, minute=minute),
+        tzinfo=ZoneInfo(zone),
+    ).astimezone(UTC)
+
+
+def _opening_session(
+    closed_at: datetime,
+    policy: StrictSetupPolicy,
+) -> Optional[_SessionInterval]:
+    """Return only an active London or New York ORB window."""
+    definitions = (
+        ("London", "Europe/London", 8, 0),
+        ("New York", "America/New_York", 9, 30),
+    )
+    for name, zone, hour, minute in definitions:
+        local_day = closed_at.astimezone(ZoneInfo(zone)).date()
+        opened = _local_datetime(local_day, zone, hour, minute)
+        range_end = opened + timedelta(minutes=policy.opening_range_minutes)
+        activation_end = opened + timedelta(
+            minutes=policy.opening_range_window_minutes
+        )
+        if range_end <= closed_at <= activation_end:
+            return _SessionInterval(name=name, start=opened, end=range_end)
+    return None
+
+
+def _opening_range_breakout(
+    df: pd.DataFrame,
+    indicators: IndicatorSuite,
+    structure: StructureReport,
+    direction: str,
+    atr: float,
+    candle: Any,
+    policy: StrictSetupPolicy,
+) -> Optional[SetupDetection]:
+    timing = _closed_candle_timing(df)
+    if timing is None:
+        return None
+    closed_at, candle_delta = timing
+    session = _opening_session(closed_at, policy)
+    if session is None:
+        return None
+    index = pd.DatetimeIndex(df.index)
+    index = index.tz_localize(UTC) if index.tz is None else index.tz_convert(UTC)
+    work = df.copy()
+    work.index = index
+    range_candles = work[
+        (work.index >= session.start)
+        & ((work.index + candle_delta) <= session.end)
+    ]
+    minimum_range_candles = max(
+        1,
+        int(policy.opening_range_minutes / max(candle_delta.total_seconds() / 60, 1)),
+    )
+    if len(range_candles) < minimum_range_candles:
+        return None
+    range_high = float(range_candles["high"].max())
+    range_low = float(range_candles["low"].min())
+    range_width_atr = (range_high - range_low) / atr
+    if not (
+        policy.opening_range_min_width_atr
+        <= range_width_atr
+        <= policy.opening_range_max_width_atr
+    ):
+        return None
+
+    post_range = work[(work.index + candle_delta) > session.end]
+    if len(post_range) < 2:
+        return None
+    last = post_range.iloc[-1]
+    breakout_rows = post_range.iloc[:-1]
+    breakout: Optional[pd.Series] = None
+    breakout_time: Optional[pd.Timestamp] = None
+    breakout_volume_ratio = 0.0
+    level = range_high if direction == "long" else range_low
+    for timestamp, candidate in breakout_rows.tail(6).iterrows():
+        history = work[work.index < timestamp].tail(30)
+        volume_base = max(float(history["volume"].median()), 1e-12)
+        volume_ratio = float(candidate["volume"]) / volume_base
+        displacement = (
+            (float(candidate["close"]) - level) / atr
+            if direction == "long"
+            else (level - float(candidate["close"])) / atr
+        )
+        if (
+            displacement >= policy.opening_range_min_breakout_atr
+            and volume_ratio >= policy.opening_range_min_volume_ratio
+        ):
+            breakout = candidate
+            breakout_time = timestamp
+            breakout_volume_ratio = volume_ratio
+    if breakout is None or breakout_time is None:
+        return None
+
+    if direction == "long":
+        retest_distance = abs(float(last["low"]) - level) / atr
+        reclaim = (float(last["close"]) - level) / atr
+    else:
+        retest_distance = abs(float(last["high"]) - level) / atr
+        reclaim = (level - float(last["close"])) / atr
+    sign = 1.0 if direction == "long" else -1.0
+    summary = indicators.summary or {}
+    directional_bias = sign * (
+        0.55 * safe_float(summary.get("trend_score"))
+        + 0.45 * safe_float(summary.get("momentum_score"))
+    )
+    momentum = sign * safe_float(summary.get("momentum_score"))
+    wanted = "bullish" if direction == "long" else "bearish"
+    wanted_trend = "up" if direction == "long" else "down"
+    structure_supports = bool(
+        structure.last_bos == wanted
+        or structure.last_choch == wanted
+        or structure.trend == wanted_trend
+    )
+    if not (
+        retest_distance <= policy.opening_range_max_retest_distance_atr
+        and reclaim >= policy.opening_range_min_reclaim_atr
+        and candle.score >= policy.breakout_min_candle_score
+        and not candle.adverse_rejection
+        and directional_bias >= policy.opening_range_min_bias_score
+        and momentum >= policy.opening_range_min_momentum
+        and structure_supports
+    ):
+        return None
+    return SetupDetection(
+        setup_type="opening_range_breakout",
+        passed=True,
+        reasons=[
+            f"{session.name} 30-minute range broke on volume and passed a separate retest"
+        ],
+        evidence={
+            "session": session.name,
+            "session_open": session.start.isoformat(),
+            "opening_range_end": session.end.isoformat(),
+            "opening_range_high": range_high,
+            "opening_range_low": range_low,
+            "opening_range_width_atr": round(range_width_atr, 3),
+            "breakout_level": level,
+            "breakout_time": breakout_time.isoformat(),
+            "breakout_volume_ratio": round(breakout_volume_ratio, 3),
+            "retest_distance_atr": round(retest_distance, 3),
+            "reclaim_atr": round(reclaim, 3),
+            "directional_bias": round(directional_bias, 3),
+            "directional_momentum": round(momentum, 3),
+            "invalidation_level": (
+                float(last["low"]) if direction == "long" else float(last["high"])
+            ),
+        },
+    )
+
+
+def _major_session_intervals(reference: datetime) -> List[_SessionInterval]:
+    """DST-aware completed sessions used only for prior-session levels."""
+    intervals: List[_SessionInterval] = []
+    for offset in range(-3, 2):
+        day = (reference + timedelta(days=offset)).date()
+        london_open = _local_datetime(day, "Europe/London", 8)
+        new_york_open = _local_datetime(day, "America/New_York", 9, 30)
+        intervals.extend(
+            [
+                _SessionInterval(
+                    "Asia",
+                    datetime.combine(day, time(0), tzinfo=UTC),
+                    london_open,
+                ),
+                _SessionInterval("London", london_open, new_york_open),
+                _SessionInterval(
+                    "New York",
+                    new_york_open,
+                    _local_datetime(day, "America/New_York", 16),
+                ),
+            ]
+        )
+    return sorted(intervals, key=lambda item: item.end)
+
+
+def _previous_session_range(
+    df: pd.DataFrame,
+    closed_at: datetime,
+    candle_delta: timedelta,
+) -> Optional[tuple[_SessionInterval, float, float]]:
+    index = pd.DatetimeIndex(df.index)
+    index = index.tz_localize(UTC) if index.tz is None else index.tz_convert(UTC)
+    work = df.copy()
+    work.index = index
+    for session in reversed(_major_session_intervals(closed_at)):
+        if session.end > closed_at:
+            continue
+        candles = work[
+            (work.index >= session.start)
+            & ((work.index + candle_delta) <= session.end)
+        ]
+        if len(candles) >= 4:
+            return (
+                session,
+                float(candles["high"].max()),
+                float(candles["low"].min()),
+            )
+    return None
+
+
+def _session_high_low_rejection(
+    df: pd.DataFrame,
+    indicators: IndicatorSuite,
+    structure: StructureReport,
+    direction: str,
+    atr: float,
+    candle: Any,
+    policy: StrictSetupPolicy,
+) -> Optional[SetupDetection]:
+    timing = _closed_candle_timing(df)
+    if timing is None:
+        return None
+    closed_at, candle_delta = timing
+    previous = _previous_session_range(df, closed_at, candle_delta)
+    if previous is None:
+        return None
+    session, previous_high, previous_low = previous
+    last = df.iloc[-1]
+    if direction == "long":
+        rejected_level = previous_low
+        opposite_level = previous_high
+        breach = (rejected_level - float(last["low"])) / atr
+        reclaim = (float(last["close"]) - rejected_level) / atr
+        wick = candle.lower_wick_ratio
+        invalidation = float(last["low"])
+    else:
+        rejected_level = previous_high
+        opposite_level = previous_low
+        breach = (float(last["high"]) - rejected_level) / atr
+        reclaim = (rejected_level - float(last["close"])) / atr
+        wick = candle.upper_wick_ratio
+        invalidation = float(last["high"])
+    sign = 1.0 if direction == "long" else -1.0
+    summary = indicators.summary or {}
+    directional_bias = sign * (
+        0.55 * safe_float(summary.get("trend_score"))
+        + 0.45 * safe_float(summary.get("momentum_score"))
+    )
+    wanted = "bullish" if direction == "long" else "bearish"
+    wanted_trend = "up" if direction == "long" else "down"
+    structure_supports = bool(
+        structure.last_bos == wanted
+        or structure.last_choch == wanted
+        or structure.trend == wanted_trend
+    )
+    if not (
+        breach >= policy.session_rejection_min_breach_atr
+        and reclaim >= policy.session_rejection_min_reclaim_atr
+        and wick >= policy.session_rejection_min_wick
+        and candle.volume_ratio >= policy.session_rejection_min_volume_ratio
+        and candle.score >= policy.session_rejection_min_candle_score
+        and directional_bias >= policy.session_rejection_min_bias_score
+        and structure_supports
+        and not candle.absorption
+    ):
+        return None
+    return SetupDetection(
+        setup_type="session_high_low_rejection",
+        passed=True,
+        reasons=[
+            f"Previous {session.name} {'low' if direction == 'long' else 'high'} swept and rejected on above-average volume"
+        ],
+        evidence={
+            "previous_session": session.name,
+            "previous_session_start": session.start.isoformat(),
+            "previous_session_end": session.end.isoformat(),
+            "previous_session_high": previous_high,
+            "previous_session_low": previous_low,
+            "rejected_level": rejected_level,
+            "opposite_session_level": opposite_level,
+            "breach_atr": round(breach, 3),
+            "reclaim_atr": round(reclaim, 3),
+            "rejection_wick": round(wick, 3),
+            "volume_ratio": round(candle.volume_ratio, 3),
+            "directional_bias": round(directional_bias, 3),
+            "invalidation_level": invalidation,
         },
     )
 

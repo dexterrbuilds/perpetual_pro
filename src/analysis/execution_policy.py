@@ -74,6 +74,18 @@ class ExecutionQualityPolicy:
                 "stop_quality": 0.15, "target_feasibility": 0.11,
                 "liquidity_cost_quality": 0.06, "data_market_quality": 0.05,
             },
+            "opening_range_breakout": {
+                "entry_accessibility": 0.15, "entry_zone_quality": 0.14,
+                "pre_entry_survival": 0.15, "confirmation_quality": 0.18,
+                "stop_quality": 0.13, "target_feasibility": 0.13,
+                "liquidity_cost_quality": 0.07, "data_market_quality": 0.05,
+            },
+            "session_high_low_rejection": {
+                "entry_accessibility": 0.12, "entry_zone_quality": 0.14,
+                "pre_entry_survival": 0.16, "confirmation_quality": 0.20,
+                "stop_quality": 0.16, "target_feasibility": 0.11,
+                "liquidity_cost_quality": 0.06, "data_market_quality": 0.05,
+            },
             "breakout_continuation": {
                 "entry_accessibility": 0.14, "entry_zone_quality": 0.08,
                 "pre_entry_survival": 0.12, "confirmation_quality": 0.18,

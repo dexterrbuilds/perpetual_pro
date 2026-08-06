@@ -5,7 +5,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from src.analysis.execution import _canonical_setup_type, build_execution_profile
+from src.analysis.execution import (
+    _canonical_setup_type,
+    _entry_anchors,
+    _select_anchor,
+    build_execution_profile,
+)
 from src.analysis.execution_policy import DEFAULT_EXECUTION_POLICY
 from src.analysis.indicators import IndicatorSuite
 from src.analysis.market_structure import StructureLevel, StructureReport
@@ -174,11 +179,12 @@ def test_counter_trend_reversal_uses_stronger_confirmation():
 
 def test_new_setup_types_reuse_existing_global_safety_thresholds():
     for setup_type in (
-        "trend_pullback", "breakout_retest", "ob_fvg_retest", "liquidity_sweep"
+        "trend_pullback", "breakout_retest", "ob_fvg_retest", "liquidity_sweep",
+        "opening_range_breakout", "session_high_low_rejection",
     ):
         values = DEFAULT_EXECUTION_POLICY.setup_weights[setup_type]
         assert set(values) == set(DEFAULT_EXECUTION_POLICY.component_weights)
-        assert sum(values.values()) == 1.0
+        assert round(sum(values.values()), 10) == 1.0
     assert DEFAULT_EXECUTION_POLICY.minimum_execution_quality == 72.0
     assert DEFAULT_EXECUTION_POLICY.max_spread_bps == 12.0
     assert _canonical_setup_type(
@@ -189,6 +195,194 @@ def test_new_setup_types_reuse_existing_global_safety_thresholds():
     assert config.analysis.max_immediate_sl_risk == 32
     assert config.analysis.directional_score_threshold == .20
     assert config.risk.min_rr == 1.25
+
+
+def _session_frame(last_open: str) -> pd.DataFrame:
+    index = pd.date_range(
+        "2026-08-03T00:00:00Z",
+        pd.Timestamp(last_open),
+        freq="15min",
+        tz="UTC",
+    )
+    close = np.full(len(index), 99.6)
+    return pd.DataFrame(
+        {
+            "open": close,
+            "high": close + 0.20,
+            "low": close - 0.20,
+            "close": close,
+            "volume": np.full(len(index), 100.0),
+        },
+        index=index,
+    )
+
+
+def test_london_opening_range_breakout_requires_window_volume_and_retest():
+    df = _session_frame("2026-08-03T08:30:00Z")
+    # London is UTC+1 on this date: 08:00 local = 07:00 UTC.
+    df.loc["2026-08-03T07:00:00Z"] = [99.40, 100.00, 99.00, 99.70, 100.0]
+    df.loc["2026-08-03T07:15:00Z"] = [99.70, 99.90, 99.10, 99.60, 100.0]
+    df.loc["2026-08-03T07:30:00Z"] = [99.70, 100.35, 99.65, 100.25, 160.0]
+    for timestamp in df.loc["2026-08-03T07:45:00Z":].index[:-1]:
+        df.loc[timestamp] = [100.20, 100.35, 100.12, 100.25, 105.0]
+    df.iloc[-1] = [100.06, 100.30, 99.98, 100.22, 120.0]
+    setup = detect_strict_setup(
+        df,
+        _suite(df, trend_score=.20, momentum_score=.22, adx=22),
+        StructureReport(trend="up", last_bos="bullish", structure_score=.45),
+        direction="long",
+        price=100.22,
+        atr=1.0,
+    )
+    assert setup is not None
+    assert setup.setup_type == "opening_range_breakout"
+    assert setup.label == "Long Opening Range Breakout"
+    assert setup.evidence["session"] == "London"
+    assert setup.evidence["opening_range_high"] == 100.0
+
+    # Identical geometry outside the two-hour activation window must not be ORB.
+    outside = pd.concat(
+        [
+            df,
+            pd.DataFrame(
+                [[100.2, 100.3, 100.0, 100.2, 120.0]],
+                columns=df.columns,
+                index=pd.DatetimeIndex(["2026-08-03T10:30:00Z"]),
+            ),
+        ]
+    )
+    outside_setup = detect_strict_setup(
+        outside,
+        _suite(outside, trend_score=.20, momentum_score=.22, adx=22),
+        StructureReport(trend="up", last_bos="bullish", structure_score=.45),
+        direction="long",
+        price=100.2,
+        atr=1.0,
+    )
+    assert outside_setup is None or outside_setup.setup_type != "opening_range_breakout"
+
+
+def test_new_york_opening_range_uses_only_new_york_levels():
+    df = _session_frame("2026-08-03T15:00:00Z")
+    # New York is UTC-4: 09:30 local = 13:30 UTC.
+    df.loc["2026-08-03T13:30:00Z"] = [100.4, 101.0, 100.0, 100.5, 100.0]
+    df.loc["2026-08-03T13:45:00Z"] = [100.5, 100.9, 100.1, 100.4, 100.0]
+    df.loc["2026-08-03T14:00:00Z"] = [100.4, 100.5, 99.65, 99.75, 165.0]
+    for timestamp in df.loc["2026-08-03T14:15:00Z":].index[:-1]:
+        df.loc[timestamp] = [99.75, 99.88, 99.67, 99.76, 105.0]
+    df.iloc[-1] = [99.93, 100.02, 99.62, 99.76, 125.0]
+    setup = detect_strict_setup(
+        df,
+        _suite(
+            df, close=99.76, trend_score=-.20, momentum_score=-.22,
+            ema_fast=100.2, ema_mid=100.3, vwap=100.4, adx=22,
+        ),
+        StructureReport(trend="down", last_bos="bearish", structure_score=-.45),
+        direction="short",
+        price=99.76,
+        atr=1.0,
+    )
+    assert setup is not None
+    assert setup.setup_type == "opening_range_breakout"
+    assert setup.evidence["session"] == "New York"
+    assert setup.evidence["opening_range_low"] == 100.0
+
+
+def test_session_high_low_rejection_requires_wick_volume_and_bias():
+    df = _session_frame("2026-08-03T13:30:00Z")
+    # The completed London block runs from 07:00 to 13:30 UTC on this date.
+    df.loc["2026-08-03T07:00:00Z":"2026-08-03T13:15:00Z", "high"] = 101.0
+    df.loc["2026-08-03T07:00:00Z":"2026-08-03T13:15:00Z", "low"] = 99.0
+    df.iloc[-1] = [99.50, 100.00, 98.78, 99.82, 145.0]
+    setup = detect_strict_setup(
+        df,
+        _suite(df, trend_score=.20, momentum_score=.16, adx=20),
+        StructureReport(trend="up", last_choch="bullish", structure_score=.35),
+        direction="long",
+        price=99.82,
+        atr=1.0,
+    )
+    assert setup is not None
+    assert setup.setup_type == "session_high_low_rejection"
+    assert setup.label == "Long Session High/Low Rejection"
+    assert setup.evidence["previous_session"] == "London"
+    assert setup.evidence["rejection_wick"] >= .35
+    assert setup.evidence["volume_ratio"] >= 1.10
+
+    weak_volume = df.copy()
+    weak_volume.iloc[-1, weak_volume.columns.get_loc("volume")] = 90.0
+    weak = detect_strict_setup(
+        weak_volume,
+        _suite(weak_volume, trend_score=.20, momentum_score=.16, adx=20),
+        StructureReport(trend="up", last_choch="bullish", structure_score=.35),
+        direction="long",
+        price=99.82,
+        atr=1.0,
+    )
+    assert weak is None or weak.setup_type != "session_high_low_rejection"
+
+
+def test_session_high_low_rejection_is_long_short_symmetric():
+    df = _session_frame("2026-08-03T13:30:00Z")
+    df.loc["2026-08-03T07:00:00Z":"2026-08-03T13:15:00Z", "high"] = 101.0
+    df.loc["2026-08-03T07:00:00Z":"2026-08-03T13:15:00Z", "low"] = 99.0
+    df.iloc[-1] = [100.50, 101.22, 100.00, 100.18, 145.0]
+    setup = detect_strict_setup(
+        df,
+        _suite(
+            df, close=100.18, trend_score=-.20, momentum_score=-.16,
+            ema_fast=100.4, ema_mid=100.5, vwap=100.55, adx=20,
+        ),
+        StructureReport(trend="down", last_choch="bearish", structure_score=-.35),
+        direction="short",
+        price=100.18,
+        atr=1.0,
+    )
+    assert setup is not None
+    assert setup.setup_type == "session_high_low_rejection"
+    assert setup.label == "Short Session High/Low Rejection"
+    assert setup.evidence["previous_session"] == "London"
+    assert setup.evidence["rejection_wick"] >= .35
+
+
+def test_structure_leads_entry_anchor_and_stop_geometry():
+    df = _frame()
+    df.iloc[-1] = [100.0, 100.2, 99.8, 100.1, 120.0]
+    block = StructureLevel(
+        "order_block", "bullish", 99.0, 99.25, 88,
+        age_bars=6, touch_count=0, mitigation_fraction=.10,
+    )
+    resistance = StructureLevel("resistance", "bearish", 100.8, 101.0, 82)
+    structure = StructureReport(
+        trend="up",
+        last_bos="bullish",
+        structure_score=.5,
+        levels=[block, resistance],
+        swing_lows=[98.9],
+        swing_highs=[101.0],
+    )
+    indicators = _suite(
+        df, close=100.1, ema_fast=99.95, ema_mid=99.90, vwap=99.85,
+    )
+    anchors = _entry_anchors(indicators, structure, "long", 100.1, 1.0)
+    anchor, sources, _, _, _ = _select_anchor(anchors, "long", 100.1, 1.0)
+    assert anchor is not None
+    assert "order_block" in sources
+    assert anchor < 99.5  # indicators are nearer, but structure owns the level.
+
+    profile = build_execution_profile(
+        df,
+        indicators,
+        structure,
+        direction="long",
+        price=100.1,
+        atr=1.0,
+        setup_name="Long Day-Trade Confluence",
+        strategy_tags=["day_trade"],
+    )
+    assert "order_block" in profile.anchor_sources
+    assert profile.stop_loss < block.price_low
+    assert any(target >= 100.8 for target in profile.targets)
 
 
 def test_unconfirmed_strict_label_fails_closed_in_execution():
@@ -208,13 +402,18 @@ def test_unconfirmed_strict_label_fails_closed_in_execution():
 
 
 def test_telegram_preserves_clear_new_setup_label():
-    caption = format_signal_photo_caption({
-        "symbol": "BTC/USDT:USDT", "direction": "long", "confidence": 82,
-        "technical_confidence": 84, "execution_quality": 78,
-        "entry_status": "wait_retest", "entry_low": 100, "entry_high": 101,
-        "stop_loss": 98, "take_profits": [103], "risk_pct": .5,
-        "setup_name": "Long Trend Continuation (Pullback)",
-        "payload": {"execution": {}},
-    })
-    assert "Trend Continuation (Pullback)" in caption
-    assert len(caption) <= 1024
+    for label in (
+        "Long Trend Continuation (Pullback)",
+        "Long Opening Range Breakout",
+        "Short Session High/Low Rejection",
+    ):
+        caption = format_signal_photo_caption({
+            "symbol": "BTC/USDT:USDT", "direction": "long", "confidence": 82,
+            "technical_confidence": 84, "execution_quality": 78,
+            "entry_status": "wait_retest", "entry_low": 100, "entry_high": 101,
+            "stop_loss": 98, "take_profits": [103], "risk_pct": .5,
+            "setup_name": label,
+            "payload": {"execution": {}},
+        })
+        assert label.removeprefix("Long ").removeprefix("Short ") in caption
+        assert len(caption) <= 1024

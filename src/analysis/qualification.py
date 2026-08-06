@@ -143,6 +143,7 @@ CHECK_REGISTRY: Dict[str, CheckPolicy] = {
         duplicate_group="entry_state", setup_types=(
             "cmp_confirmation", "breakout_continuation", "trend_pullback",
             "breakout_retest", "ob_fvg_retest", "liquidity_sweep", "reversal",
+            "opening_range_breakout", "session_high_low_rejection",
         ),
     ),
     "ENTRY_EXPIRED": _policy("entry_expiry", "Entry not expired", "hard", [_ALERT, _REVALIDATION]),

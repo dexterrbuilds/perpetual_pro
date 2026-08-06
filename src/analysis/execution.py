@@ -131,6 +131,23 @@ class EntryAnchor:
     relevant: bool = True
 
 
+STRUCTURAL_ANCHOR_SOURCES = {
+    "order_block",
+    "fvg",
+    "liquidity",
+    "support",
+    "resistance",
+    "confirmed breakout retest",
+    "swept liquidity reclaim",
+    "opening range breakout retest",
+    "session high/low rejection",
+}
+
+
+def _is_structural_anchor(anchor: EntryAnchor) -> bool:
+    return anchor.source in STRUCTURAL_ANCHOR_SOURCES
+
+
 def analyze_candles(df: pd.DataFrame, atr: float, direction: str) -> CandleContext:
     """Summarize bodies, wicks, rejection, and signed-volume order flow."""
     if df is None or len(df) < 20:
@@ -278,10 +295,20 @@ def build_execution_profile(
         ]
         if structural_anchors:
             anchors = structural_anchors
+    elif setup_type in {"opening_range_breakout", "session_high_low_rejection"}:
+        # The strict detector contributes the relevant session level below.
+        # Retain nearby chart structure, but do not let an indicator-only
+        # anchor replace the session level.
+        anchors = [
+            anchor for anchor in anchors
+            if _is_structural_anchor(anchor)
+        ]
     if strict_detection is not None:
         evidence = strict_detection.evidence
         derived_level = safe_float(
-            evidence.get("breakout_level") or evidence.get("swept_level")
+            evidence.get("breakout_level")
+            or evidence.get("rejected_level")
+            or evidence.get("swept_level")
         )
         if derived_level > 0 and abs(derived_level - price) <= atr * 2.2:
             derived_anchor = EntryAnchor(
@@ -289,11 +316,17 @@ def build_execution_profile(
                 derived_level,
                 derived_level,
                 (
-                    "confirmed breakout retest"
+                    "opening range breakout retest"
+                    if setup_type == "opening_range_breakout"
+                    else "session high/low rejection"
+                    if setup_type == "session_high_low_rejection"
+                    else "confirmed breakout retest"
                     if setup_type == "breakout_retest"
                     else "swept liquidity reclaim"
                 ),
-                0.92,
+                0.96 if setup_type in {
+                    "opening_range_breakout", "session_high_low_rejection"
+                } else 0.92,
             )
             nearby = [
                 item for item in anchors
@@ -342,6 +375,27 @@ def build_execution_profile(
         else max(0.0, entry_low - price) / atr
     )
     relevant_edge = anchor_bounds[0] if direction == "long" else anchor_bounds[1]
+    structural_invalidation = _structural_invalidation_level(
+        structure,
+        direction=direction,
+        entry=entry_mid,
+        atr=atr,
+    )
+    detected_invalidation = safe_float(
+        (strict_detection.evidence if strict_detection is not None else {}).get(
+            "invalidation_level"
+        )
+    )
+    if detected_invalidation > 0:
+        structurally_valid = (
+            detected_invalidation < entry_mid
+            if direction == "long"
+            else detected_invalidation > entry_mid
+        )
+        if structurally_valid:
+            structural_invalidation = detected_invalidation
+    if structural_invalidation is not None:
+        relevant_edge = structural_invalidation
     noise_buffer = atr * float(clamp(candle.noise_atr * 0.16, 0.12, 0.30))
     min_stop_distance = atr * float(clamp(0.85 + candle.noise_atr * 0.12, 0.90, 1.25))
     if direction == "long":
@@ -355,6 +409,12 @@ def build_execution_profile(
         atr=atr, current_price=price,
     )
 
+    session_target = safe_float(
+        (strict_detection.evidence if strict_detection is not None else {}).get(
+            "opposite_session_level"
+        )
+    )
+    extra_structure_targets = [session_target] if session_target > 0 else []
     targets, target_quality, obstacles = _feasible_structure_targets(
         structure,
         df,
@@ -364,6 +424,7 @@ def build_execution_profile(
         atr=atr,
         current_price=price,
         expected_hold_hours=expected_hold_hours,
+        extra_structure_targets=extra_structure_targets,
         policy=policy,
     )
 
@@ -809,14 +870,19 @@ def _select_anchor(
 ) -> Tuple[Optional[float], List[str], Tuple[float, float], float, float]:
     if not anchors:
         return None, [], (0.0, 0.0), 0.0, 0.0
+    structural = [anchor for anchor in anchors if _is_structural_anchor(anchor)]
+    # Structure owns price geometry whenever a usable chart level exists.
+    # Indicators may strengthen a nearby cluster but cannot replace its center.
+    candidates = structural or anchors
     best: Optional[EntryAnchor] = None
     best_score = -1e9
     best_cluster: List[EntryAnchor] = []
-    for candidate in anchors:
+    for candidate in candidates:
         mid = candidate.mid
         cluster = [a for a in anchors if abs(a.mid - mid) <= atr * 0.28]
         confidence = sum(
             a.confidence
+            * (1.20 if _is_structural_anchor(a) else 0.80)
             * max(0.20, 1.0 - 0.80 * a.touch_count / max(1, policy.max_level_touches))
             * max(0.15, 1.0 - 0.70 * a.mitigation_fraction)
             for a in cluster
@@ -853,6 +919,40 @@ def _select_anchor(
     ]
     health = float(np.average(health_values, weights=weights)) if health_values else 0.0
     return anchor, sources, (float(min(lows)), float(max(highs))), float(best_score), health
+
+
+def _structural_invalidation_level(
+    structure: StructureReport,
+    *,
+    direction: str,
+    entry: float,
+    atr: float,
+) -> Optional[float]:
+    """Nearest valid thesis-invalidation edge; indicators never define it."""
+    candidates: List[float] = []
+    wanted = "bullish" if direction == "long" else "bearish"
+    for level in structure.levels:
+        if level.side != wanted or level.kind not in {
+            "order_block", "fvg", "liquidity", "support", "resistance"
+        }:
+            continue
+        if getattr(level, "invalidated", False) or getattr(
+            level, "fully_mitigated", False
+        ):
+            continue
+        edge = float(level.price_low if direction == "long" else level.price_high)
+        valid_side = edge < entry if direction == "long" else edge > entry
+        if valid_side and abs(edge - entry) <= atr * 3.0:
+            candidates.append(edge)
+    swings = structure.swing_lows if direction == "long" else structure.swing_highs
+    for value in swings:
+        edge = float(value)
+        valid_side = edge < entry if direction == "long" else edge > entry
+        if valid_side and abs(edge - entry) <= atr * 3.0:
+            candidates.append(edge)
+    if not candidates:
+        return None
+    return max(candidates) if direction == "long" else min(candidates)
 
 
 def _legacy_structure_targets(
@@ -921,6 +1021,10 @@ def _canonical_setup_type(
     text = " ".join([setup_name.lower(), *(str(tag).lower() for tag in tags)])
     if "trend_pullback" in text or "trend continuation" in text:
         return "trend_pullback"
+    if "opening_range_breakout" in text or "opening range breakout" in text:
+        return "opening_range_breakout"
+    if "session_high_low_rejection" in text or "session high/low rejection" in text:
+        return "session_high_low_rejection"
     if "liquidity_sweep" in text or "liquidity sweep" in text:
         return "liquidity_sweep"
     if "ob_fvg_retest" in text or "order block / fvg" in text:
@@ -1106,6 +1210,7 @@ def _feasible_structure_targets(
     df: pd.DataFrame,
     *, direction: str, entry: float, stop: float, atr: float,
     current_price: float, expected_hold_hours: float,
+    extra_structure_targets: Optional[List[float]] = None,
     policy: ExecutionQualityPolicy,
 ) -> Tuple[List[float], List[float], List[float]]:
     """Choose reachable structure targets; never manufacture a minimum R:R."""
@@ -1131,6 +1236,9 @@ def _feasible_structure_targets(
     ):
         if value is not None and ((value > entry) if direction == "long" else (value < entry)):
             candidates.append((float(value), quality, name))
+    for value in extra_structure_targets or []:
+        if value and ((value > entry) if direction == "long" else (value < entry)):
+            candidates.append((float(value), 82.0, "session_structure"))
     candidates.sort(key=lambda item: abs(item[0] - entry))
     targets: List[float] = []
     qualities: List[float] = []
