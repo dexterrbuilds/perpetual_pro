@@ -540,6 +540,12 @@ def format_signal_photo_caption(
     }.get(zone_relation, "")
     stop = row.get("stop_loss")
     targets = list(row.get("take_profits") or [])
+    target_adjustment = dict(
+        row.get("target_adjustment")
+        or execution.get("target_adjustment")
+        or primary.get("target_adjustment")
+        or {}
+    )
     leverage = row.get("leverage") or row.get("display_leverage") or 5
     risk_pct = _number(row.get("risk_pct"), 1.0)
     hold_style = _caption_hold_style(
@@ -645,6 +651,19 @@ def format_signal_photo_caption(
         lines.extend(
             f"✅ <b>TP{index}:</b> {_caption_price(target)}"
             for index, target in enumerate(targets[:4], 1)
+        )
+    if target_adjustment.get("resolved"):
+        action = str(target_adjustment.get("action") or "")
+        adjusted_net_rr = _number(target_adjustment.get("adjusted_tp1_net_rr"))
+        minimum_net_rr = _number(target_adjustment.get("minimum_net_rr"), 0.75)
+        adjustment_text = (
+            "TP1 moved just beyond nearby structure"
+            if action == "adjusted_beyond_structure"
+            else "Next feasible structure promoted to TP1"
+        )
+        lines.append(
+            f"📌 <b>Target adjustment:</b> {adjustment_text} · "
+            f"net {adjusted_net_rr:.2f}R (floor {minimum_net_rr:.2f}R)"
         )
     setup_label = setup_name or f"{direction.title()} {hold_style}"
     lines += [

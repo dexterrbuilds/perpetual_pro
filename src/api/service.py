@@ -980,6 +980,8 @@ def scan_symbols(
                     "confirmation_quality": (execution.get("components") or {}).get("confirmation_quality"),
                     "stop_quality": (execution.get("components") or {}).get("stop_quality"),
                     "target_feasibility": list(execution.get("target_feasibility") or []),
+                    "target_policy_version": execution.get("target_policy_version"),
+                    "target_adjustment": dict(execution.get("target_adjustment") or {}),
                     "gross_risk_reward": list(execution.get("gross_risk_reward") or []),
                     "net_risk_reward": list(execution.get("net_risk_reward") or []),
                     "estimated_total_cost_bps": execution.get("estimated_total_cost_bps"),

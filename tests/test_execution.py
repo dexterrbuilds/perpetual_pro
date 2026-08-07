@@ -104,6 +104,8 @@ def test_execution_profile_waits_for_retest_and_uses_structure_targets():
     assert plan.entry_high == profile.entry_high
     assert plan.stop_loss == profile.stop_loss
     assert plan.take_profits == profile.targets
+    assert plan.target_policy_version == profile.target_policy_version
+    assert plan.target_adjustment == profile.target_adjustment
     assert plan.entry_status == profile.status
     entry_mid = (plan.entry_low + plan.entry_high) / 2.0
     expected_rr = (plan.take_profits[0] - entry_mid) / (entry_mid - plan.stop_loss)

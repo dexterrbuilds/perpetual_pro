@@ -121,6 +121,12 @@ class ExecutionQualityPolicy:
     max_stop_atr: float = 3.00
     max_target_atr_by_index: Tuple[float, ...] = (2.2, 4.0, 6.0, 8.0)
     min_net_tp1_cost_multiple: float = 2.0
+    # Nearby opposing structure is resolved conservatively: a small clearance
+    # may become TP1 only when a later real structure level leaves open space
+    # and the adjusted target still returns at least 0.75R net of costs.
+    nearby_target_obstacle_atr: float = 0.35
+    structure_target_clearance_atr: float = 0.08
+    min_structure_adjusted_target_net_rr: float = 0.75
     default_taker_fee_bps_per_side: float = 5.0
     default_slippage_bps_per_side: float = 1.5
     default_funding_bps_per_8h: float = 1.0

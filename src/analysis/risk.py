@@ -68,6 +68,8 @@ class TradePlan:
     execution_policy_version: str = ""
     execution_components: Dict[str, float] = field(default_factory=dict)
     target_feasibility: List[float] = field(default_factory=list)
+    target_policy_version: str = ""
+    target_adjustment: Dict[str, Any] = field(default_factory=dict)
     gross_risk_reward: List[float] = field(default_factory=list)
     net_risk_reward: List[float] = field(default_factory=list)
     estimated_total_cost_bps: float = 0.0
@@ -151,6 +153,8 @@ class TradePlan:
             "execution_policy_version": self.execution_policy_version,
             "execution_components": dict(self.execution_components),
             "target_feasibility": list(self.target_feasibility),
+            "target_policy_version": self.target_policy_version,
+            "target_adjustment": dict(self.target_adjustment),
             "gross_risk_reward": list(self.gross_risk_reward or self.risk_reward),
             "net_risk_reward": list(self.net_risk_reward),
             "estimated_total_cost_bps": self.estimated_total_cost_bps,
@@ -197,6 +201,8 @@ class TradePlan:
             "execution_policy_version": self.execution_policy_version,
             "execution_components": dict(self.execution_components),
             "target_feasibility": list(self.target_feasibility),
+            "target_policy_version": self.target_policy_version,
+            "target_adjustment": dict(self.target_adjustment),
             "gross_risk_reward": list(self.gross_risk_reward or self.risk_reward),
             "net_risk_reward": list(self.net_risk_reward),
             "estimated_total_cost_bps": self.estimated_total_cost_bps,
@@ -763,6 +769,8 @@ class RiskManager:
             target_feasibility=[
                 safe_float(value) for value in (execution.get("target_feasibility") or [])
             ],
+            target_policy_version=str(execution.get("target_policy_version") or ""),
+            target_adjustment=dict(execution.get("target_adjustment") or {}),
             gross_risk_reward=[float(x) for x in rrs],
             net_risk_reward=[float(x) for x in net_rrs],
             estimated_total_cost_bps=safe_float(

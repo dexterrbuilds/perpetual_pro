@@ -23,6 +23,9 @@ from src.analysis.setups import SETUP_POLICY_VERSION, detect_strict_setup
 from src.utils.helpers import clamp, safe_float
 
 
+TARGET_STRUCTURE_POLICY_VERSION = "structure_target_resolution_v1"
+
+
 @dataclass
 class CandleContext:
     score: float = 0.0
@@ -65,6 +68,8 @@ class ExecutionProfile:
     stop_loss: float = 0.0
     targets: List[float] = field(default_factory=list)
     target_feasibility: List[float] = field(default_factory=list)
+    target_policy_version: str = TARGET_STRUCTURE_POLICY_VERSION
+    target_adjustment: Dict[str, Any] = field(default_factory=dict)
     gross_risk_reward: List[float] = field(default_factory=list)
     net_risk_reward: List[float] = field(default_factory=list)
     entry_reason: str = ""
@@ -129,6 +134,17 @@ class EntryAnchor:
     touch_count: int = 0
     mitigation_fraction: float = 0.0
     relevant: bool = True
+
+
+@dataclass
+class TargetSelection:
+    """Structure-derived targets plus the nearby obstacles skipped as TPs."""
+
+    targets: List[float] = field(default_factory=list)
+    qualities: List[float] = field(default_factory=list)
+    sources: List[str] = field(default_factory=list)
+    obstacles: List[Dict[str, Any]] = field(default_factory=list)
+    used_projection: bool = False
 
 
 STRUCTURAL_ANCHOR_SOURCES = {
@@ -415,7 +431,7 @@ def build_execution_profile(
         )
     )
     extra_structure_targets = [session_target] if session_target > 0 else []
-    targets, target_quality, obstacles = _feasible_structure_targets(
+    target_selection = _feasible_structure_targets(
         structure,
         df,
         direction=direction,
@@ -427,6 +443,12 @@ def build_execution_profile(
         extra_structure_targets=extra_structure_targets,
         policy=policy,
     )
+    targets = list(target_selection.targets)
+    target_quality = list(target_selection.qualities)
+    obstacles = [
+        safe_float(item.get("distance_atr"))
+        for item in target_selection.obstacles
+    ]
 
     direction_sign = 1.0 if direction == "long" else -1.0
     flow_alignment = candle.order_flow_score * direction_sign
@@ -493,6 +515,18 @@ def build_execution_profile(
         funding_bps = policy.default_funding_bps_per_8h * max(0.0, expected_hold_hours / 8.0)
     total_cost_bps = fee_bps + slippage_bps + funding_bps + max(0.0, spread_bps or 0.0)
     cost_price = entry_mid * total_cost_bps / 10_000.0
+    target_selection, target_adjustment = _resolve_nearby_target_obstacle(
+        target_selection,
+        direction=direction,
+        entry=entry_mid,
+        stop_distance=stop_distance,
+        atr=atr,
+        cost_price=cost_price,
+        expected_hold_hours=expected_hold_hours,
+        policy=policy,
+    )
+    targets = list(target_selection.targets)
+    target_quality = list(target_selection.qualities)
     gross_rr = [abs(tp - entry_mid) / max(stop_distance, 1e-12) for tp in targets]
     net_rr = [
         max(0.0, abs(tp - entry_mid) - cost_price) / max(stop_distance + cost_price, 1e-12)
@@ -629,7 +663,7 @@ def build_execution_profile(
         hard_failures.append("spread_above_hard_limit")
     if not targets:
         hard_failures.append("no_feasible_target")
-    if obstacles and min(obstacles) < 0.35:
+    if target_selection.obstacles and not target_adjustment.get("resolved"):
         hard_failures.append("tp1_blocked_by_nearby_structure")
     if targets and abs(targets[0] - entry_mid) < cost_price * policy.min_net_tp1_cost_multiple:
         hard_failures.append("tp1_reward_does_not_cover_cost_buffer")
@@ -668,6 +702,8 @@ def build_execution_profile(
         f"Order-flow approximation {candle.order_flow_score:+.2f}",
         f"Execution Quality {score:.0f}/100 ({policy.version})",
     ]
+    if target_adjustment.get("resolved"):
+        reasons.append(str(target_adjustment.get("reason") or "Target plan adjusted around nearby structure"))
     if strict_detection is not None:
         reasons.extend(strict_detection.reasons[:1])
     if spread_bps is not None:
@@ -746,6 +782,8 @@ def build_execution_profile(
         stop_loss=float(stop),
         targets=[float(x) for x in targets],
         target_feasibility=[float(x) for x in target_quality],
+        target_policy_version=TARGET_STRUCTURE_POLICY_VERSION,
+        target_adjustment=dict(target_adjustment),
         gross_risk_reward=[float(x) for x in gross_rr],
         net_risk_reward=[float(x) for x in net_rr],
         entry_reason=entry_reason,
@@ -1209,7 +1247,7 @@ def _feasible_structure_targets(
     current_price: float, expected_hold_hours: float,
     extra_structure_targets: Optional[List[float]] = None,
     policy: ExecutionQualityPolicy,
-) -> Tuple[List[float], List[float], List[float]]:
+) -> TargetSelection:
     """Choose reachable structure targets; never manufacture a minimum R:R."""
     sign = 1.0 if direction == "long" else -1.0
     target_side = "bearish" if direction == "long" else "bullish"
@@ -1239,14 +1277,20 @@ def _feasible_structure_targets(
     candidates.sort(key=lambda item: abs(item[0] - entry))
     targets: List[float] = []
     qualities: List[float] = []
-    obstacles: List[float] = []
+    sources: List[str] = []
+    obstacles: List[Dict[str, Any]] = []
     seen: List[float] = []
     hold_scale = float(clamp(expected_hold_hours / 8.0, 0.55, 1.35))
-    for value, base_quality, _source in candidates:
+    for value, base_quality, source in candidates:
         distance_atr = abs(value - entry) / max(atr, 1e-12)
-        if distance_atr < 0.35:
-            if _source != "volume_poc":
-                obstacles.append(distance_atr)
+        if distance_atr < policy.nearby_target_obstacle_atr:
+            if source != "volume_poc":
+                obstacles.append({
+                    "price": float(value),
+                    "distance_atr": float(distance_atr),
+                    "source": str(source),
+                    "quality": float(base_quality),
+                })
             continue
         index = len(targets)
         if index >= len(policy.max_target_atr_by_index):
@@ -1260,6 +1304,7 @@ def _feasible_structure_targets(
         quality = float(clamp(0.60 * base_quality + 0.40 * temporal, 0, 100))
         targets.append(value)
         qualities.append(quality)
+        sources.append(str(source))
         seen.append(value)
     # A volatility projection is allowed for TP1 only when no real structure
     # level exists; it is not moved to satisfy the minimum-R gate.
@@ -1268,8 +1313,163 @@ def _feasible_structure_targets(
         projected = entry + sign * atr * projection_atr
         targets = [float(projected)]
         qualities = [48.0]
-    ordered = sorted(zip(targets, qualities), key=lambda item: item[0], reverse=direction == "short")
-    return [x for x, _ in ordered], [q for _, q in ordered], obstacles
+        sources = ["volatility_projection"]
+    ordered = sorted(
+        zip(targets, qualities, sources),
+        key=lambda item: item[0],
+        reverse=direction == "short",
+    )
+    return TargetSelection(
+        targets=[x for x, _, _ in ordered],
+        qualities=[q for _, q, _ in ordered],
+        sources=[source for _, _, source in ordered],
+        obstacles=sorted(obstacles, key=lambda item: item["distance_atr"]),
+        used_projection=bool(sources == ["volatility_projection"]),
+    )
+
+
+def _target_net_rr(
+    target: float,
+    *,
+    entry: float,
+    stop_distance: float,
+    cost_price: float,
+) -> float:
+    """Return cost-adjusted R:R using the production execution-cost model."""
+    reward = max(0.0, abs(float(target) - entry) - cost_price)
+    return reward / max(stop_distance + cost_price, 1e-12)
+
+
+def _resolve_nearby_target_obstacle(
+    selection: TargetSelection,
+    *,
+    direction: str,
+    entry: float,
+    stop_distance: float,
+    atr: float,
+    cost_price: float,
+    expected_hold_hours: float,
+    policy: ExecutionQualityPolicy,
+) -> Tuple[TargetSelection, Dict[str, Any]]:
+    """Resolve a nearby TP1 obstacle without weakening target safety.
+
+    Preference order:
+    1. Place TP1 a small documented clearance beyond the obstacle, but only
+       when a later real structure target proves that the path remains open
+       and the adjusted target returns at least the configured net R:R floor.
+    2. Promote the next real structure target to TP1 when it independently
+       clears that same floor.
+    3. Leave the obstacle unresolved so the existing hard gate rejects it.
+
+    A volatility projection is never treated as the confirming structure for
+    either alternative.
+    """
+    if not selection.obstacles:
+        return selection, {}
+
+    # Clear the full nearby obstacle cluster, not merely its closest member.
+    # Otherwise a TP shifted past the first level could remain trapped behind
+    # a second level that is still inside the same 0.35-ATR blocked region.
+    obstacle = max(selection.obstacles, key=lambda item: item["distance_atr"])
+    real_targets = [
+        (target, quality, source)
+        for target, quality, source in zip(
+            selection.targets, selection.qualities, selection.sources
+        )
+        if source != "volatility_projection"
+    ]
+    diagnostic: Dict[str, Any] = {
+        "resolved": False,
+        "action": "rejected",
+        "policy_version": TARGET_STRUCTURE_POLICY_VERSION,
+        "blocking_structure_price": float(obstacle["price"]),
+        "blocking_structure_distance_atr": float(obstacle["distance_atr"]),
+        "blocking_structure_source": str(obstacle["source"]),
+        "minimum_net_rr": float(policy.min_structure_adjusted_target_net_rr),
+        "reason": "Nearby structure blocks TP1 and no cost-justified structural alternative remains.",
+    }
+    if not real_targets:
+        return selection, diagnostic
+
+    sign = 1.0 if direction == "long" else -1.0
+    next_target, next_quality, next_source = real_targets[0]
+    next_distance_atr = abs(next_target - entry) / max(atr, 1e-12)
+    clearance_distance_atr = max(
+        policy.nearby_target_obstacle_atr,
+        float(obstacle["distance_atr"]) + policy.structure_target_clearance_atr,
+    )
+    clearance_target = entry + sign * atr * clearance_distance_atr
+    clearance_has_room = (
+        clearance_distance_atr + policy.structure_target_clearance_atr
+        <= next_distance_atr
+    )
+    hold_scale = float(clamp(expected_hold_hours / 8.0, 0.55, 1.35))
+    clearance_within_horizon = (
+        clearance_distance_atr
+        <= policy.max_target_atr_by_index[0] * hold_scale
+    )
+    clearance_net_rr = _target_net_rr(
+        clearance_target,
+        entry=entry,
+        stop_distance=stop_distance,
+        cost_price=cost_price,
+    )
+    if (
+        clearance_has_room
+        and clearance_within_horizon
+        and clearance_net_rr >= policy.min_structure_adjusted_target_net_rr
+    ):
+        adjusted_quality = float(clamp(
+            min(float(obstacle.get("quality") or 0.0), next_quality) * 0.85,
+            0,
+            100,
+        ))
+        targets = [float(clearance_target), *selection.targets]
+        qualities = [adjusted_quality, *selection.qualities]
+        sources = ["structure_clearance_adjustment", *selection.sources]
+        limit = len(policy.max_target_atr_by_index)
+        resolved = TargetSelection(
+            targets=targets[:limit],
+            qualities=qualities[:limit],
+            sources=sources[:limit],
+            obstacles=list(selection.obstacles),
+            used_projection=False,
+        )
+        diagnostic.update({
+            "resolved": True,
+            "action": "adjusted_beyond_structure",
+            "adjusted_tp1": float(clearance_target),
+            "adjusted_tp1_net_rr": float(clearance_net_rr),
+            "promoted_from_source": str(next_source),
+            "reason": (
+                "TP1 was moved slightly beyond nearby structure; open space to the "
+                "next real level and net R:R remained acceptable."
+            ),
+        })
+        return resolved, diagnostic
+
+    promoted_net_rr = _target_net_rr(
+        next_target,
+        entry=entry,
+        stop_distance=stop_distance,
+        cost_price=cost_price,
+    )
+    if promoted_net_rr >= policy.min_structure_adjusted_target_net_rr:
+        diagnostic.update({
+            "resolved": True,
+            "action": "promoted_next_structure",
+            "adjusted_tp1": float(next_target),
+            "adjusted_tp1_net_rr": float(promoted_net_rr),
+            "promoted_from_source": str(next_source),
+            "reason": (
+                "The blocked first objective was removed; the next feasible "
+                "structure level was promoted to TP1."
+            ),
+        })
+        return selection, diagnostic
+
+    diagnostic["next_structure_net_rr"] = float(promoted_net_rr)
+    return selection, diagnostic
 
 
 def _legacy_execution_score(

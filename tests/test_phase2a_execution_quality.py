@@ -10,9 +10,12 @@ import pytest
 
 from src.analysis.execution import (
     CandleContext,
+    TARGET_STRUCTURE_POLICY_VERSION,
+    TargetSelection,
     _data_market_quality,
     _entry_accessibility_quality,
     _liquidity_cost_quality,
+    _resolve_nearby_target_obstacle,
     _stop_quality,
     build_execution_profile,
 )
@@ -187,6 +190,143 @@ def test_targets_are_not_fabricated_to_four_and_net_rr_is_lower():
     assert all(net <= gross for net, gross in zip(profile.net_risk_reward, profile.gross_risk_reward))
 
 
+def _blocked_target_selection(
+    *,
+    direction: str = "long",
+    next_target: float = 101.2,
+    next_source: str = "resistance",
+) -> TargetSelection:
+    obstacle_price = 100.2 if direction == "long" else 99.8
+    return TargetSelection(
+        targets=[next_target],
+        qualities=[76.0],
+        sources=[next_source],
+        obstacles=[{
+            "price": obstacle_price,
+            "distance_atr": 0.2,
+            "source": "liquidity",
+            "quality": 74.0,
+        }],
+    )
+
+
+def test_nearby_structure_prefers_small_cost_justified_tp1_adjustment():
+    selection = _blocked_target_selection()
+    selection.obstacles.append({
+        "price": 100.32,
+        "distance_atr": 0.32,
+        "source": "order_block",
+        "quality": 72.0,
+    })
+    resolved, detail = _resolve_nearby_target_obstacle(
+        selection,
+        direction="long",
+        entry=100.0,
+        stop_distance=0.30,
+        atr=1.0,
+        cost_price=0.01,
+        expected_hold_hours=8.0,
+        policy=DEFAULT_EXECUTION_POLICY,
+    )
+    assert detail["resolved"] is True
+    assert detail["action"] == "adjusted_beyond_structure"
+    assert detail["policy_version"] == TARGET_STRUCTURE_POLICY_VERSION
+    assert detail["adjusted_tp1_net_rr"] >= 0.75
+    assert resolved.targets[0] == pytest.approx(100.40)
+    assert resolved.targets[0] > max(
+        obstacle["price"] for obstacle in selection.obstacles
+    )
+    assert resolved.sources[0] == "structure_clearance_adjustment"
+
+
+@pytest.mark.parametrize(
+    "direction,next_target",
+    [("long", 101.2), ("short", 98.8)],
+)
+def test_next_real_structure_is_promoted_when_clearance_tp_is_too_weak(
+    direction,
+    next_target,
+):
+    resolved, detail = _resolve_nearby_target_obstacle(
+        _blocked_target_selection(direction=direction, next_target=next_target),
+        direction=direction,
+        entry=100.0,
+        stop_distance=1.0,
+        atr=1.0,
+        cost_price=0.02,
+        expected_hold_hours=8.0,
+        policy=DEFAULT_EXECUTION_POLICY,
+    )
+    assert detail["resolved"] is True
+    assert detail["action"] == "promoted_next_structure"
+    assert detail["adjusted_tp1_net_rr"] >= 0.75
+    assert resolved.targets == [next_target]
+
+
+def test_execution_profile_clears_tp1_block_only_after_structural_promotion():
+    df = frame()
+    report = structure()
+    report.levels.append(
+        StructureLevel("resistance", "bearish", 100.15, 100.25, 82)
+    )
+    profile = build_execution_profile(
+        df,
+        suite(df),
+        report,
+        direction="long",
+        price=100.6,
+        atr=1.0,
+    )
+    assert profile.target_adjustment["action"] == "promoted_next_structure"
+    assert profile.target_adjustment["adjusted_tp1_net_rr"] >= 0.75
+    assert "tp1_blocked_by_nearby_structure" not in profile.hard_failures
+    assert profile.targets[0] == pytest.approx(101.7)
+
+
+@pytest.mark.parametrize(
+    "direction,next_target",
+    [("long", 100.6), ("short", 99.4)],
+)
+def test_blocked_tp1_still_rejects_when_no_target_clears_net_rr_floor(
+    direction,
+    next_target,
+):
+    resolved, detail = _resolve_nearby_target_obstacle(
+        _blocked_target_selection(direction=direction, next_target=next_target),
+        direction=direction,
+        entry=100.0,
+        stop_distance=1.0,
+        atr=1.0,
+        cost_price=0.03,
+        expected_hold_hours=8.0,
+        policy=DEFAULT_EXECUTION_POLICY,
+    )
+    assert detail["resolved"] is False
+    assert detail["action"] == "rejected"
+    assert detail["next_structure_net_rr"] < 0.75
+    assert resolved.targets == [next_target]
+
+
+def test_projection_cannot_resolve_a_blocked_tp1():
+    selection = _blocked_target_selection(
+        next_target=101.0,
+        next_source="volatility_projection",
+    )
+    selection.used_projection = True
+    _, detail = _resolve_nearby_target_obstacle(
+        selection,
+        direction="long",
+        entry=100.0,
+        stop_distance=0.5,
+        atr=1.0,
+        cost_price=0.01,
+        expected_hold_hours=8.0,
+        policy=DEFAULT_EXECUTION_POLICY,
+    )
+    assert detail["resolved"] is False
+    assert detail["action"] == "rejected"
+
+
 def test_long_short_component_symmetry():
     long_df, short_df = frame("long"), frame("short")
     long_profile = build_execution_profile(
@@ -264,6 +404,25 @@ def test_telegram_labels_heuristics_as_quality_not_probability():
     assert "87% Confidence" not in caption
 
 
+def test_telegram_discloses_structure_adjusted_tp1_with_net_floor():
+    caption = format_signal_photo_caption({
+        "symbol": "BTC", "direction": "long", "confidence": 84,
+        "technical_confidence": 86, "execution_quality": 82,
+        "entry_status": "wait_retest", "entry_low": 100, "entry_high": 100.1,
+        "stop_loss": 99, "take_profits": [101.2, 102.0], "risk_pct": 1,
+        "target_adjustment": {
+            "resolved": True,
+            "action": "promoted_next_structure",
+            "adjusted_tp1_net_rr": 0.86,
+            "minimum_net_rr": 0.75,
+        },
+        "payload": {"execution": {}},
+    })
+    assert "Next feasible structure promoted to TP1" in caption
+    assert "net 0.86R (floor 0.75R)" in caption
+    assert len(caption) <= 1024
+
+
 def test_component_outputs_are_finite_and_bounded_under_adversarial_values():
     quality, parts = weighted_execution_quality({name: math.inf for name in DEFAULT_EXECUTION_POLICY.component_weights}, "retest_continuation")
     assert 0 <= quality <= 100
@@ -280,6 +439,11 @@ def test_phase2a_instrumentation_is_persisted_additively():
         "execution_components": {"entry_accessibility": 80},
         "stop_distance_atr": 1.0, "entry_distance_atr": .1,
         "gross_risk_reward": [1.5], "net_risk_reward": [1.2],
+        "target_policy_version": TARGET_STRUCTURE_POLICY_VERSION,
+        "target_adjustment": {
+            "resolved": True,
+            "action": "promoted_next_structure",
+        },
         "depth_bands_bps": {"10": {"bid_usd": 10000}},
         "hard_failures": [], "execution_uncertainties": ["tick_size_unknown"],
         "execution": {"status": "confirmation_pending"},
@@ -300,6 +464,8 @@ def test_phase2a_instrumentation_is_persisted_additively():
     assert record["decision"]["execution_policy_version"] == "execution_quality_v2a.1"
     assert record["decision"]["stop_distance_atr"] == 1.0
     assert record["decision"]["depth_bands_bps"]["10"]["bid_usd"] == 10000
+    assert record["decision"]["target_policy_version"] == TARGET_STRUCTURE_POLICY_VERSION
+    assert record["decision"]["target_adjustment"]["action"] == "promoted_next_structure"
     assert record["decision"]["universal_eligible"] is True
     assert record["decision"]["production_qualified"] is True
     assert record["decision"]["prop_safe"] is False

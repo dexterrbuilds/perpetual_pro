@@ -419,6 +419,8 @@ def build_candidate_record(
             "confirmation_quality",
             "stop_quality",
             "target_feasibility",
+            "target_policy_version",
+            "target_adjustment",
             "gross_risk_reward",
             "net_risk_reward",
             "estimated_total_cost_bps",
