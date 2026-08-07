@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from src.analysis.legacy_v2 import (
     compare_legacy_v2_outcomes,
     execution_aware_legacy_confidence,
@@ -60,7 +62,35 @@ def test_sl_and_data_quality_penalties_remain_enforced():
         confidence_max=92,
         execution_confidence_buffer=5,
     )
-    assert risky.legacy_v2_confidence == clean.legacy_v2_confidence - 4
+    assert risky.legacy_v2_confidence == pytest.approx(
+        clean.legacy_v2_confidence - 3.2
+    )
+
+
+def test_immediate_sl_penalty_starts_only_above_hard_maximum():
+    at_limit = execution_aware_legacy_confidence(
+        technical_confidence=88,
+        execution_score=85,
+        immediate_sl_risk=32,
+        data_quality_score=100,
+        confidence_min=15,
+        confidence_max=92,
+        execution_confidence_buffer=5,
+    )
+    above_limit = execution_aware_legacy_confidence(
+        technical_confidence=88,
+        execution_score=85,
+        immediate_sl_risk=33,
+        data_quality_score=100,
+        confidence_min=15,
+        confidence_max=92,
+        execution_confidence_buffer=5,
+    )
+    assert at_limit.immediate_sl_penalty == 0.0
+    assert above_limit.immediate_sl_penalty == pytest.approx(0.2)
+    assert above_limit.legacy_v2_confidence == pytest.approx(
+        at_limit.legacy_v2_confidence - 0.2
+    )
 
 
 def test_historical_policy_comparison_counts_avoided_and_rejected_outcomes():
@@ -145,7 +175,7 @@ def test_legacy_v2_cap_penalties_and_telegram_use_one_final_overall_quality():
     penalized = execution_aware_legacy_confidence(
         technical_confidence=technical,
         execution_score=execution,
-        immediate_sl_risk=38,  # 2-point penalty above the 28 threshold
+        immediate_sl_risk=38,  # 1.2-point penalty above the 32 threshold
         data_quality_score=65,  # 2-point penalty below the 75 threshold
         confidence_min=config.analysis.min_confidence,
         confidence_max=config.analysis.max_confidence,
@@ -153,9 +183,9 @@ def test_legacy_v2_cap_penalties_and_telegram_use_one_final_overall_quality():
     )
     assert clean.legacy_v2_confidence <= pre_penalty_cap
     assert clean.legacy_v2_confidence == 84.0
-    assert penalized.immediate_sl_penalty == 2.0
+    assert penalized.immediate_sl_penalty == pytest.approx(1.2)
     assert penalized.data_quality_penalty == 2.0
-    assert penalized.legacy_v2_confidence == 80.0
+    assert penalized.legacy_v2_confidence == pytest.approx(80.8)
     assert penalized.legacy_v2_confidence <= clean.legacy_v2_confidence
     assert penalized.legacy_v2_confidence <= pre_penalty_cap
 

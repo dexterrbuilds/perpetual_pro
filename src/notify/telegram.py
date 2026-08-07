@@ -1097,6 +1097,8 @@ def _signal_qualification_lines(qualification: Dict[str, Any]) -> List[str]:
         title = "💎 <b>FULLY QUALIFIED SIGNAL</b>"
     elif qualification_type == "qualified_beta":
         title = "⚠️ <b>QUALIFIED BETA SIGNAL</b>"
+    elif qualification_type == "high_quality_override":
+        title = "⚠️ <b>HIGH QUALITY OVERRIDE</b>"
     else:
         return []
     hard_passed = int(qualification.get("hard_pass_count") or 0)
@@ -1111,12 +1113,42 @@ def _signal_qualification_lines(qualification: Dict[str, Any]) -> List[str]:
     supporting_total = int(
         qualification.get("supporting_soft_applicable_count") or 0
     )
+    hard_percentage = float(
+        qualification.get("hard_pass_percentage") or 0.0
+    )
     lines = [
         title,
-        f"✅ Hard checks: {hard_passed}/{hard_total} passed · 100%",
+        (
+            f"✅ Hard checks: {hard_passed}/{hard_total} passed · "
+            f"{hard_percentage:.0f}%"
+        ),
         f"✅ Important soft checks: {important_passed}/{important_total}",
         f"📊 Supporting soft checks: {supporting_passed}/{supporting_total}",
     ]
+    if qualification_type == "high_quality_override":
+        override = dict(qualification.get("high_quality_override_check") or {})
+        chase = _optional_number(override.get("actual_chase_distance_atr"))
+        normal_limit = _optional_number(
+            override.get("normal_max_chase_distance_atr")
+        )
+        absolute_limit = _optional_number(
+            override.get("absolute_max_chase_distance_atr")
+        )
+        lines.append("⚠️ One bounded non-critical check was overridden")
+        if (
+            chase is not None
+            and normal_limit is not None
+            and absolute_limit is not None
+        ):
+            lines.append(
+                f"Entry extension: {chase:.2f} ATR · normal {normal_limit:.2f} · "
+                f"absolute {absolute_limit:.2f}"
+            )
+        overridden = list(qualification.get("failed_hard_checks") or [])
+        if overridden:
+            lines.extend(
+                _qualification_check_line(dict(check)) for check in overridden
+            )
     passed_important = list(
         qualification.get("passed_important_soft_checks") or []
     )

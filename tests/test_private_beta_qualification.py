@@ -101,6 +101,26 @@ def _set_gate(row: dict, code: str, passed: bool, actual=None) -> None:
             gate["explanation"] = "passed" if passed else f"{code} failed"
 
 
+def _high_quality_override_row(chase_distance_atr: float = 1.20) -> dict:
+    row = _row()
+    row["confidence"] = 82.0
+    row["overall_quality"] = 82.0
+    row["execution_quality"] = 82.0
+    row["execution_score"] = 82.0
+    row["chase_distance_atr"] = chase_distance_atr
+    _set_gate(row, "OVERALL_QUALITY_BELOW_MINIMUM", True, 82.0)
+    _set_gate(row, "EXECUTION_QUALITY_BELOW_MINIMUM", True, 82.0)
+    row["gate_evaluation"]["gates"].append(
+        _gate(
+            "PRICE_TOO_EXTENDED",
+            False,
+            chase_distance_atr,
+            {"operator": "<=", "value": 1.0},
+        )
+    )
+    return row
+
+
 def test_duplicate_checks_count_once_and_revalidation_does_not_inflate_count():
     row = _row()
     checks = build_deduplicated_check_registry(row)
@@ -165,7 +185,7 @@ def test_private_beta_overall_floor_can_be_77_without_changing_public(monkeypatc
     monkeypatch.setenv("PRIVATE_BETA_MIN_OVERALL_QUALITY", "77")
     trial_result = evaluate_private_beta_qualification(row)
     assert trial_result["private_beta_min_overall_quality"] == 77.0
-    assert trial_result["qualification_policy_variant"].endswith("overall_77")
+    assert ":overall_77:" in trial_result["qualification_policy_variant"]
     assert trial_result["overall_quality_passed"] is True
     assert trial_result["private_beta_qualified"] is True
 
@@ -255,6 +275,139 @@ def test_hard_and_mandatory_failures_always_reject():
         for check in cost_result["failed_hard_checks"]
     )
     assert cost_result["private_beta_qualified"] is False
+
+
+def test_high_quality_override_allows_one_moderate_entry_extension_only():
+    row = _high_quality_override_row()
+    result = evaluate_private_beta_qualification(row)
+    assert result["private_beta_qualified"] is True
+    assert result["base_private_beta_qualified"] is False
+    assert result["high_quality_override_applied"] is True
+    assert result["qualification_type"] == "high_quality_override"
+    assert result["immediate_sl_override_guard_passed"] is True
+    assert [
+        check["canonical_check_id"] for check in result["failed_hard_checks"]
+    ] == ["entry_extension"]
+    assert result["high_quality_override_check"] == {
+        "eligible": True,
+        "canonical_check_id": "entry_extension",
+        "actual_chase_distance_atr": 1.2,
+        "normal_max_chase_distance_atr": 1.0,
+        "absolute_max_chase_distance_atr": 1.35,
+        "reason": (
+            "Moderate entry extension passed the existing absolute execution boundary"
+        ),
+    }
+
+
+def test_high_quality_override_never_allows_extreme_or_critical_failures():
+    extreme = _high_quality_override_row(1.36)
+    extreme_result = evaluate_private_beta_qualification(extreme)
+    assert extreme_result["high_quality_override_applied"] is False
+    assert extreme_result["private_beta_qualified"] is False
+
+    stale = _high_quality_override_row()
+    _set_gate(stale, "DATA_QUALITY_FAILED", False, False)
+    stale_result = evaluate_private_beta_qualification(stale)
+    assert stale_result["high_quality_override_applied"] is False
+    assert stale_result["private_beta_qualified"] is False
+
+    wide_stop = _high_quality_override_row()
+    wide_stop["gate_evaluation"]["gates"].append(
+        _gate("STOP_TOO_WIDE", False, 3.2, {"operator": "<=", "value": 3.0})
+    )
+    stop_result = evaluate_private_beta_qualification(wide_stop)
+    assert stop_result["high_quality_override_applied"] is False
+    assert stop_result["private_beta_qualified"] is False
+
+
+def test_high_quality_override_critical_failure_allowlist_is_fail_closed():
+    critical_failures = (
+        ("INVALIDATED_BEFORE_ENTRY", "invalidated", "valid"),
+        ("TP1_ALREADY_PROGRESSING", 100.0, {"operator": "<", "value": 70}),
+        ("DATA_QUALITY_FAILED", False, True),
+        ("STALE_TICKER", 46.0, {"operator": "<=", "value": 45}),
+        ("STALE_ORDER_BOOK", 31.0, {"operator": "<=", "value": 30}),
+        ("MARKET_UNAVAILABLE", "unsupported", "supported"),
+        ("REVALIDATION_FAILED", False, True),
+    )
+    for code, actual, required in critical_failures:
+        row = _row()
+        row["confidence"] = 82.0
+        row["execution_quality"] = 82.0
+        row["execution_score"] = 82.0
+        _set_gate(row, "OVERALL_QUALITY_BELOW_MINIMUM", True, 82.0)
+        _set_gate(row, "EXECUTION_QUALITY_BELOW_MINIMUM", True, 82.0)
+        row["gate_evaluation"]["gates"].append(
+            _gate(code, False, actual, required)
+        )
+        result = evaluate_private_beta_qualification(row)
+        assert result["high_quality_override_applied"] is False, code
+        assert result["private_beta_qualified"] is False, code
+
+
+def test_high_quality_override_preserves_scores_immediate_sl_and_net_rr_guards():
+    low_overall = _high_quality_override_row()
+    low_overall["confidence"] = 79.9
+    _set_gate(low_overall, "OVERALL_QUALITY_BELOW_MINIMUM", True, 79.9)
+    assert evaluate_private_beta_qualification(low_overall)[
+        "private_beta_qualified"
+    ] is False
+
+    low_execution = _high_quality_override_row()
+    low_execution["execution_quality"] = 79.9
+    low_execution["execution_score"] = 79.9
+    _set_gate(low_execution, "EXECUTION_QUALITY_BELOW_MINIMUM", True, 79.9)
+    assert evaluate_private_beta_qualification(low_execution)[
+        "private_beta_qualified"
+    ] is False
+
+    immediate_sl = _high_quality_override_row()
+    _set_gate(immediate_sl, "IMMEDIATE_SL_RISK_TOO_HIGH", False, 33.0)
+    immediate_result = evaluate_private_beta_qualification(immediate_sl)
+    assert immediate_result["important_soft_pass_count"] == 2
+    assert immediate_result["immediate_sl_override_guard_passed"] is False
+    assert immediate_result["private_beta_qualified"] is False
+
+    low_net_rr = _high_quality_override_row()
+    low_net_rr["net_risk_reward"] = [0.5, 0.74]
+    _set_gate(low_net_rr, "NET_RR_BELOW_MINIMUM", False, 0.74)
+    low_rr_result = evaluate_private_beta_qualification(low_net_rr)
+    assert low_rr_result["net_rr_floor_passed"] is False
+    assert low_rr_result["private_beta_qualified"] is False
+
+
+def test_high_quality_override_is_persisted_displayed_and_private_only():
+    row = _high_quality_override_row()
+    qualification = evaluate_private_beta_qualification(row)
+    row["qualification"] = qualification
+    row["qualification_policy_version"] = qualification[
+        "qualification_policy_version"
+    ]
+    record = build_candidate_record(None, row, source="override-test")
+    stored = record["decision"]["qualification"]
+    assert stored["high_quality_override_applied"] is True
+    assert stored["high_quality_override_check"][
+        "canonical_check_id"
+    ] == "entry_extension"
+
+    caption = format_signal_photo_caption(row)
+    assert "HIGH QUALITY OVERRIDE" in caption
+    assert "Entry extension: 1.20 ATR" in caption
+    assert "1.35" in caption
+    assert len(caption) <= 1024
+
+    public_row = {
+        **row,
+        "signal_eligible": True,
+        "prop_safe": True,
+        "immediate_sl_risk": 20,
+        "spread_bps": 2,
+    }
+    assert filter_high_confidence(
+        [public_row], min_llm=65, min_rank=50, only_prop_safe=False,
+        min_execution_score=72,
+    ) == []
 
 
 def test_two_important_checks_are_required_and_missing_evidence_rejects():

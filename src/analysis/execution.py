@@ -592,7 +592,7 @@ def build_execution_profile(
         candle, flow_alignment, book_alignment, setup_type, bos_agrees, structure
     )
     stop_quality = _stop_quality(
-        stop_distance / atr, candle, spread_bps, slippage_bps, anchor_health, expected_hold_hours
+        stop_distance / atr, candle, anchor_health, expected_hold_hours
     )
     target_feasibility_score = (
         float(clamp(0.60 * target_quality[0] + 0.40 * np.mean(target_quality), 0, 100))
@@ -1126,18 +1126,15 @@ def _confirmation_quality(
 def _stop_quality(
     stop_atr: float,
     candle: CandleContext,
-    spread_bps: Optional[float],
-    slippage_bps: float,
     anchor_health: float,
     expected_hold_hours: float,
 ) -> float:
     noise_floor = max(0.70, candle.noise_atr * 0.82)
     tight = max(0.0, noise_floor - stop_atr) * 85.0
     wide = max(0.0, stop_atr - 2.20) * (18.0 + min(12.0, expected_hold_hours))
-    friction = max(0.0, (spread_bps or 0.0) + slippage_bps - 12.0) * 1.5
     wick_risk = 14.0 if candle.adverse_rejection else 0.0
     structural = 0.20 * anchor_health
-    return float(clamp(82.0 + structural - tight - wide - friction - wick_risk, 0, 100))
+    return float(clamp(82.0 + structural - tight - wide - wick_risk, 0, 100))
 
 
 def _data_market_quality(

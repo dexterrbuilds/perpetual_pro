@@ -12,13 +12,20 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from src.analysis.execution_policy import DEFAULT_EXECUTION_POLICY
 
-QUALIFICATION_POLICY_VERSION = "private_beta_important_soft_v1"
+QUALIFICATION_POLICY_VERSION = "private_beta_high_quality_override_v1"
 PRIVATE_BETA_MIN_IMPORTANT_SOFT_PASSES = 2
 PRIVATE_BETA_NET_RR_FLOOR = 0.75
 PRIVATE_BETA_PREFERRED_NET_RR = 1.25
 PRIVATE_BETA_MIN_OVERALL_QUALITY_DEFAULT = 78.0
 PRIVATE_BETA_MIN_OVERALL_QUALITY_ENV = "PRIVATE_BETA_MIN_OVERALL_QUALITY"
+HIGH_QUALITY_OVERRIDE_MIN_OVERALL = 80.0
+HIGH_QUALITY_OVERRIDE_MIN_EXECUTION = 80.0
+HIGH_QUALITY_OVERRIDE_ALLOWED_HARD_CHECK_IDS = frozenset({"entry_extension"})
+HIGH_QUALITY_OVERRIDE_MAX_CHASE_DISTANCE_ATR = (
+    DEFAULT_EXECUTION_POLICY.max_retest_distance_atr
+)
 IMPORTANT_SOFT_CHECK_IDS = frozenset(
     {"directional_confluence", "immediate_sl_risk", "net_rr"}
 )
@@ -421,6 +428,87 @@ def _authoritative_rank(
     return available, value if available else None
 
 
+def _required_numeric(value: Any) -> Optional[float]:
+    if isinstance(value, Mapping):
+        return _numeric(value.get("value"))
+    return _numeric(value)
+
+
+def _moderate_entry_extension_override(
+    row: Mapping[str, Any],
+    gate_evaluation: Optional[Mapping[str, Any]],
+    failed_hard: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Validate the sole overrideable hard failure without changing its gate.
+
+    The normal alert preference remains 1.0 ATR.  A high-quality private-beta
+    candidate may continue to final force-refresh only when its sole hard
+    failure is numeric entry extension and it remains within the execution
+    planner's existing 1.35 ATR absolute boundary.  Categorical ``avoid_chase``
+    states without a numeric extension failure are never overridden.
+    """
+    result = {
+        "eligible": False,
+        "canonical_check_id": None,
+        "actual_chase_distance_atr": _numeric(row.get("chase_distance_atr")),
+        "normal_max_chase_distance_atr": None,
+        "absolute_max_chase_distance_atr": (
+            HIGH_QUALITY_OVERRIDE_MAX_CHASE_DISTANCE_ATR
+        ),
+        "reason": "No overrideable hard failure",
+    }
+    if len(failed_hard) != 1:
+        return result
+    failed = dict(failed_hard[0])
+    check_id = str(failed.get("canonical_check_id") or "")
+    result["canonical_check_id"] = check_id or None
+    if check_id not in HIGH_QUALITY_OVERRIDE_ALLOWED_HARD_CHECK_IDS:
+        result["reason"] = (
+            "The failed hard check is critical or not overrideable"
+        )
+        return result
+
+    evaluation = dict(gate_evaluation or row.get("gate_evaluation") or {})
+    numeric_gate = next(
+        (
+            dict(gate)
+            for gate in reversed(list(evaluation.get("gates") or []))
+            if str(gate.get("code") or "") == "PRICE_TOO_EXTENDED"
+            and not bool(gate.get("passed"))
+        ),
+        None,
+    )
+    if numeric_gate is None:
+        result["reason"] = (
+            "Entry extension was not supported by a failed numeric chase gate"
+        )
+        return result
+    normal_limit = _required_numeric(numeric_gate.get("required_value"))
+    chase_distance = _numeric(row.get("chase_distance_atr"))
+    if chase_distance is None:
+        chase_distance = _numeric(numeric_gate.get("actual_value"))
+    result["actual_chase_distance_atr"] = chase_distance
+    result["normal_max_chase_distance_atr"] = normal_limit
+    if normal_limit is None or chase_distance is None:
+        result["reason"] = (
+            "Numeric chase distance or its normal limit was unavailable"
+        )
+        return result
+    if not (
+        chase_distance > normal_limit
+        and chase_distance <= HIGH_QUALITY_OVERRIDE_MAX_CHASE_DISTANCE_ATR
+    ):
+        result["reason"] = (
+            "Chase distance was not inside the bounded moderate-extension range"
+        )
+        return result
+    result["eligible"] = True
+    result["reason"] = (
+        "Moderate entry extension passed the existing absolute execution boundary"
+    )
+    return result
+
+
 def evaluate_private_beta_qualification(
     row: Mapping[str, Any],
     gate_evaluation: Optional[Mapping[str, Any]] = None,
@@ -502,10 +590,8 @@ def evaluate_private_beta_qualification(
         None,
     )
     overall_floor = private_beta_min_overall_quality()
+    overall_actual = _numeric(row.get("confidence", row.get("overall_quality")))
     if overall is not None:
-        overall_actual = _numeric(
-            row.get("confidence", row.get("overall_quality"))
-        )
         if overall_actual is None:
             overall_actual = _numeric(overall.get("actual_value"))
         overall["actual_value"] = overall_actual
@@ -523,35 +609,82 @@ def evaluate_private_beta_qualification(
         )
     overall_passed = bool(overall and overall["passed"])
     execution_passed = bool(execution and execution["passed"])
+    execution_actual = _numeric(
+        row.get("execution_quality", row.get("execution_score"))
+    )
+    if execution_actual is None and execution is not None:
+        execution_actual = _numeric(execution.get("actual_value"))
     hard_passed = not failed_hard
     net_rr = _authoritative_net_rr(row, important)
     net_rr_floor_passed = bool(
         net_rr is not None and net_rr + 1e-9 >= PRIVATE_BETA_NET_RR_FLOOR
     )
-    qualifies = private_beta_threshold_passes(
+    base_qualifies = private_beta_threshold_passes(
         hard_passed=hard_passed,
         overall_quality_passed=overall_passed,
         execution_quality_passed=execution_passed,
         important_soft_passed=len(passed_important),
         net_rr_floor_passed=net_rr_floor_passed,
     )
+    immediate_sl_check = next(
+        (
+            item for item in important
+            if item.get("canonical_check_id") == "immediate_sl_risk"
+        ),
+        None,
+    )
+    immediate_sl_override_guard_passed = bool(
+        immediate_sl_check and immediate_sl_check.get("passed")
+    )
+    override_check = _moderate_entry_extension_override(
+        row, gate_evaluation, failed_hard
+    )
+    override_applied = bool(
+        not base_qualifies
+        and override_check["eligible"]
+        and overall_actual is not None
+        and overall_actual >= HIGH_QUALITY_OVERRIDE_MIN_OVERALL
+        and overall_passed
+        and execution_actual is not None
+        and execution_actual >= HIGH_QUALITY_OVERRIDE_MIN_EXECUTION
+        and execution_passed
+        and len(passed_important) >= PRIVATE_BETA_MIN_IMPORTANT_SOFT_PASSES
+        and immediate_sl_override_guard_passed
+        and net_rr_floor_passed
+    )
+    qualifies = bool(base_qualifies or override_applied)
     if (
-        qualifies
+        base_qualifies
         and len(important) >= 3
         and len(passed_important) == len(important)
     ):
         qualification_type = "fully_qualified"
-    elif qualifies:
+    elif base_qualifies:
         qualification_type = "qualified_beta"
+    elif override_applied:
+        qualification_type = "high_quality_override"
     else:
         qualification_type = "rejected"
     return {
         "qualification_policy_version": QUALIFICATION_POLICY_VERSION,
         "qualification_policy_variant": (
-            f"{QUALIFICATION_POLICY_VERSION}:overall_{overall_floor:g}"
+            f"{QUALIFICATION_POLICY_VERSION}:overall_{overall_floor:g}:"
+            f"hq_{HIGH_QUALITY_OVERRIDE_MIN_OVERALL:g}_"
+            f"exec_{HIGH_QUALITY_OVERRIDE_MIN_EXECUTION:g}"
         ),
         "qualification_type": qualification_type,
         "private_beta_qualified": qualifies,
+        "base_private_beta_qualified": base_qualifies,
+        "high_quality_override_applied": override_applied,
+        "high_quality_override_min_overall": HIGH_QUALITY_OVERRIDE_MIN_OVERALL,
+        "high_quality_override_min_execution": HIGH_QUALITY_OVERRIDE_MIN_EXECUTION,
+        "high_quality_override_allowed_hard_check_ids": sorted(
+            HIGH_QUALITY_OVERRIDE_ALLOWED_HARD_CHECK_IDS
+        ),
+        "high_quality_override_check": override_check,
+        "immediate_sl_override_guard_passed": (
+            immediate_sl_override_guard_passed
+        ),
         "applicable_hard_checks": hard,
         "passed_hard_checks": passed_hard,
         "failed_hard_checks": failed_hard,

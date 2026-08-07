@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import main_server
+from src.analysis.qualification import QUALIFICATION_POLICY_VERSION
 from src.scheduler import scan_job
 from src.utils.config import load_config
 
@@ -84,7 +85,7 @@ def _signal(symbol="BTC/USDT:USDT"):
         "signal_generated_at": "2026-08-04T12:30:00Z",
         "gate_evaluation": {"gates": []},
         "qualification": {
-            "qualification_policy_version": "private_beta_important_soft_v1",
+            "qualification_policy_version": QUALIFICATION_POLICY_VERSION,
             "qualification_type": "fully_qualified",
             "private_beta_qualified": True,
             "important_soft_pass_count": 3,

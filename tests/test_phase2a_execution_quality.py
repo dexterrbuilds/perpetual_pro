@@ -109,11 +109,57 @@ def test_liquidity_missing_is_not_neutral():
 
 def test_stop_quality_penalizes_tight_and_wide_stops_symmetrically():
     candle = CandleContext(noise_atr=1.1)
-    good = _stop_quality(1.2, candle, 2, 3, 80, 8)
-    tight = _stop_quality(.45, candle, 2, 3, 80, 8)
-    wide = _stop_quality(3.0, candle, 2, 3, 80, 8)
+    good = _stop_quality(1.2, candle, 80, 8)
+    tight = _stop_quality(.45, candle, 80, 8)
+    wide = _stop_quality(3.0, candle, 80, 8)
     assert good > tight
     assert good > wide
+
+
+def test_spread_and_slippage_affect_liquidity_but_not_stop_quality():
+    df = frame()
+    common = {
+        "symbol": "BTC/USDT:USDT",
+        "exchange_id": "okx",
+        "last": 100.7,
+        "orderbook_imbalance": 0.1,
+        "ticker_age_seconds": 1.0,
+        "orderbook_age_seconds": 1.0,
+        "execution_data_fresh": True,
+        "estimated_impact_bps": 1.0,
+        "raw": {
+            "orderbook_summary": {
+                "bid_depth_usd_10bps": 100_000,
+                "ask_depth_usd_10bps": 100_000,
+                "estimated_impact_bps": 1.0,
+            }
+        },
+    }
+    low_friction = build_execution_profile(
+        df,
+        suite(df),
+        structure(),
+        direction="long",
+        price=100.7,
+        atr=1.0,
+        snapshot=MarketSnapshot(spread_bps=2.0, **common),
+    )
+    high_friction = build_execution_profile(
+        df,
+        suite(df),
+        structure(),
+        direction="long",
+        price=100.7,
+        atr=1.0,
+        snapshot=MarketSnapshot(spread_bps=11.0, **common),
+    )
+    assert high_friction.components["stop_quality"] == pytest.approx(
+        low_friction.components["stop_quality"]
+    )
+    assert (
+        high_friction.components["liquidity_cost_quality"]
+        < low_friction.components["liquidity_cost_quality"]
+    )
 
 
 def test_fresh_zone_outscores_consumed_zone():

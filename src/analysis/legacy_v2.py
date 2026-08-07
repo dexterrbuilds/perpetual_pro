@@ -55,7 +55,10 @@ def execution_aware_legacy_confidence(
     """
     technical = float(clamp(technical_confidence, 0.0, 100.0))
     execution = float(clamp(execution_score, 0.0, 100.0))
-    immediate_sl_penalty = max(0.0, float(immediate_sl_risk) - 28.0) * 0.20
+    # Passing signals should not be scored down twice for the same risk. The
+    # execution components already capture stop/confirmation/survival quality,
+    # while the unchanged hard Immediate-SL gate rejects values above 32.
+    immediate_sl_penalty = max(0.0, float(immediate_sl_risk) - 32.0) * 0.20
     data_quality_penalty = max(0.0, 75.0 - float(data_quality_score)) * 0.20
     legacy_adjustment = float(
         clamp((execution - 70.0) * 0.12, -10.0, 3.0)
