@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from src.experiments.comparison import build_comparison_report
 from src.experiments.identity import bot_namespace, is_legacy_comparison
@@ -186,3 +187,11 @@ def test_comparison_report_separates_legacy_only_and_agreed_signals():
     assert report["both_policies"] == 1
     assert report["maximum_losing_streak"] == 1
     assert report["maximum_winning_streak"] == 1
+
+
+def test_legacy_entrypoint_requires_separate_credentials_when_enabled():
+    source = Path("legacy_server.py").read_text(encoding="utf-8")
+    assert '_require("LEGACY_TELEGRAM_BOT_TOKEN")' in source
+    assert '_require("LEGACY_BETA_CHAT_IDS")' in source
+    assert 'os.environ["DELIVERY_MODE"] = "private_beta"' in source
+    assert 'os.getenv("TELEGRAM_ENABLED", "1")' in source

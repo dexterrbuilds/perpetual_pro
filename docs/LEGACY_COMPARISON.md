@@ -19,7 +19,8 @@ candidate. It cannot deliver, register a lifecycle, or influence Legacy.
 
 - Strict remains on `main`; Legacy runs from `codex/legacy-comparison`.
 - Start Legacy with `uvicorn legacy_server:app --host 0.0.0.0 --port $PORT`.
-- Legacy Telegram credentials are mandatory and separate.
+- Legacy Telegram credentials are mandatory and separate whenever delivery is
+  enabled. A guarded `TELEGRAM_ENABLED=0` deployment may start without them.
 - Candidate/outcome IDs use `legacy_cand_` / `legacy_sig_` prefixes.
 - Operational lifecycle, event, notification, and scheduler tables live in the
   additive `legacy_comparison` Supabase schema created by migration 006.
