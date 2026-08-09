@@ -82,6 +82,8 @@ from src.tracking.signal_tracker import (
 )
 from src.utils.config import load_config, setup_logging
 from src.utils.build_info import get_build_identity
+from src.experiments.identity import is_legacy_comparison
+from src.experiments.comparison import ComparisonRepository
 
 # ---------------------------------------------------------------------------
 # App
@@ -146,7 +148,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="perpetual_pro",
+    title=("Perpetual Pro Legacy" if is_legacy_comparison() else "perpetual_pro"),
     description=(
         "Professional crypto perpetual futures analysis API. "
         "Upload a chart screenshot for OCR + full pro analysis "
@@ -170,7 +172,7 @@ app.add_middleware(
 @app.get("/")
 def root() -> Dict[str, Any]:
     return {
-        "app": "perpetual_pro",
+        "app": "perpetual_pro_legacy" if is_legacy_comparison() else "perpetual_pro",
         "version": __version__,
         "docs": "/docs",
         "endpoints": {
@@ -286,6 +288,30 @@ def admin_status(
             "last_latency_ms": rejection_repository.last_latency_ms,
         },
     }
+
+
+@app.get("/admin/legacy/comparison")
+def legacy_comparison_report(
+    request: Request,
+    days: int = 7,
+    x_scan_api_key: Optional[str] = Header(None, alias="X-Scan-API-Key"),
+) -> JSONResponse:
+    """Protected A/B report; strict-shadow decisions never gain authority."""
+    SCAN_ACCESS.authorize(request, x_scan_api_key)
+    if not is_legacy_comparison():
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "error": "legacy_comparison_not_active"},
+        )
+    if days < 1 or days > 90:
+        raise HTTPException(status_code=422, detail="days must be between 1 and 90")
+    result = ComparisonRepository(
+        get_config().outcome_scoring.database_url
+    ).report(days=days)
+    return JSONResponse(
+        status_code=200 if result.get("ok") else 503,
+        content=result,
+    )
 
 
 @app.get("/admin/scheduler/status")

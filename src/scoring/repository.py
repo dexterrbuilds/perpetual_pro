@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from loguru import logger
+from src.experiments.storage import operational_relation
 
 try:
     import psycopg
@@ -39,6 +40,7 @@ class OutcomeRepository:
     def __init__(self, database_url: str) -> None:
         self.database_url = str(database_url or "").strip()
         self.enabled = bool(self.database_url and psycopg is not None)
+        self._tracked_signals = operational_relation("tracked_signals")
         self._status_lock = threading.Lock()
         self._status: Dict[str, Any] = {
             "configured": bool(self.database_url),
@@ -164,8 +166,8 @@ class OutcomeRepository:
         row_payload = dict(signal.get("row") or {})
         candidate_id = row_payload.get("candidate_id")
         targets = list(signal.get("take_profits") or [])
-        sql = """
-            insert into public.tracked_signals (
+        sql = f"""
+            insert into {self._tracked_signals} (
                 signal_id, candidate_id, symbol, exchange_id, direction,
                 timeframe, source, status, generated_at, valid_until,
                 entered_at, terminal_at, entry_low, entry_high, entry_mid,

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 from loguru import logger
+from src.experiments.storage import operational_relation
 
 try:
     import psycopg
@@ -31,6 +32,8 @@ class SchedulerRunRepository:
     def __init__(self, database_url: str) -> None:
         self.database_url = str(database_url or "").strip()
         self.enabled = bool(self.database_url and psycopg is not None)
+        self._runs = operational_relation("scheduler_runs")
+        self._deliveries = operational_relation("scheduler_run_deliveries")
 
     def _connect(self):
         if not self.enabled:
@@ -56,8 +59,8 @@ class SchedulerRunRepository:
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    """
-                    insert into public.scheduler_runs (
+                    f"""
+                    insert into {self._runs} (
                       run_id, source, slot_label, scheduled_for, started_at,
                       status, symbols_requested
                     ) values (%s,%s,%s,%s,now(),'running',%s)
@@ -94,8 +97,8 @@ class SchedulerRunRepository:
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    """
-                    update public.scheduler_runs set
+                    f"""
+                    update {self._runs} set
                       completed_at=now(), status=%s,
                       symbols_analyzed=%s, symbol_failures=%s,
                       eligible_candidates=%s, revalidated_candidates=%s,
@@ -121,8 +124,8 @@ class SchedulerRunRepository:
                 )
                 for delivery in deliveries:
                     cursor.execute(
-                        """
-                        insert into public.scheduler_run_deliveries (
+                        f"""
+                        insert into {self._deliveries} (
                           idempotency_key, run_id, destination_hash,
                           delivery_type, status, telegram_message_id,
                           attempted_at, delivered_at, error_category
@@ -170,14 +173,14 @@ class SchedulerRunRepository:
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     select run_id, source, slot_label, scheduled_for, started_at,
                            completed_at, status, symbols_requested,
                            symbols_analyzed, symbol_failures,
                            eligible_candidates, revalidated_candidates,
                            rejected_candidates, scan_duration_seconds,
                            result_code, result_summary
-                    from public.scheduler_runs where run_id=%s
+                    from {self._runs} where run_id=%s
                     """,
                     (str(run_id),),
                 )
@@ -193,17 +196,17 @@ class SchedulerRunRepository:
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     select run_id, source, slot_label, scheduled_for, started_at,
                            completed_at, status, symbols_requested,
                            symbols_analyzed, symbol_failures,
                            eligible_candidates, revalidated_candidates,
                            rejected_candidates, scan_duration_seconds,
                            result_code, result_summary
-                    from public.scheduler_runs
+                    from {self._runs}
                     where source='scheduled'
                     order by scheduled_for desc nulls last limit 1
-                    """
+                    f"""
                 )
                 row = cursor.fetchone()
             return dict(row) if row else None
@@ -224,11 +227,11 @@ class SchedulerRunRepository:
                            eligible_candidates, revalidated_candidates,
                            rejected_candidates, scan_duration_seconds,
                            result_code, result_summary
-                    from public.scheduler_runs
+                    from {self._runs}
                     where source='scheduled'
                       and slot_label like 'Private beta hourly scan%'
                     order by scheduled_for desc nulls last limit 1
-                    """
+                    f"""
                 )
                 row = cursor.fetchone()
             return dict(row) if row else None
@@ -243,7 +246,7 @@ class SchedulerRunRepository:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    select 1 from public.scheduler_run_deliveries
+                    select 1 from {self._deliveries}
                     where idempotency_key=%s and status='delivered' limit 1
                     """,
                     (str(idempotency_key),),
@@ -264,8 +267,8 @@ class SchedulerRunRepository:
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    """
-                    insert into public.scheduler_run_deliveries (
+                    f"""
+                    insert into {self._deliveries} (
                       idempotency_key, run_id, destination_hash,
                       delivery_type, status, telegram_message_id,
                       attempted_at, delivered_at, error_category
@@ -320,14 +323,14 @@ class SchedulerRunRepository:
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     select run_id, source, slot_label, scheduled_for, started_at,
                            completed_at, status, symbols_requested,
                            symbols_analyzed, symbol_failures,
                            eligible_candidates, revalidated_candidates,
                            rejected_candidates, scan_duration_seconds,
                            result_code
-                    from public.scheduler_runs
+                    from {self._runs}
                     order by started_at desc limit 1
                     """
                 )

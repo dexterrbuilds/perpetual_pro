@@ -20,6 +20,7 @@ import requests
 from loguru import logger
 
 from src.utils.config import AppConfig, TelegramConfig
+from src.experiments.identity import identity_metadata, is_legacy_comparison
 
 TELEGRAM_API_ROOT = "https://api.telegram.org"
 DELIVERY_MODE_PRIVATE_BETA = "private_beta"
@@ -176,8 +177,13 @@ def get_delivery_status() -> Dict[str, Any]:
     beta_count = len(get_private_beta_chat_ids())
     public_count = len(get_telegram_public_alert_chat_ids())
     return {
+        **identity_metadata(),
         "mode": mode,
-        "mode_label": "PRIVATE BETA" if mode == DELIVERY_MODE_PRIVATE_BETA else "PUBLIC",
+        "mode_label": (
+            "LEGACY PRIVATE BETA"
+            if is_legacy_comparison()
+            else ("PRIVATE BETA" if mode == DELIVERY_MODE_PRIVATE_BETA else "PUBLIC")
+        ),
         "beta_recipient_count": beta_count,
         "public_delivery_enabled": bool(
             mode == DELIVERY_MODE_PUBLIC and public_count > 0
@@ -646,6 +652,8 @@ def format_signal_photo_caption(
         f"📌 <b>Entry mode:</b> {html.escape(entry_mode)}",
         f"🛑 <b>Stop:</b> {_caption_price(stop)}",
     ]
+    if is_legacy_comparison():
+        lines.insert(0, "🧪 <b>PERPETUAL PRO LEGACY</b>")
     lines = [line for line in lines if line]
     if targets:
         lines.extend(
@@ -704,12 +712,39 @@ def format_signal_photo_caption(
         )
     if quality_bits:
         lines.append(f"🛡 <b>Quality:</b> {html.escape(' · '.join(quality_bits))}")
-    qualification = dict(
-        row.get("qualification")
-        or payload.get("qualification")
-        or {}
-    )
-    lines.extend(_signal_qualification_lines(qualification))
+    if is_legacy_comparison():
+        legacy_decision = dict(
+            row.get("legacy_decision")
+            or payload.get("legacy_decision")
+            or {}
+        )
+        tier = dict(
+            row.get("quality_tier")
+            or legacy_decision.get("quality_tier")
+            or {}
+        )
+        if tier:
+            lines.append(
+                f"{html.escape(str(tier.get('badge') or '🧪'))} "
+                f"<b>{html.escape(str(tier.get('label') or 'LEGACY SETUP'))}</b>"
+            )
+        caveats = list(row.get("caveats") or legacy_decision.get("caveats") or [])
+        if caveats:
+            lines.append("⚠️ <b>Legacy caveats</b>")
+            for caveat in caveats[:2]:
+                explanation = (
+                    caveat.get("explanation")
+                    if isinstance(caveat, dict)
+                    else str(caveat)
+                )
+                lines.append(f"• {html.escape(str(explanation)[:105])}")
+    else:
+        qualification = dict(
+            row.get("qualification")
+            or payload.get("qualification")
+            or {}
+        )
+        lines.extend(_signal_qualification_lines(qualification))
     guidance = dict(
         row.get("prop_guidance")
         or payload.get("prop_guidance")
@@ -1534,7 +1569,8 @@ def send_test_telegram_alert(source: str = "manual") -> Dict[str, Any]:
         }
     when = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S UTC")
     message = (
-        "✅ <b>Perpetual Pro Telegram test</b>\n"
+        ("🧪 <b>PERPETUAL PRO LEGACY</b>\n" if is_legacy_comparison() else "")
+        + "✅ <b>Perpetual Pro Telegram test</b>\n"
         f"Source: {html.escape(source)}\n"
         f"Time: {when}\n"
         "Credentials, chat access, and message delivery are working."
@@ -1566,7 +1602,11 @@ def format_prop_scan_report(
     except Exception:  # noqa: BLE001
         when = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    header = "📊 <b>Perpetual Pro Prop Scan</b>"
+    header = (
+        "🧪 <b>PERPETUAL PRO LEGACY</b>\n📊 <b>Legacy Comparison Scan</b>"
+        if is_legacy_comparison()
+        else "📊 <b>Perpetual Pro Prop Scan</b>"
+    )
     if slot_label:
         header += f" · {html.escape(slot_label)}"
     lines = [
@@ -1701,7 +1741,11 @@ def format_prop_scan_report(
                 )
         lines += [
             "━━━━━━━━━━━━━━",
-            "🛡 <b>No rules were relaxed.</b>",
+            (
+                "🧪 <b>Legacy comparison policy applied.</b>"
+                if is_legacy_comparison()
+                else "🛡 <b>No rules were relaxed.</b>"
+            ),
             "Sometimes the highest-probability trade is waiting.",
             "No rejected setup is a trade signal.",
             "NFA · DYOR · Trade at your own risk",

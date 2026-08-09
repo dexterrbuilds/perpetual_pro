@@ -30,6 +30,12 @@ from src.analytics.rejection import (
 from src.analytics.runtime import get_rejection_repository
 from src.analysis.confluence import ConfluenceEngine, FullAnalysis
 from src.analysis.qualification import evaluate_private_beta_qualification
+from src.experiments.identity import identity_metadata, is_legacy_comparison
+from src.experiments.legacy_policy import (
+    LEGACY_POLICY_VERSION,
+    evaluate_legacy_qualification,
+    strict_shadow_decision,
+)
 from src.analysis.risk import RiskManager
 from src.data.exchange import EXCHANGE_MAP, normalize_exchange_id
 from src.data.multi_tf import fetch_multi_timeframe_with_fallback
@@ -1298,6 +1304,60 @@ def scan_symbols(
                         "private_beta_net_rr_floor"
                     ],
                 }
+                if is_legacy_comparison():
+                    legacy_decision = evaluate_legacy_qualification(row)
+                    shadow_decision = strict_shadow_decision(row)
+                    row.update(identity_metadata())
+                    row["strict_production_qualified"] = bool(
+                        row.get("production_qualified")
+                    )
+                    row["legacy_decision"] = legacy_decision
+                    row["strict_shadow_decision"] = shadow_decision
+                    row["legacy_comparison_qualified"] = bool(
+                        legacy_decision.get("qualified")
+                    )
+                    row["quality_tier"] = legacy_decision.get("quality_tier")
+                    row["caveats"] = list(legacy_decision.get("caveats") or [])
+                    row["legacy_qualification_policy_version"] = (
+                        LEGACY_POLICY_VERSION
+                    )
+                    row["payload"].update(identity_metadata())
+                    row["payload"]["legacy_decision"] = legacy_decision
+                    row["payload"]["strict_shadow_decision"] = shadow_decision
+                    row["payload"]["quality_tier"] = row["quality_tier"]
+                    row["payload"]["caveats"] = row["caveats"]
+                    candidate["decision"].update(identity_metadata())
+                    candidate["decision"]["legacy_decision"] = legacy_decision
+                    candidate["decision"]["strict_shadow_decision"] = (
+                        shadow_decision
+                    )
+                    candidate["decision"]["strict_production_qualified"] = (
+                        row["strict_production_qualified"]
+                    )
+                    candidate["production_scores"].update(identity_metadata())
+                    candidate["production_scores"]["legacy_decision"] = {
+                        "qualified": bool(legacy_decision.get("qualified")),
+                        "quality_tier": legacy_decision.get("quality_tier"),
+                        "overall_quality": legacy_decision.get("overall_quality"),
+                        "execution_quality": legacy_decision.get("execution_quality"),
+                        "net_rr": legacy_decision.get("net_rr"),
+                        "gross_rr": legacy_decision.get("gross_rr"),
+                        "caveats": list(legacy_decision.get("caveats") or []),
+                        "policy_version": LEGACY_POLICY_VERSION,
+                    }
+                    candidate["production_scores"]["strict_shadow_decision"] = (
+                        shadow_decision
+                    )
+                    candidate["production_eligible"] = bool(
+                        legacy_decision.get("qualified")
+                    )
+                    # Legacy shares the candidate journal for A/B reporting,
+                    # but its rows must never enter Strict model training.
+                    candidate["decision"]["comparison_directional_candidate"] = (
+                        str(row.get("direction") or "").lower()
+                        in {"long", "short"}
+                    )
+                    candidate["is_directional_candidate"] = False
                 evaluated_direction = str(
                     row.get("evaluated_direction") or ""
                 ).lower()

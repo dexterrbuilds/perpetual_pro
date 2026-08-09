@@ -9,6 +9,7 @@ from typing import Any, Dict
 from src import __version__
 from src.analysis.execution_policy import EXECUTION_POLICY_VERSION, RANK_POLICY_VERSION
 from src.scoring.features import FEATURE_SCHEMA_VERSION
+from src.experiments.identity import identity_metadata
 
 
 def get_build_identity() -> Dict[str, Any]:
@@ -24,6 +25,7 @@ def get_build_identity() -> Dict[str, Any]:
         or "local"
     ).strip()
     return {
+        **identity_metadata(),
         "application_version": __version__,
         "git_commit_sha": commit,
         "build_timestamp": timestamp,
@@ -34,4 +36,3 @@ def get_build_identity() -> Dict[str, Any]:
         "identity_complete": bool(commit != "unknown" and timestamp != "unknown"),
         "reported_at": datetime.now(timezone.utc).isoformat(),
     }
-

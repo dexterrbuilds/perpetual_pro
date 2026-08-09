@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from loguru import logger
+from src.experiments.storage import operational_relation, operational_schema
 
 try:
     import psycopg
@@ -78,6 +79,10 @@ class LifecycleRepository:
         self.database_url = str(database_url or "").strip()
         self.enabled = bool(self.database_url and psycopg is not None)
         self._lock = threading.Lock()
+        self._schema = operational_schema()
+        self._signals = operational_relation("tracked_signals")
+        self._events = operational_relation("signal_lifecycle_events")
+        self._ledger = operational_relation("telegram_notification_ledger")
         self._status: Dict[str, Any] = {
             "configured": bool(self.database_url),
             "driver_available": psycopg is not None,
@@ -123,11 +128,11 @@ class LifecycleRepository:
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     select
-                      to_regclass('public.tracked_signals') as signals,
-                      to_regclass('public.signal_lifecycle_events') as events,
-                      to_regclass('public.telegram_notification_ledger') as ledger
+                      to_regclass('{self._signals}') as signals,
+                      to_regclass('{self._events}') as events,
+                      to_regclass('{self._ledger}') as ledger
                     """
                 )
                 row = cursor.fetchone() or {}
@@ -242,8 +247,8 @@ class LifecycleRepository:
             "signal_payload": Jsonb(row),
             "lifecycle_state": Jsonb(lifecycle_state),
         }
-        upsert = """
-            insert into public.tracked_signals (
+        upsert = f"""
+            insert into {self._signals} (
               signal_id, candidate_id, fingerprint, symbol, exchange_id, direction,
               timeframe, source, status, setup_type, entry_mode,
               confirmation_pending, generated_at, valid_until, entered_at,
@@ -312,8 +317,8 @@ class LifecycleRepository:
                     event = dict(item)
                     event_uid = event_id_for(event)
                     cursor.execute(
-                        """
-                        insert into public.signal_lifecycle_events (
+                        f"""
+                        insert into {self._events} (
                           event_id, signal_id, lifecycle_version, event_type,
                           from_status, to_status, occurred_at, price, payload,
                           notification_required
@@ -342,8 +347,8 @@ class LifecycleRepository:
                             digest = destination_hash(destination)
                             if event.get("notify", True):
                                 cursor.execute(
-                                    """
-                                insert into public.telegram_notification_ledger (
+                                    f"""
+                                insert into {self._ledger} (
                                   idempotency_key, event_id, signal_id,
                                   destination_hash, status, attempt_count,
                                   next_retry_at
@@ -354,8 +359,8 @@ class LifecycleRepository:
                                 )
                             else:
                                 cursor.execute(
-                                    """
-                                    insert into public.telegram_notification_ledger (
+                                    f"""
+                                    insert into {self._ledger} (
                                       idempotency_key, event_id, signal_id,
                                       destination_hash, status, attempt_count,
                                       last_attempt_at, delivered_at, next_retry_at
@@ -383,11 +388,11 @@ class LifecycleRepository:
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     select signal_id, lifecycle_state, lifecycle_schema_version,
                            feature_schema_version, execution_policy_version,
                            rank_policy_version
-                    from public.tracked_signals
+                    from {self._signals}
                     where status = any(%s)
                     order by generated_at
                     """,
@@ -420,11 +425,11 @@ class LifecycleRepository:
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     select lifecycle_state, lifecycle_schema_version,
                            feature_schema_version, execution_policy_version,
                            rank_policy_version
-                    from public.tracked_signals where signal_id=%s
+                    from {self._signals} where signal_id=%s
                     """,
                     (str(signal_id),),
                 )
@@ -449,9 +454,9 @@ class LifecycleRepository:
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     select status, count(*) as count
-                    from public.telegram_notification_ledger
+                    from {self._ledger}
                     where signal_id=%s group by status
                     """,
                     (str(signal_id),),
@@ -471,9 +476,9 @@ class LifecycleRepository:
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     with due as (
-                      select id from public.telegram_notification_ledger
+                      select id from {self._ledger}
                       where (
                         status in ('queued','retry') and next_retry_at <= now()
                       ) or (status='sending' and last_attempt_at < %s)
@@ -481,7 +486,7 @@ class LifecycleRepository:
                       for update skip locked
                       limit %s
                     )
-                    update public.telegram_notification_ledger n
+                    update {self._ledger} n
                     set status='sending', attempt_count=n.attempt_count+1,
                         last_attempt_at=now(), updated_at=now()
                     from due where n.id=due.id
@@ -492,11 +497,11 @@ class LifecycleRepository:
                 jobs = [dict(row) for row in cursor.fetchall()]
                 for job in jobs:
                     cursor.execute(
-                        """
+                        f"""
                         select e.event_type, e.occurred_at, e.price, e.payload,
                                t.lifecycle_state
-                        from public.signal_lifecycle_events e
-                        join public.tracked_signals t on t.signal_id=e.signal_id
+                        from {self._events} e
+                        join {self._signals} t on t.signal_id=e.signal_id
                         where e.event_id=%s
                         """,
                         (job["event_id"],),
@@ -524,7 +529,7 @@ class LifecycleRepository:
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
-                    "select attempt_count from public.telegram_notification_ledger where id=%s for update",
+                    f"select attempt_count from {self._ledger} where id=%s for update",
                     (int(ledger_id),),
                 )
                 row = cursor.fetchone()
@@ -549,8 +554,8 @@ class LifecycleRepository:
                     base = max(float(retry_after_seconds or 0), min(1800.0, 30.0 * (2 ** max(0, attempts - 1))))
                     next_retry = _now() + timedelta(seconds=base + random.uniform(0, min(15.0, base * 0.1)))
                 cursor.execute(
-                    """
-                    update public.telegram_notification_ledger
+                    f"""
+                    update {self._ledger}
                     set status=%s, telegram_message_id=%s, delivered_at=%s,
                         next_retry_at=%s, error_category=%s, updated_at=now()
                     where id=%s and status='sending'

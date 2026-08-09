@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from src.utils.helpers import safe_float
+from src.experiments.identity import identity_metadata, is_legacy_comparison
 
 
 FEATURE_SCHEMA_VERSION = "3.0"
@@ -366,7 +367,12 @@ def build_candidate_record(
     ).lower()
     if direction not in ("long", "short"):
         direction = "flat"
-    is_directional_candidate = direction in ("long", "short")
+    comparison_directional_candidate = direction in ("long", "short")
+    # Legacy rows are retained for experiment reporting, but never enter the
+    # Strict model training/promotion heads sharing this candidate journal.
+    is_directional_candidate = bool(
+        comparison_directional_candidate and not is_legacy_comparison()
+    )
     identity = "|".join(
         [
             generated_at,
@@ -379,7 +385,10 @@ def build_candidate_record(
             str(feature_schema_version),
         ]
     )
-    candidate_id = "cand_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:28]
+    candidate_prefix = "legacy_cand_" if is_legacy_comparison() else "cand_"
+    candidate_id = candidate_prefix + hashlib.sha256(
+        identity.encode("utf-8")
+    ).hexdigest()[:28]
     decision = {
         key: row.get(key)
         for key in (
@@ -446,6 +455,10 @@ def build_candidate_record(
             "rank_breakdown",
         )
     }
+    decision.update(identity_metadata())
+    decision["comparison_directional_candidate"] = (
+        comparison_directional_candidate
+    )
     decision["atr"] = _number(
         (getattr(analysis, "meta", None) or {}).get("atr")
         if analysis is not None
@@ -492,6 +505,7 @@ def build_candidate_record(
         ),
         "rejection_reasons": list(row.get("rejection_reasons") or []),
     }
+    production_scores.update(identity_metadata())
     return {
         "id": candidate_id,
         "generated_at": generated_at,

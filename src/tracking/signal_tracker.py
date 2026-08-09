@@ -33,6 +33,7 @@ from src.tracking.durable_repository import (
 )
 from src.utils.config import AppConfig, load_config
 from src.utils.helpers import safe_float
+from src.experiments.identity import bot_namespace, is_legacy_comparison
 
 try:
     import websocket
@@ -814,11 +815,12 @@ class SignalStore:
         )
         timeframe = str(row.get("primary_tf") or "15m")
         level_blob = (
-            f"{exchange_id}|{symbol}|{direction}|{entry_low:.12g}|{entry_high:.12g}|"
+            f"{bot_namespace()}|{exchange_id}|{symbol}|{direction}|{entry_low:.12g}|{entry_high:.12g}|"
             f"{stop_loss:.12g}|{_iso(valid_until)}"
         )
         fingerprint = hashlib.sha256(level_blob.encode("utf-8")).hexdigest()[:24]
-        signal_id = f"sig_{fingerprint}_{int(timestamp.timestamp())}"
+        signal_prefix = "legacy_sig" if is_legacy_comparison() else "sig"
+        signal_id = f"{signal_prefix}_{fingerprint}_{int(timestamp.timestamp())}"
         initial_price = safe_float(row.get("price"))
         # Publication inside a CMP zone is not execution evidence. All signals
         # begin pending; CMP requires a later closed-candle confirmation.

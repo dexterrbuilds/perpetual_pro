@@ -26,6 +26,17 @@ from src.analysis.qualification import (
     evaluate_private_beta_qualification,
     qualify_private_beta_candidates,
 )
+from src.experiments.identity import (
+    bot_namespace,
+    identity_metadata,
+    is_legacy_comparison,
+)
+from src.experiments.legacy_policy import (
+    LEGACY_POLICY_VERSION,
+    evaluate_legacy_qualification,
+    qualify_legacy_candidates,
+    strict_shadow_decision,
+)
 from src.notify.telegram import (
     format_signal_photo_caption,
     format_prop_scan_report,
@@ -107,9 +118,11 @@ def get_scheduler_status() -> Dict[str, Any]:
 
 def _durable_run_id(slot_label: str, scheduled_for: Optional[str]) -> str:
     if scheduled_for:
-        material = f"{slot_label}|{scheduled_for}"
-        return "sched_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
-    return "run_" + uuid4().hex
+        material = f"{bot_namespace()}|{slot_label}|{scheduled_for}"
+        prefix = "legacy_sched_" if is_legacy_comparison() else "sched_"
+        return prefix + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+    prefix = "legacy_run_" if is_legacy_comparison() else "run_"
+    return prefix + uuid4().hex
 
 
 def _parse_utc_datetime(value: Any) -> Optional[datetime]:
@@ -296,7 +309,10 @@ def _signal_delivery_idempotency_key(
     ]
     material = "|".join(str(value) for value in levels)
     signal_digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
-    return f"signal_initial:v1:{signal_digest}:{destination_hash(destination)}"
+    return (
+        f"{bot_namespace()}:signal_initial:v1:{signal_digest}:"
+        f"{destination_hash(destination)}"
+    )
 
 
 def _recover_expected_scheduler_windows(
@@ -423,7 +439,8 @@ def _send_missed_window_warning(
     """Warn private operators only; never fall back to a public destination."""
     deliveries: List[Dict[str, Any]] = []
     text = (
-        "⚠️ <b>SCHEDULED WINDOW MISSED</b>\n\n"
+        ("🧪 <b>PERPETUAL PRO LEGACY</b>\n" if is_legacy_comparison() else "")
+        + "⚠️ <b>SCHEDULED WINDOW MISSED</b>\n\n"
         f"Window: <b>{slot_label}</b>\n"
         f"Expected: <code>{scheduled_for}</code>\n"
         f"Reason: {reason}\n\n"
@@ -1053,7 +1070,18 @@ def _run_scheduled_scan_once_unlocked(
             "requester_identity_hash": requester_identity_hash,
         }
         row["gate_evaluation"] = evaluation
-    if private_beta_mode:
+    if is_legacy_comparison():
+        # Legacy comparison consumes the same directional candidates and gate
+        # evidence, but only its isolated publication policy has authority.
+        # The strict policy remains journaled as a shadow decision.
+        filtered = qualify_legacy_candidates(
+            qualification_candidates, limit=2
+        )
+        for row in qualification_candidates:
+            row.setdefault("strict_shadow_decision", strict_shadow_decision(row))
+            row.setdefault("legacy_decision", evaluate_legacy_qualification(row))
+            row.update(identity_metadata())
+    elif private_beta_mode:
         required_alert_codes = {
             "OVERALL_QUALITY_BELOW_MINIMUM",
             "EXECUTION_QUALITY_BELOW_MINIMUM",
@@ -1087,13 +1115,18 @@ def _run_scheduled_scan_once_unlocked(
                 "their entry-validity window",
                 len(suppressed_duplicates),
             )
-    filtered, portfolio_risk_excluded = cap_signals_by_portfolio_risk(
-        filtered,
-        max_open_risk_pct=float(
-            getattr(cfg.risk, "max_open_risk_pct", 2.0) or 2.0
-        ),
-        default_risk_pct=float(cfg.risk.risk_per_trade_pct or 1.0),
-    )
+    if is_legacy_comparison():
+        # Portfolio/prop routing is advisory in the Legacy experiment. The
+        # same per-trade risk guidance remains visible in Telegram.
+        portfolio_risk_excluded = []
+    else:
+        filtered, portfolio_risk_excluded = cap_signals_by_portfolio_risk(
+            filtered,
+            max_open_risk_pct=float(
+                getattr(cfg.risk, "max_open_risk_pct", 2.0) or 2.0
+            ),
+            default_risk_pct=float(cfg.risk.risk_per_trade_pct or 1.0),
+        )
     if portfolio_risk_excluded:
         logger.info(
             "Withheld {} lower-ranked signal(s) to keep total proposed open "
@@ -1127,7 +1160,23 @@ def _run_scheduled_scan_once_unlocked(
                     }
                 if validation.get("ok"):
                     refreshed = dict(validation.get("row") or original)
-                    if private_beta_mode:
+                    if is_legacy_comparison():
+                        refreshed["pre_delivery_revalidation_ok"] = True
+                        decision = evaluate_legacy_qualification(refreshed)
+                        refreshed["legacy_decision"] = decision
+                        refreshed["strict_shadow_decision"] = strict_shadow_decision(
+                            refreshed
+                        )
+                        refreshed["quality_tier"] = decision.get("quality_tier")
+                        refreshed["caveats"] = list(decision.get("caveats") or [])
+                        refreshed.update(identity_metadata())
+                        if not decision["qualified"]:
+                            refreshed["pre_delivery_rejection_reasons"] = [
+                                "LEGACY_QUALIFICATION_FAILED"
+                            ]
+                            pre_delivery_rejected.append(refreshed)
+                            continue
+                    elif private_beta_mode:
                         refreshed["pre_delivery_revalidation_ok"] = True
                         qualification = evaluate_private_beta_qualification(
                             refreshed, refreshed.get("gate_evaluation")
@@ -1170,7 +1219,16 @@ def _run_scheduled_scan_once_unlocked(
                         or rejected.get("gate_evaluation")
                         or {}
                     )
-                    if private_beta_mode:
+                    if is_legacy_comparison():
+                        rejected["pre_delivery_revalidation_ok"] = False
+                        rejected["legacy_decision"] = (
+                            evaluate_legacy_qualification(rejected)
+                        )
+                        rejected["strict_shadow_decision"] = (
+                            strict_shadow_decision(rejected)
+                        )
+                        rejected.update(identity_metadata())
+                    elif private_beta_mode:
                         rejected["pre_delivery_revalidation_ok"] = False
                         qualification = evaluate_private_beta_qualification(
                             rejected, rejected.get("gate_evaluation")
@@ -1192,7 +1250,23 @@ def _run_scheduled_scan_once_unlocked(
 
     scan_failed = not bool(result.get("ok"))
     report_summary = dict(result.get("rejection_analytics") or {})
-    if private_beta_mode:
+    if is_legacy_comparison():
+        report_summary.update(
+            {
+                "bot_variant": "legacy",
+                "bot_namespace": bot_namespace(),
+                "experiment_id": identity_metadata()["experiment_id"],
+                "qualification_policy_version": LEGACY_POLICY_VERSION,
+                "strict_shadow_signals": sum(
+                    1
+                    for row in qualification_candidates
+                    if (row.get("strict_shadow_decision") or {}).get("decision")
+                    == "SIGNAL"
+                ),
+                "legacy_signals": len(filtered),
+            }
+        )
+    elif private_beta_mode:
         latest_beta_rows: Dict[str, Dict[str, Any]] = {
             str(row.get("candidate_id") or index): row
             for index, row in enumerate(qualification_candidates)
@@ -1214,7 +1288,8 @@ def _run_scheduled_scan_once_unlocked(
     )
     if scan_failed:
         report = (
-            "⚠️ <b>SCAN UNAVAILABLE</b>\n\n"
+            ("🧪 <b>PERPETUAL PRO LEGACY</b>\n" if is_legacy_comparison() else "")
+            + "⚠️ <b>SCAN UNAVAILABLE</b>\n\n"
             "Market data or analysis failed for the complete watchlist. "
             "No trade decision was produced; this is not a no-setup result.\n\n"
             "NFA · DYOR · Trade at your own risk"
@@ -1263,6 +1338,9 @@ def _run_scheduled_scan_once_unlocked(
             if not manual_delivery
             else report_destinations
         )
+    if is_legacy_comparison() and not manual_delivery and not scan_failed:
+        # Legacy scheduled no-setup reports are intentionally silent.
+        report_destinations = []
     logger.info(
         "Delivery Mode: {} recipients_attempted={} report_recipients={} "
         "public_enabled={}",
@@ -1521,7 +1599,9 @@ def _run_scheduled_scan_once_unlocked(
                     filtered[:6],
                     tracking_destinations,
                     source=(
-                        scan_origin
+                        f"legacy_{scan_origin}"
+                        if is_legacy_comparison()
+                        else scan_origin
                         if private_beta_mode
                         else (
                             "telegram_manual"
@@ -1555,7 +1635,9 @@ def _run_scheduled_scan_once_unlocked(
         elif (
             scan_failed
             or (
-                bool(notify_on_empty)
+                False
+                if is_legacy_comparison() and not manual_delivery and not scan_failed
+                else bool(notify_on_empty)
                 if notify_on_empty is not None
                 else (
                     routing_status["mode"] == "private_beta"
@@ -1812,6 +1894,12 @@ def _run_scheduled_scan_once_unlocked(
         "rejection_analytics": result.get("rejection_analytics") or {},
         "rejection_analytics_finalized": analytics_finalized,
         "slot_label": slot_label,
+        **identity_metadata(),
+        "qualification_policy_version": (
+            LEGACY_POLICY_VERSION
+            if is_legacy_comparison()
+            else None
+        ),
     }
 
 
