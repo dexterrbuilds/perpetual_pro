@@ -365,6 +365,10 @@ def build_candidate_record(
     direction = str(
         row.get("direction") or getattr(analysis, "direction", "flat") or "flat"
     ).lower()
+    if is_legacy_comparison():
+        evaluated_direction = str(row.get("evaluated_direction") or "").lower()
+        if evaluated_direction in ("long", "short"):
+            direction = evaluated_direction
     if direction not in ("long", "short"):
         direction = "flat"
     comparison_directional_candidate = direction in ("long", "short")

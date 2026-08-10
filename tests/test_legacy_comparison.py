@@ -189,6 +189,18 @@ def test_legacy_candidate_and_operational_namespaces_are_isolated(monkeypatch, t
     store.close()
 
 
+def test_legacy_candidate_journal_preserves_comparison_direction(monkeypatch):
+    monkeypatch.setenv("BOT_VARIANT", "legacy")
+    candidate = build_candidate_record(
+        None,
+        _row(direction="flat", evaluated_direction="short"),
+        source="comparison",
+    )
+    assert candidate["direction"] == "short"
+    assert candidate["decision"]["comparison_directional_candidate"] is True
+    assert candidate["is_directional_candidate"] is False
+
+
 def test_legacy_telegram_is_private_and_unmistakable(monkeypatch):
     monkeypatch.setenv("BOT_VARIANT", "legacy")
     monkeypatch.setenv("DELIVERY_MODE", "private_beta")
