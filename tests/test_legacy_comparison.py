@@ -94,6 +94,32 @@ def test_legacy_policy_relaxes_selectivity_but_preserves_absolute_floors(monkeyp
     assert evaluate_legacy_qualification(_row(net_risk_reward=[0.5, 0.74]))["qualified"] is False
 
 
+def test_legacy_recovers_entry_state_only_for_relaxable_selectivity(monkeypatch):
+    monkeypatch.setenv("BOT_VARIANT", "legacy")
+    relaxed = _row(
+        candidate_id="relaxed-block",
+        entry_status="blocked",
+        legacy_execution_status="wait_retest",
+        execution_setup_type="trend_pullback",
+        setup_name="No Trade / Wait for Confirmation",
+        hard_failures=["setup_confirmation_insufficient"],
+    )
+    decision = evaluate_legacy_qualification(relaxed)
+    assert decision["qualified"] is True
+    assert decision["effective_entry_status"] == "wait_retest"
+    selected = qualify_legacy_candidates([relaxed], limit=2)
+    assert selected[0]["entry_status"] == "wait_retest"
+    assert selected[0]["strict_entry_status"] == "blocked"
+    assert selected[0]["setup_name"] == "Trend Continuation (Pullback)"
+
+    universal = _row(
+        entry_status="blocked",
+        legacy_execution_status="wait_retest",
+        hard_failures=["stale_execution_data"],
+    )
+    assert evaluate_legacy_qualification(universal)["qualified"] is False
+
+
 def test_legacy_correctness_failures_remain_hard(monkeypatch):
     monkeypatch.setenv("BOT_VARIANT", "legacy")
     cases = (

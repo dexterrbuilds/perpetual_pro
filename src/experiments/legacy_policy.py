@@ -23,6 +23,20 @@ LEGACY_MIN_NET_RR_DEFAULT = 0.75
 LEGACY_PREFERRED_RR_DEFAULT = 1.25
 LEGACY_ABSOLUTE_CHASE_ATR_DEFAULT = 1.35
 
+LEGACY_SETUP_LABELS = {
+    "trend_pullback": "Trend Continuation (Pullback)",
+    "breakout_continuation": "Breakout Continuation",
+    "breakout_retest": "Breakout + Retest",
+    "liquidity_sweep": "Liquidity Sweep",
+    "ob_fvg_retest": "Order Block / FVG Retest",
+    "range_mean_reversion": "Range Mean Reversion",
+    "reversal": "Confirmed Reversal",
+    "opening_range_breakout": "Opening Range Breakout",
+    "session_high_low_rejection": "Session High/Low Rejection",
+    "cmp_confirmation": "CMP Confirmation",
+    "retest_continuation": "Retest Continuation",
+}
+
 RELAXABLE_EXECUTION_FAILURES = frozenset(
     {
         "stop_beyond_maximum_structure_distance",
@@ -135,6 +149,27 @@ def _valid_levels(row: Mapping[str, Any], direction: str) -> bool:
     return stop > entry_mid and any(target < entry_mid for target in targets)
 
 
+def _effective_entry_status(
+    row: Mapping[str, Any], hard_failures: Sequence[str]
+) -> str:
+    """Recover pre-selectivity entry state without bypassing correctness.
+
+    The modern execution planner derives ``blocked`` whenever *any* execution
+    hard-failure is present. For Legacy, a block created exclusively by the
+    approved relaxable selectivity failures may fall back to the planner's
+    already-computed historical status. Original universal failures retain the
+    current block and final revalidation remains mandatory.
+    """
+    current = str(row.get("entry_status") or "blocked").lower()
+    if current != "blocked" or not hard_failures:
+        return current
+    if all(failure in RELAXABLE_EXECUTION_FAILURES for failure in hard_failures):
+        legacy = str(row.get("legacy_execution_status") or "").lower()
+        if legacy in {"confirmation_pending", "wait_retest", "avoid_chase"}:
+            return legacy
+    return current
+
+
 def _failure_item(code: str, explanation: str, actual: Any = None, required: Any = None) -> Dict[str, Any]:
     return {
         "code": code,
@@ -170,8 +205,8 @@ def evaluate_legacy_qualification(
     orderbook_age = _number(row.get("orderbook_age_seconds"))
     chase = _number(row.get("chase_distance_atr"))
     progress = _number(row.get("tp1_progress_pct"))
-    entry_status = str(row.get("entry_status") or "blocked").lower()
     hard_failures = [str(value) for value in list(row.get("hard_failures") or [])]
+    entry_status = _effective_entry_status(row, hard_failures)
 
     failures: List[Dict[str, Any]] = []
     caveats: List[Dict[str, Any]] = []
@@ -267,6 +302,8 @@ def evaluate_legacy_qualification(
         "execution_quality": execution,
         "net_rr": net_rr,
         "gross_rr": gross_rr,
+        "effective_entry_status": entry_status,
+        "strict_entry_status": str(row.get("entry_status") or "blocked").lower(),
         "thresholds": thresholds,
         "hard_failures": failures,
         "caveats": caveats,
@@ -323,6 +360,25 @@ def qualify_legacy_candidates(
         row["bot_variant"] = "legacy"
         row["qualification_policy_version"] = LEGACY_POLICY_VERSION
         if decision["qualified"]:
+            row["strict_entry_status"] = str(row.get("entry_status") or "blocked")
+            row["entry_status"] = str(
+                decision.get("effective_entry_status") or row.get("entry_status")
+            )
+            setup_type = str(row.get("execution_setup_type") or "").lower()
+            row["setup_name"] = LEGACY_SETUP_LABELS.get(
+                setup_type,
+                str(row.get("setup_name") or setup_type.replace("_", " ").title()),
+            )
+            payload = dict(row.get("payload") or {})
+            payload["direction"] = _direction(row)
+            for key in ("primary_setup", "trade_plan"):
+                setup = dict(payload.get(key) or {})
+                if setup:
+                    setup["direction"] = _direction(row)
+                    setup["entry_status"] = row["entry_status"]
+                    setup["setup_name"] = row["setup_name"]
+                    payload[key] = setup
+            row["payload"] = payload
             qualified.append(row)
     qualified.sort(
         key=lambda row: (
