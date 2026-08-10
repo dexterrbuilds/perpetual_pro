@@ -10,6 +10,7 @@ from src.experiments.legacy_policy import (
     evaluate_legacy_qualification,
     qualify_legacy_candidates,
 )
+from src.api.service import _build_directional_comparison_row
 from src.notify.telegram import format_signal_photo_caption, get_delivery_status
 from src.scheduler.run_repository import SchedulerRunRepository
 from src.scheduler.scan_job import _durable_run_id
@@ -118,6 +119,31 @@ def test_legacy_recovers_entry_state_only_for_relaxable_selectivity(monkeypatch)
         hard_failures=["stale_execution_data"],
     )
     assert evaluate_legacy_qualification(universal)["qualified"] is False
+
+
+def test_legacy_journal_uses_preserved_directional_thesis(monkeypatch):
+    monkeypatch.setenv("BOT_VARIANT", "legacy")
+    flattened = _row(
+        direction="flat",
+        evaluated_direction="short",
+        entry_low=99.0,
+        entry_high=100.0,
+        stop_loss=102.0,
+        take_profits=[97.0, 95.0],
+        payload={
+            "direction": "flat",
+            "primary_setup": {"direction": "flat"},
+            "chart": {"trade": {"direction": "flat"}},
+        },
+    )
+    comparison = _build_directional_comparison_row(flattened)
+    assert comparison is not None
+    assert comparison["direction"] == "short"
+    assert comparison["payload"]["direction"] == "short"
+    assert comparison["payload"]["primary_setup"]["direction"] == "short"
+    assert comparison["payload"]["chart"]["trade"]["direction"] == "short"
+    assert evaluate_legacy_qualification(comparison)["qualified"] is True
+    assert flattened["direction"] == "flat"
 
 
 def test_legacy_correctness_failures_remain_hard(monkeypatch):

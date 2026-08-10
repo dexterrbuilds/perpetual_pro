@@ -14,7 +14,7 @@ from math import isfinite
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 from uuid import uuid4
 
 from loguru import logger
@@ -600,6 +600,38 @@ def analyze_market_data(
         return payload
     finally:
         client.close()
+
+
+def _build_directional_comparison_row(
+    row: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Restore the evaluated thesis for policy comparison and journaling.
+
+    Strict publication gates may intentionally flatten ``direction`` while
+    retaining ``evaluated_direction``. The Legacy A/B experiment must compare
+    both policies against that same preserved directional thesis.
+    """
+    evaluated_direction = str(row.get("evaluated_direction") or "").lower()
+    if evaluated_direction not in {"long", "short"}:
+        return None
+    comparison_row = copy.deepcopy(dict(row))
+    comparison_row["direction"] = evaluated_direction
+    payload = comparison_row.get("payload") or {}
+    payload["direction"] = evaluated_direction
+    for key in ("primary_setup", "trade_plan"):
+        if isinstance(payload.get(key), dict):
+            payload[key]["direction"] = evaluated_direction
+            payload[key]["entry_status"] = comparison_row.get("entry_status")
+    chart_trade = (
+        (payload.get("chart") or {}).get("trade")
+        if isinstance(payload.get("chart"), dict)
+        else None
+    )
+    if isinstance(chart_trade, dict):
+        chart_trade["direction"] = evaluated_direction
+        chart_trade["entry_status"] = comparison_row.get("entry_status")
+    comparison_row["payload"] = payload
+    return comparison_row
 
 
 def scan_symbols(
@@ -1304,9 +1336,19 @@ def scan_symbols(
                         "private_beta_net_rr_floor"
                     ],
                 }
+                evaluated_direction = str(
+                    row.get("evaluated_direction") or ""
+                ).lower()
+                beta_row = _build_directional_comparison_row(row)
+
                 if is_legacy_comparison():
-                    legacy_decision = evaluate_legacy_qualification(row)
-                    shadow_decision = strict_shadow_decision(row)
+                    # Strict analysis may flatten a directional thesis after
+                    # publication-selectivity gates fail. Compare both policies
+                    # against the preserved directional row, not that display
+                    # flattening, so the A/B journal records the real experiment.
+                    comparison_row = beta_row or row
+                    legacy_decision = evaluate_legacy_qualification(comparison_row)
+                    shadow_decision = strict_shadow_decision(comparison_row)
                     row.update(identity_metadata())
                     row["strict_production_qualified"] = bool(
                         row.get("production_qualified")
@@ -1326,6 +1368,34 @@ def scan_symbols(
                     row["payload"]["strict_shadow_decision"] = shadow_decision
                     row["payload"]["quality_tier"] = row["quality_tier"]
                     row["payload"]["caveats"] = row["caveats"]
+                    if beta_row is not None:
+                        beta_row.update(identity_metadata())
+                        beta_row["strict_production_qualified"] = row[
+                            "strict_production_qualified"
+                        ]
+                        beta_row["legacy_decision"] = legacy_decision
+                        beta_row["strict_shadow_decision"] = shadow_decision
+                        beta_row["legacy_comparison_qualified"] = bool(
+                            legacy_decision.get("qualified")
+                        )
+                        beta_row["quality_tier"] = legacy_decision.get(
+                            "quality_tier"
+                        )
+                        beta_row["caveats"] = list(
+                            legacy_decision.get("caveats") or []
+                        )
+                        beta_row["legacy_qualification_policy_version"] = (
+                            LEGACY_POLICY_VERSION
+                        )
+                        beta_row["payload"].update(identity_metadata())
+                        beta_row["payload"]["legacy_decision"] = legacy_decision
+                        beta_row["payload"]["strict_shadow_decision"] = (
+                            shadow_decision
+                        )
+                        beta_row["payload"]["quality_tier"] = beta_row[
+                            "quality_tier"
+                        ]
+                        beta_row["payload"]["caveats"] = beta_row["caveats"]
                     candidate["decision"].update(identity_metadata())
                     candidate["decision"]["legacy_decision"] = legacy_decision
                     candidate["decision"]["strict_shadow_decision"] = (
@@ -1354,33 +1424,10 @@ def scan_symbols(
                     # Legacy shares the candidate journal for A/B reporting,
                     # but its rows must never enter Strict model training.
                     candidate["decision"]["comparison_directional_candidate"] = (
-                        str(row.get("direction") or "").lower()
-                        in {"long", "short"}
+                        evaluated_direction in {"long", "short"}
                     )
                     candidate["is_directional_candidate"] = False
-                evaluated_direction = str(
-                    row.get("evaluated_direction") or ""
-                ).lower()
-                if evaluated_direction in {"long", "short"}:
-                    beta_row = copy.deepcopy(row)
-                    beta_row["direction"] = evaluated_direction
-                    beta_payload = beta_row.get("payload") or {}
-                    beta_payload["direction"] = evaluated_direction
-                    for key in ("primary_setup", "trade_plan"):
-                        if isinstance(beta_payload.get(key), dict):
-                            beta_payload[key]["direction"] = evaluated_direction
-                            beta_payload[key]["entry_status"] = beta_row.get(
-                                "entry_status"
-                            )
-                    chart_trade = (
-                        (beta_payload.get("chart") or {}).get("trade")
-                        if isinstance(beta_payload.get("chart"), dict)
-                        else None
-                    )
-                    if isinstance(chart_trade, dict):
-                        chart_trade["direction"] = evaluated_direction
-                        chart_trade["entry_status"] = beta_row.get("entry_status")
-                    beta_row["payload"] = beta_payload
+                if beta_row is not None:
                     qualification_candidates.append(beta_row)
                 analytics_candidates.append(
                     candidate_analytics_snapshot(
