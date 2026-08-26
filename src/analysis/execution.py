@@ -40,7 +40,7 @@ class CandleContext:
 @dataclass
 class ExecutionProfile:
     direction: str
-    status: str = "blocked"  # ready | wait_retest | avoid_chase | blocked
+    status: str = "blocked"  # confirmation_pending | wait_retest | avoid_chase | blocked
     score: float = 0.0
     entry_low: float = 0.0
     entry_high: float = 0.0
@@ -273,7 +273,7 @@ def build_execution_profile(
     elif chase_distance > 1.35 or score < 55:
         status = "avoid_chase"
     elif inside and not candle.adverse_rejection and not candle.absorption:
-        status = "ready"
+        status = "confirmation_pending"
     else:
         status = "wait_retest"
 
@@ -315,7 +315,7 @@ def build_execution_profile(
     )
     entry_reason = (
         "Price is inside the validated zone; enter only after candle confirmation."
-        if status == "ready"
+        if status == "confirmation_pending"
         else (
             "Place no market order; wait for price to retest this demand/supply cluster."
             if status == "wait_retest"

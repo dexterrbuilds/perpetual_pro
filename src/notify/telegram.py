@@ -393,11 +393,11 @@ def format_signal_photo_caption(
             "RETEST ONLY — wait for price to return to the Entry zone; "
             "do not enter at the current price."
         )
-    elif status == "ready":
-        call = f"{direction} — CMP READY"
+    elif status in ("ready", "confirmation_pending"):
+        call = f"{direction} — CMP CONFIRMATION"
         entry_mode = (
-            "CMP ALLOWED — price is already inside the Entry zone after "
-            "confirmation. If it leaves before you act, wait for a new scan."
+            "CMP CONFIRMATION — price is inside the Entry zone, but a later "
+            "closed candle must confirm execution."
         )
     else:
         call = f"{direction} — CONDITIONAL"
@@ -524,7 +524,7 @@ def format_signal_photo_caption(
     execution_note = entry_reason
     if not execution_note and status == "wait_retest":
         execution_note = "Wait for retest of the zone. Do not chase."
-    elif not execution_note and status == "ready":
+    elif not execution_note and status in ("ready", "confirmation_pending"):
         execution_note = "Enter only after the confirmation candle closes."
     if execution_note:
         lines += ["", f"📌 {html.escape(execution_note)}"]
@@ -892,6 +892,7 @@ def format_prop_scan_report(
         raw_entry_status = str(row.get("entry_status") or "ready")
         entry_status = {
             "ready": "CMP Ready",
+            "confirmation_pending": "CMP Confirmation",
             "wait_retest": "Retest Only",
             "avoid_chase": "Avoid Chase",
             "blocked": "Blocked",

@@ -25,8 +25,9 @@ from src.utils.config import AppConfig, load_config
 
 # Fallback watchlist when scheduler.watchlist is empty
 DEFAULT_WATCHLIST = [
-    "BTC", "ETH", "SOL", "BNB", "AAVE", "ARB", "NEAR", "INJ", "SEI", "TIA",
-    "SUI", "APT", "AVAX", "TRX", "UNI",
+    "BTC", "ETH", "SOL", "BNB", "TRX", "UNI", "XRP", "DOGE", "LTC", "LINK",
+    "BCH", "HBAR", "XLM", "HYPE", "ZEC", "XMR", "ICP", "ALGO", "AVAX",
+    "PENGU", "WIF", "BONK",
 ]
 MIN_TELEGRAM_SIGNAL_CONFIDENCE = 80.0
 
@@ -197,7 +198,11 @@ def filter_high_confidence(
         if tp2_rr is not None and tp2_rr < min_tp2_rr:
             continue
         entry_status = row.get("entry_status")
-        if entry_status is not None and entry_status not in ("ready", "wait_retest"):
+        if entry_status is not None and entry_status not in (
+            "ready",
+            "confirmation_pending",
+            "wait_retest",
+        ):
             continue
         if only_prop_safe and row.get("prop_safe") is False:
             continue

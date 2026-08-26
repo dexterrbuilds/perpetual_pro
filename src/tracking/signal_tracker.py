@@ -41,6 +41,7 @@ TERMINAL_STATUSES = (
     "expired",
     "invalidated",
     "time_exit",
+    "ambiguous_gap",
 )
 
 
@@ -103,6 +104,55 @@ def _target_hit(direction: str, price: float, target: float) -> bool:
 
 def _stop_hit(direction: str, price: float, stop: float) -> bool:
     return price <= stop if direction == "long" else price >= stop
+
+
+def _segment_crossing_fraction(
+    previous: float,
+    current: float,
+    low: float,
+    high: Optional[float] = None,
+) -> Optional[float]:
+    """Return the earliest fraction of a price segment that touches a level/zone."""
+    zone_low = min(low, high if high is not None else low)
+    zone_high = max(low, high if high is not None else low)
+    if zone_low <= previous <= zone_high:
+        return 0.0
+    delta = current - previous
+    if delta == 0:
+        return None
+    boundary = zone_low if previous < zone_low else zone_high
+    fraction = (boundary - previous) / delta
+    if 0.0 <= fraction <= 1.0:
+        point = previous + delta * fraction
+        if zone_low - 1e-12 <= point <= zone_high + 1e-12:
+            return fraction
+    return None
+
+
+def _pending_crossing_order(
+    *,
+    previous: Optional[float],
+    current: float,
+    entry_low: float,
+    entry_high: float,
+    target: float,
+) -> str:
+    """Classify sparse pending observations without assuming event order."""
+    if previous is None or previous <= 0:
+        return "ambiguous"
+    entry_fraction = _segment_crossing_fraction(
+        previous, current, entry_low, entry_high
+    )
+    target_fraction = _segment_crossing_fraction(previous, current, target)
+    if entry_fraction is not None and target_fraction is not None:
+        if abs(entry_fraction - target_fraction) <= 1e-9:
+            return "ambiguous"
+        return "entry_first" if entry_fraction < target_fraction else "target_first"
+    if entry_fraction is not None:
+        return "entry_first"
+    if target_fraction is not None:
+        return "target_first"
+    return "none"
 
 
 def _r_at_price(signal: Dict[str, Any], price: float) -> float:
@@ -471,14 +521,11 @@ class SignalStore:
         fingerprint = hashlib.sha256(level_blob.encode("utf-8")).hexdigest()[:24]
         signal_id = f"sig_{fingerprint}_{int(timestamp.timestamp())}"
         initial_price = safe_float(row.get("price"))
-        initial_entered = (
-            str(row.get("entry_status") or "").lower() == "ready"
-            and initial_price > 0
-            and _price_in_zone(initial_price, entry_low, entry_high)
-        )
-        status = "entered" if initial_entered else "pending"
-        entered_at = timestamp if initial_entered else None
-        entry_price = initial_price if initial_entered else None
+        # Publication inside a CMP zone is not proof of execution. A later
+        # closed candle must confirm CMP; retests fill only on an observed touch.
+        status = "pending"
+        entered_at = None
+        entry_price = None
         hold_hours = max(0.5, safe_float(row.get("hold_hours_max")) or 12.0)
         hold_until = (
             entered_at + timedelta(hours=hold_hours)
@@ -566,25 +613,6 @@ class SignalStore:
                     now_iso,
                 ),
             )
-            if initial_entered:
-                payload = {
-                    "entry_price": entry_price,
-                    "entry_delay_minutes": max(
-                        0.0,
-                        (timestamp - generated).total_seconds() / 60.0,
-                    ),
-                    "slippage_bps": slippage_bps,
-                    "initial_cmp": True,
-                }
-                self._create_event_locked(
-                    signal_id,
-                    "entered",
-                    timestamp,
-                    entry_price,
-                    payload,
-                    chats,
-                    notify=False,
-                )
             self._connection.commit()
             inserted = self._connection.execute(
                 "SELECT * FROM signals WHERE id = ?",
@@ -668,6 +696,75 @@ class SignalStore:
             signal["destinations"],
         )
 
+    def _record_entry_locked(
+        self,
+        signal: Dict[str, Any],
+        *,
+        price: float,
+        timestamp: datetime,
+        source: str,
+    ) -> Dict[str, Any]:
+        generated = _parse_datetime(signal["generated_at"])
+        hold_hours = max(
+            0.5,
+            safe_float((signal.get("row") or {}).get("hold_hours_max")) or 12.0,
+        )
+        hold_until = timestamp + timedelta(hours=hold_hours)
+        entry_mid = safe_float(signal["entry_mid"])
+        direction_sign = 1.0 if signal["direction"] == "long" else -1.0
+        slippage_bps = (
+            (price - entry_mid)
+            / max(entry_mid, 1e-12)
+            * 10_000.0
+            * direction_sign
+        )
+        self._connection.execute(
+            """
+            UPDATE signals
+            SET status = 'entered', entered_at = ?, entry_price = ?,
+                hold_until = ?, slippage_bps = ?, mfe_r = 0, mae_r = 0,
+                last_price = ?, last_price_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                _iso(timestamp),
+                price,
+                _iso(hold_until),
+                slippage_bps,
+                price,
+                _iso(timestamp),
+                _iso(timestamp),
+                signal["id"],
+            ),
+        )
+        self._create_event_locked(
+            signal["id"],
+            "entered",
+            timestamp,
+            price,
+            {
+                "entry_price": price,
+                "entry_delay_minutes": max(
+                    0.0, (timestamp - generated).total_seconds() / 60.0
+                ),
+                "slippage_bps": slippage_bps,
+                "source": source,
+            },
+            signal["destinations"],
+        )
+        signal.update(
+            {
+                "status": "entered",
+                "entered_at": _iso(timestamp),
+                "entry_price": price,
+                "hold_until": _iso(hold_until),
+                "slippage_bps": slippage_bps,
+                "mfe_r": 0.0,
+                "mae_r": 0.0,
+            }
+        )
+        return signal
+
     def process_price(
         self,
         symbol: str,
@@ -702,6 +799,11 @@ class SignalStore:
                 )
                 if last_seen and timestamp < last_seen:
                     continue
+                previous_price = (
+                    safe_float(signal.get("last_price"))
+                    if signal.get("last_price") is not None
+                    else None
+                )
                 valid_until = _parse_datetime(signal["valid_until"])
                 if signal["status"] == "pending" and timestamp > valid_until:
                     self._terminal_transition_locked(
@@ -726,77 +828,71 @@ class SignalStore:
 
                 if signal["status"] == "pending":
                     first_target = safe_float(signal["take_profits"][0])
-                    if _target_hit(signal["direction"], price, first_target):
+                    entry_status = str(
+                        (signal.get("row") or {}).get("entry_status") or "wait_retest"
+                    ).lower()
+                    confirmation_required = entry_status in (
+                        "ready",
+                        "confirmation_pending",
+                    )
+                    crossing = _pending_crossing_order(
+                        previous=previous_price,
+                        current=price,
+                        entry_low=safe_float(signal["entry_low"]),
+                        entry_high=safe_float(signal["entry_high"]),
+                        target=first_target,
+                    )
+                    if _target_hit(signal["direction"], price, first_target) and (
+                        crossing == "ambiguous"
+                    ):
+                        self._terminal_transition_locked(
+                            signal,
+                            status="ambiguous_gap",
+                            event_type="ambiguous_gap",
+                            timestamp=timestamp,
+                            price=price,
+                            reason=(
+                                "Sparse market-data gap crossed TP1 without enough "
+                                "evidence to establish entry order"
+                            ),
+                        )
+                        transition_count += 1
+                        continue
+                    if _target_hit(signal["direction"], price, first_target) and (
+                        crossing == "target_first" or confirmation_required
+                    ):
                         self._terminal_transition_locked(
                             signal,
                             status="missed",
                             event_type="missed",
                             timestamp=timestamp,
                             price=price,
-                            reason="TP1 traded before the planned entry zone",
+                            reason="TP1 traded before a confirmed planned entry",
                         )
                         transition_count += 1
                         continue
-                    if _price_in_zone(
-                        price,
-                        safe_float(signal["entry_low"]),
-                        safe_float(signal["entry_high"]),
-                    ):
-                        generated = _parse_datetime(signal["generated_at"])
-                        hold_hours = max(
-                            0.5,
-                            safe_float(
-                                (signal.get("row") or {}).get("hold_hours_max")
-                            )
-                            or 12.0,
-                        )
-                        hold_until = timestamp + timedelta(hours=hold_hours)
-                        entry_mid = safe_float(signal["entry_mid"])
-                        direction_sign = (
-                            1.0 if signal["direction"] == "long" else -1.0
-                        )
-                        slippage_bps = (
-                            (price - entry_mid)
-                            / max(entry_mid, 1e-12)
-                            * 10_000.0
-                            * direction_sign
-                        )
-                        self._connection.execute(
-                            """
-                            UPDATE signals
-                            SET status = 'entered', entered_at = ?,
-                                entry_price = ?, hold_until = ?,
-                                slippage_bps = ?, mfe_r = 0, mae_r = 0,
-                                updated_at = ?
-                            WHERE id = ?
-                            """,
-                            (
-                                _iso(timestamp),
+                    if not confirmation_required and crossing == "entry_first":
+                        fill_price = price
+                        if previous_price is not None:
+                            entry_fraction = _segment_crossing_fraction(
+                                previous_price,
                                 price,
-                                _iso(hold_until),
-                                slippage_bps,
-                                _iso(timestamp),
-                                signal["id"],
-                            ),
-                        )
-                        self._create_event_locked(
-                            signal["id"],
-                            "entered",
-                            timestamp,
-                            price,
-                            {
-                                "entry_price": price,
-                                "entry_delay_minutes": max(
-                                    0.0,
-                                    (timestamp - generated).total_seconds() / 60.0,
-                                ),
-                                "slippage_bps": slippage_bps,
-                                "source": source,
-                            },
-                            signal["destinations"],
+                                safe_float(signal["entry_low"]),
+                                safe_float(signal["entry_high"]),
+                            )
+                            if entry_fraction is not None:
+                                fill_price = previous_price + (
+                                    price - previous_price
+                                ) * entry_fraction
+                        signal = self._record_entry_locked(
+                            signal,
+                            price=fill_price,
+                            timestamp=timestamp,
+                            source=source,
                         )
                         transition_count += 1
-                    continue
+                    else:
+                        continue
 
                 current_r = _r_at_price(signal, price)
                 mfe_r = max(safe_float(signal.get("mfe_r")), current_r)
@@ -809,6 +905,34 @@ class SignalStore:
                     """,
                     (mfe_r, mae_r, _iso(timestamp), signal["id"]),
                 )
+                highest_tp = int(signal.get("highest_tp") or 0)
+                if highest_tp >= 1 and _stop_hit(
+                    signal["direction"],
+                    price,
+                    safe_float(signal["entry_price"]),
+                ):
+                    result_r = max(0.0, safe_float(signal.get("realized_r")))
+                    self._connection.execute(
+                        "UPDATE signals SET realized_r = ? WHERE id = ?",
+                        (result_r, signal["id"]),
+                    )
+                    self._terminal_transition_locked(
+                        signal,
+                        status="completed",
+                        event_type="protected_exit",
+                        timestamp=timestamp,
+                        price=price,
+                        reason="Breakeven protection triggered after TP1",
+                        payload={
+                            "result_r": result_r,
+                            "highest_tp": highest_tp,
+                            "mfe_r": mfe_r,
+                            "mae_r": mae_r,
+                            "protected_price": safe_float(signal["entry_price"]),
+                        },
+                    )
+                    transition_count += 1
+                    continue
                 if _stop_hit(
                     signal["direction"],
                     price,
@@ -818,9 +942,7 @@ class SignalStore:
                         self._allocations_config,
                         len(signal["take_profits"]),
                     )
-                    completed_fraction = sum(
-                        allocations[: int(signal.get("highest_tp") or 0)]
-                    )
+                    completed_fraction = sum(allocations[:highest_tp])
                     result_r = safe_float(signal.get("realized_r")) - (
                         1.0 - completed_fraction
                     )
@@ -837,7 +959,7 @@ class SignalStore:
                         reason="Hard stop traded after entry",
                         payload={
                             "result_r": result_r,
-                            "highest_tp": int(signal.get("highest_tp") or 0),
+                            "highest_tp": highest_tp,
                             "mfe_r": mfe_r,
                             "mae_r": min(mae_r, -1.0),
                         },
@@ -845,7 +967,7 @@ class SignalStore:
                     transition_count += 1
                     continue
 
-                old_highest = int(signal.get("highest_tp") or 0)
+                old_highest = highest_tp
                 new_highest = old_highest
                 for index, target in enumerate(signal["take_profits"], 1):
                     if index > old_highest and _target_hit(
@@ -914,8 +1036,10 @@ class SignalStore:
         closed_at: datetime,
         *,
         exchange_id: Optional[str] = None,
+        high_price: Optional[float] = None,
+        low_price: Optional[float] = None,
     ) -> int:
-        """Cancel pending structures only on a confirmed candle close."""
+        """Confirm CMP entries or cancel pending structure on a closed candle."""
         if close_price <= 0:
             return 0
         timestamp = closed_at.astimezone(UTC)
@@ -951,6 +1075,45 @@ class SignalStore:
                             f"{signal['timeframe']} candle closed beyond the "
                             "structure invalidation level before entry"
                         ),
+                    )
+                    count += 1
+                    continue
+                entry_status = str(
+                    (signal.get("row") or {}).get("entry_status") or ""
+                ).lower()
+                confirmation_required = entry_status in (
+                    "ready",
+                    "confirmation_pending",
+                )
+                high = safe_float(high_price, close_price)
+                low = safe_float(low_price, close_price)
+                first_target = safe_float(signal["take_profits"][0])
+                target_touched = (
+                    high >= first_target
+                    if signal["direction"] == "long"
+                    else low <= first_target
+                )
+                if confirmation_required and target_touched:
+                    self._terminal_transition_locked(
+                        signal,
+                        status="missed",
+                        event_type="missed",
+                        timestamp=timestamp,
+                        price=first_target,
+                        reason="TP1 traded before CMP candle confirmation",
+                    )
+                    count += 1
+                    continue
+                if confirmation_required and _price_in_zone(
+                    close_price,
+                    safe_float(signal["entry_low"]),
+                    safe_float(signal["entry_high"]),
+                ):
+                    self._record_entry_locked(
+                        signal,
+                        price=close_price,
+                        timestamp=timestamp,
+                        source="closed_candle_confirmation",
                     )
                     count += 1
             self._connection.commit()
@@ -1347,26 +1510,55 @@ def format_tracker_event(event: Dict[str, Any]) -> str:
             (
                 "Signal closed successfully."
                 if complete
-                else "Remaining targets and the original hard Stop stay active."
+                else (
+                    "Profit secured. Remaining targets stay active with the "
+                    "remainder protected at breakeven."
+                )
             ),
+        ]
+    elif event_type == "protected_exit":
+        title = f"🟢 <b>{base} {direction} — PROFIT SECURED</b>"
+        body = [
+            (
+                "Protected exit: "
+                f"<b>{_format_price(payload.get('protected_price') or price)}</b>"
+            ),
+            f"Highest target reached: <b>TP{highest_tp}</b>",
+            f"Realized model result: <b>+{safe_float(result_r):.2f}R</b>",
+            "The remainder exited at breakeven protection; this is not a stop-loss.",
         ]
     elif event_type == "stopped":
-        title = f"🛑 <b>{base} {direction} — STOP HIT</b>"
-        body = [
-            f"Stop event: <b>{_format_price(price)}</b>",
-            f"Model result: <b>{safe_float(result_r):+.2f}R</b>",
-            f"Targets reached first: <b>{highest_tp}</b>",
-            (
-                f"MFE <b>{safe_float(payload.get('mfe_r')):+.2f}R</b> · "
-                f"MAE <b>{safe_float(payload.get('mae_r')):+.2f}R</b>"
-            ),
-        ]
+        if highest_tp >= 1:
+            title = f"🟢 <b>{base} {direction} — PROFIT SECURED</b>"
+            body = [
+                f"Highest target reached: <b>TP{highest_tp}</b>",
+                "TP1 had already locked a winning outcome.",
+                "No stop-loss is recorded after TP1.",
+            ]
+        else:
+            title = f"🛑 <b>{base} {direction} — STOP HIT</b>"
+            body = [
+                f"Stop event: <b>{_format_price(price)}</b>",
+                f"Model result: <b>{safe_float(result_r):+.2f}R</b>",
+                f"Targets reached first: <b>{highest_tp}</b>",
+                (
+                    f"MFE <b>{safe_float(payload.get('mfe_r')):+.2f}R</b> · "
+                    f"MAE <b>{safe_float(payload.get('mae_r')):+.2f}R</b>"
+                ),
+            ]
     elif event_type == "missed":
         title = f"⚪ <b>{base} {direction} — SETUP MISSED</b>"
         body = [
             "TP1 traded before the planned entry zone.",
             "The old entry is cancelled. Do not chase or trade a later return automatically.",
             "A new scan must qualify a fresh setup.",
+        ]
+    elif event_type == "ambiguous_gap":
+        title = f"⚪ <b>{base} {direction} — OUTCOME AMBIGUOUS</b>"
+        body = [
+            "A market-data gap crossed both execution and outcome levels.",
+            "The event order cannot be proven, so it is not counted as a fill, win, or loss.",
+            "The setup is closed and requires a fresh scan.",
         ]
     elif event_type == "invalidated":
         title = f"⚠️ <b>{base} {direction} — STRUCTURE INVALIDATED</b>"
@@ -1685,6 +1877,8 @@ class SignalTracker:
                                 safe_float(candle.get("close")),
                                 closed_at,
                                 exchange_id=exchange_id,
+                                high_price=safe_float(candle.get("high")),
+                                low_price=safe_float(candle.get("low")),
                             )
                 # Closed-candle invalidations happened before this current
                 # ticker observation, so reconcile them first.

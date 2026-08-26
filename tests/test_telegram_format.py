@@ -511,13 +511,13 @@ def test_signal_photo_caption_is_clean_and_actionable():
     assert len(caption) <= 1024
 
 
-def test_signal_photo_caption_explains_cmp_ready_entry():
+def test_signal_photo_caption_explains_cmp_confirmation_entry():
     row = {
         "symbol": "ETH/USDT:USDT",
         "direction": "short",
         "confidence": 88,
         "technical_confidence": 86,
-        "entry_status": "ready",
+        "entry_status": "confirmation_pending",
         "execution_score": 82,
         "entry_low": 3800,
         "entry_high": 3810,
@@ -534,14 +534,14 @@ def test_signal_photo_caption_explains_cmp_ready_entry():
                 "hold_hours_max": 12,
                 "risk_reward": [1.0, 2.0],
             },
-            "execution": {"status": "ready"},
+            "execution": {"status": "confirmation_pending"},
             "chart": {"timeframe": "15m"},
         },
     }
     caption = format_signal_photo_caption(row)
-    assert "ETH SHORT — CMP READY" in caption
-    assert "<b>Entry mode:</b> CMP ALLOWED" in caption
-    assert "If it leaves before you act, wait for a new scan." in caption
+    assert "ETH SHORT — CMP CONFIRMATION" in caption
+    assert "<b>Entry mode:</b> CMP CONFIRMATION" in caption
+    assert "later closed candle must confirm execution" in caption
     assert "candle finishes above Stop" in caption
 
 

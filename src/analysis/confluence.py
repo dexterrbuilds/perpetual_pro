@@ -504,7 +504,7 @@ class ConfluenceEngine:
             and result.confidence >= confidence_floor
             and abs(result.confluence_total) >= score_floor
             and execution.score >= execution_floor
-            and execution.status in ("ready", "wait_retest")
+            and execution.status in ("confirmation_pending", "wait_retest")
             and execution.immediate_sl_risk <= max_immediate_sl_risk
             and execution.market_quality_ok
             and data_quality_ok
@@ -524,7 +524,7 @@ class ConfluenceEngine:
                 gate_reasons.append(
                     f"execution {execution.score:.0f} < {execution_floor:.0f}"
                 )
-            if execution.status not in ("ready", "wait_retest"):
+            if execution.status not in ("confirmation_pending", "wait_retest"):
                 gate_reasons.append(execution.status.replace("_", " "))
             if execution.immediate_sl_risk > max_immediate_sl_risk:
                 gate_reasons.append(
